@@ -1,0 +1,10 @@
+## Review
+
+**No blockers.** The drafts are broadly aligned on local-first behavior, conflict preservation, security, backups, and milestone structure.
+
+- **High — Contradictory notification guarantee:** `docs/PRD.md:668-670` requires that online **at most one** device is notified. `docs/DESIGN.md:739-745` permits lease reassignment after disconnect and explicitly accepts possible online duplicates. If the first device displays before losing its acknowledgment, both devices may notify. Revise the acceptance criterion to allow rare online duplicates or choose omission over failover.
+- **High — Crash consistency is underspecified:** `docs/DESIGN.md:591-598` says a batch is applied “atomically” to local files before index/cursor advancement, but filesystem writes and SQLite cannot share one atomic transaction. The known crash window is tested at `docs/DESIGN.md:1059-1068`, yet no recovery journal or replay preconditions are defined. Specify staged, idempotent recovery that cannot overwrite an external edit after restart.
+- **Medium — Telemetry traceability is incomplete:** `docs/PRD.md:472-494` requires prior pilot consent, an open-beta opt-out, bounded retention, and access control. `docs/DESIGN.md:903-938` covers field filtering/redaction only, while retention is deferred at `docs/DESIGN.md:1269`; nevertheless, the matrix claims full `TEL-001`–`TEL-006` coverage at `docs/DESIGN.md:1290-1301`. Consent and opt-out architecture remain unaddressed.
+- **Low — Missed-reminder behavior is not acceptance-testable:** `docs/PRD.md:382-384` requires a documented rule, while `docs/DESIGN.md:729-731` leaves long-series behavior open; the PRD repeats this as an open question at `docs/PRD.md:753-755`. Define lookback bounds, aggregation, ordering, and user-visible state before M3 acceptance.
+
+- **Note — Residual risk:** Several intentionally deferred M2/M3 decisions—especially reminder-state joins, DST rules, tombstone retention, and sync recovery—must become explicit ADRs before their corresponding exit criteria can be evaluated.
