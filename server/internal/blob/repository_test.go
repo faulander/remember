@@ -77,6 +77,112 @@ func TestPutLimitsAndHashMismatchLeaveNoPublishedBlob(t *testing.T) {
 	}
 }
 
+func TestQuotaBoundaryIdempotenceAndTenantLogicalDedupe(t *testing.T) {
+	t.Parallel()
+	f := newFixtureWithQuota(t, 2, 8)
+	first := []byte("12345")
+	firstHash := sha256.Sum256(first)
+	if _, err := f.users[0].Put(context.Background(), firstHash, bytes.NewReader(first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.users[0].Put(context.Background(), firstHash, bytes.NewReader(first)); err != nil {
+		t.Fatalf("idempotent entitlement consumed quota: %v", err)
+	}
+	last := []byte("678")
+	lastHash := sha256.Sum256(last)
+	if _, err := f.users[0].Put(context.Background(), lastHash, bytes.NewReader(last)); err != nil {
+		t.Fatalf("exact quota boundary rejected: %v", err)
+	}
+	over := []byte("x")
+	overHash := sha256.Sum256(over)
+	if _, err := f.users[0].Put(context.Background(), overHash, bytes.NewReader(over)); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("over quota error=%v", err)
+	}
+	if _, err := os.Stat(hashPath(f.blobs, overHash)); !os.IsNotExist(err) {
+		t.Fatalf("over-quota blob was published: %v", err)
+	}
+	if report, err := f.repo.Audit(context.Background()); err != nil || report.Orphans != 0 {
+		t.Fatalf("over-quota audit=%#v err=%v", report, err)
+	}
+	// Global physical dedupe does not waive tenant-logical quota accounting.
+	if _, err := f.users[1].Put(context.Background(), firstHash, bytes.NewReader(first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.users[1].Put(context.Background(), lastHash, bytes.NewReader(last)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.users[1].Put(context.Background(), overHash, bytes.NewReader(over)); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("second tenant logical quota error=%v", err)
+	}
+}
+
+func TestConcurrentQuotaRaceAllowsOnlyOnePublication(t *testing.T) {
+	f := newFixtureWithQuota(t, 1, 6)
+	var sequence int
+	var databaseName, databasePath string
+	if err := f.db.QueryRow("PRAGMA database_list").Scan(&sequence, &databaseName, &databasePath); err != nil {
+		t.Fatal(err)
+	}
+	otherDB, err := database.Open(context.Background(), databasePath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherDB.Close()
+	otherRepo, err := openWithQuota(otherDB, f.blobs, f.staging, fixedClock{time.Unix(100, 0)}, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherRepo.Close()
+	otherUser, err := otherRepo.ForUser(f.ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := [][]byte{[]byte("aaaa"), []byte("bbbb")}
+	boundUsers := []*UserRepository{f.users[0], otherUser}
+	start := make(chan struct{})
+	results := make(chan struct {
+		hash [sha256.Size]byte
+		err  error
+	}, 2)
+	for index, content := range contents {
+		content := content
+		bound := boundUsers[index]
+		go func() {
+			<-start
+			hash := sha256.Sum256(content)
+			_, err := bound.Put(context.Background(), hash, bytes.NewReader(content))
+			results <- struct {
+				hash [sha256.Size]byte
+				err  error
+			}{hash, err}
+		}()
+	}
+	close(start)
+	success, quota := 0, 0
+	var rejected [sha256.Size]byte
+	for range 2 {
+		result := <-results
+		switch {
+		case result.err == nil:
+			success++
+		case errors.Is(result.err, ErrQuotaExceeded):
+			quota++
+			rejected = result.hash
+		default:
+			t.Fatalf("unexpected quota race error=%v", result.err)
+		}
+	}
+	if success != 1 || quota != 1 {
+		t.Fatalf("quota race success=%d quota=%d", success, quota)
+	}
+	if _, err := os.Stat(hashPath(f.blobs, rejected)); !os.IsNotExist(err) {
+		t.Fatalf("quota loser published final blob: %v", err)
+	}
+	if report, err := f.repo.Audit(context.Background()); err != nil || report.Orphans != 0 || report.Registered != 1 {
+		t.Fatalf("quota race audit=%#v err=%v", report, err)
+	}
+}
+
 func TestCrossTenantUnknownAndInactiveAreSameUnavailable(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, 2)
@@ -96,6 +202,14 @@ func TestCrossTenantUnknownAndInactiveAreSameUnavailable(t *testing.T) {
 	}
 	if _, err := f.users[0].Get(context.Background(), hash); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("inactive get=%v", err)
+	}
+	inactiveContent := []byte("inactive write")
+	inactiveHash := sha256.Sum256(inactiveContent)
+	if _, err := f.users[0].Put(context.Background(), inactiveHash, bytes.NewReader(inactiveContent)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("inactive put=%v", err)
+	}
+	if _, err := os.Stat(hashPath(f.blobs, inactiveHash)); !os.IsNotExist(err) {
+		t.Fatalf("inactive user published blob: %v", err)
 	}
 }
 
@@ -353,6 +467,12 @@ func TestOpenRejectsSameAndSymlinkRoots(t *testing.T) {
 	db, cleanup := testDB(t)
 	defer cleanup()
 	root := t.TempDir()
+	if _, err := OpenWithQuota(db, filepath.Join(root, "invalid-blobs"), filepath.Join(root, "invalid-stage"), 0); err == nil {
+		t.Fatal("zero quota accepted")
+	}
+	if _, err := OpenWithQuota(db, filepath.Join(root, "huge-blobs"), filepath.Join(root, "huge-stage"), MaxUserQuotaBytes+1); err == nil {
+		t.Fatal("oversized quota accepted")
+	}
 	if _, err := Open(db, root, root); !errors.Is(err, ErrUnsafeStorage) {
 		t.Fatalf("same root=%v", err)
 	}
@@ -402,12 +522,17 @@ type fixture struct {
 
 func newFixture(t *testing.T, users int) *fixture {
 	t.Helper()
+	return newFixtureWithQuota(t, users, DefaultUserQuotaBytes)
+}
+
+func newFixtureWithQuota(t *testing.T, users int, quota int64) *fixture {
+	t.Helper()
 	db, cleanup := testDB(t)
 	t.Cleanup(cleanup)
 	root := t.TempDir()
 	blobs := filepath.Join(root, "blobs")
 	staging := filepath.Join(root, "staging")
-	repo, err := open(db, blobs, staging, fixedClock{time.Unix(100, 0)})
+	repo, err := openWithQuota(db, blobs, staging, fixedClock{time.Unix(100, 0)}, quota)
 	if err != nil {
 		t.Fatal(err)
 	}

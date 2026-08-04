@@ -26,6 +26,7 @@ Standardwerte:
 | `REMEMBER_DB_PATH` | `data/sqlite/remember.db` |
 | `REMEMBER_BLOB_ROOT` | `data/blobs` |
 | `REMEMBER_STAGING_PATH` | `data/staging` |
+| `REMEMBER_USER_BLOB_QUOTA_BYTES` | `1073741824` (1 GiB) |
 | `REMEMBER_HTTP_READ_HEADER_TIMEOUT` | `5s` |
 | `REMEMBER_HTTP_READ_TIMEOUT` | `15s` |
 | `REMEMBER_HTTP_WRITE_TIMEOUT` | `30s` |
@@ -33,11 +34,11 @@ Standardwerte:
 | `REMEMBER_SHUTDOWN_TIMEOUT` | `15s` |
 | `REMEMBER_DB_BUSY_TIMEOUT` | `5s` |
 
-Der Datenbankwert ist ein Dateipfad, kein frei konfigurierbarer SQLite-DSN. Datenbankdatei, Blob-Root und Staging-Root müssen verschieden sein; Blob und Staging müssen auf demselben lokalen Dateisystem liegen. Ein Blob ist in V1 fest auf **8 MiB** begrenzt. Vor Readiness werden abgebrochene Uploads bereinigt und alle registrierten Blobs vollständig geprüft.
+Der Datenbankwert ist ein Dateipfad, kein frei konfigurierbarer SQLite-DSN. Datenbankdatei, Blob-Root und Staging-Root müssen verschieden sein; Blob und Staging müssen auf demselben lokalen Dateisystem liegen. Ein Blob ist in V1 fest auf **8 MiB** begrenzt. Die logische Benutzerquota zählt alle eindeutigen berechtigten Inhaltsversionen, beträgt standardmäßig 1 GiB und darf höchstens 1 TiB betragen. Vor Readiness werden abgebrochene Uploads bereinigt und alle registrierten Blobs vollständig geprüft.
 
 ## Öffentliche HTTP-Routen
 
-Neben `/healthz` und `/readyz` stellt der Server derzeit ausschließlich den begrenzten M2-Auth-Transport bereit:
+Neben `/healthz` und `/readyz` stellt der Server derzeit den begrenzten M2-Auth- und Blob-Transport bereit:
 
 - `POST /v1/auth/login`
 - `POST /v1/auth/refresh`
@@ -45,8 +46,11 @@ Neben `/healthz` und `/readyz` stellt der Server derzeit ausschließlich den beg
 - `GET /v1/sessions`
 - `PATCH|DELETE /v1/devices/{uuidv7}`
 - `DELETE /v1/sessions/{uuidv7}`
+- `PUT|GET /v1/blobs/{sha256}`
 
-JSON-Requests sind auf 16 KiB begrenzt und werden strikt validiert. Login und Refresh besitzen feste globale und geheimnisgebundene Mindest-Rate-Limits; `429` liefert `Retry-After`. Der Limiter speichert nur SHA-256-Schlüssel und wertet weder `X-Forwarded-For` noch andere Client-IP-Header aus. Registrierung, Recovery, Sync und Blob-Bytes sind noch nicht öffentlich.
+Blob-PUT verlangt einen unkomprimierten `application/octet-stream` mit bekannter Länge bis 8 MiB; Blob-GET ist mandantengebunden und nicht cachebar. Fremde, unbekannte und nicht berechtigte Hashes sind öffentlich nicht unterscheidbar. Range- und Conditional-Requests werden noch nicht unterstützt.
+
+JSON-Requests sind auf 16 KiB begrenzt und werden strikt validiert. Login und Refresh besitzen feste globale und geheimnisgebundene Mindest-Rate-Limits; `429` liefert `Retry-After`. Der Limiter speichert nur SHA-256-Schlüssel und wertet weder `X-Forwarded-For` noch andere Client-IP-Header aus. Registrierung, Recovery und Sync sind noch nicht öffentlich.
 
 ## Docker
 

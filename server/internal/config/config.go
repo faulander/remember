@@ -15,6 +15,7 @@ const (
 	EnvDatabasePath      = "REMEMBER_DB_PATH"
 	EnvBlobRoot          = "REMEMBER_BLOB_ROOT"
 	EnvStagingPath       = "REMEMBER_STAGING_PATH"
+	EnvUserBlobQuota     = "REMEMBER_USER_BLOB_QUOTA_BYTES"
 	EnvReadHeaderTimeout = "REMEMBER_HTTP_READ_HEADER_TIMEOUT"
 	EnvReadTimeout       = "REMEMBER_HTTP_READ_TIMEOUT"
 	EnvWriteTimeout      = "REMEMBER_HTTP_WRITE_TIMEOUT"
@@ -25,16 +26,17 @@ const (
 
 // Config contains only the foundation server settings.
 type Config struct {
-	ListenAddr        string
-	DatabasePath      string
-	BlobRoot          string
-	StagingPath       string
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	ShutdownTimeout   time.Duration
-	DatabaseBusy      time.Duration
+	ListenAddr         string
+	DatabasePath       string
+	BlobRoot           string
+	StagingPath        string
+	ReadHeaderTimeout  time.Duration
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	ShutdownTimeout    time.Duration
+	DatabaseBusy       time.Duration
+	UserBlobQuotaBytes int64
 }
 
 // LookupEnv is compatible with os.LookupEnv and makes loading testable.
@@ -43,22 +45,30 @@ type LookupEnv func(string) (string, bool)
 // Load reads strict environment overrides over secure development defaults.
 func Load(lookup LookupEnv) (Config, error) {
 	cfg := Config{
-		ListenAddr:        "127.0.0.1:8080",
-		DatabasePath:      "data/sqlite/remember.db",
-		BlobRoot:          "data/blobs",
-		StagingPath:       "data/staging",
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		ShutdownTimeout:   15 * time.Second,
-		DatabaseBusy:      5 * time.Second,
+		ListenAddr:         "127.0.0.1:8080",
+		DatabasePath:       "data/sqlite/remember.db",
+		BlobRoot:           "data/blobs",
+		StagingPath:        "data/staging",
+		ReadHeaderTimeout:  5 * time.Second,
+		ReadTimeout:        15 * time.Second,
+		WriteTimeout:       30 * time.Second,
+		IdleTimeout:        60 * time.Second,
+		ShutdownTimeout:    15 * time.Second,
+		DatabaseBusy:       5 * time.Second,
+		UserBlobQuotaBytes: 1024 * 1024 * 1024,
 	}
 
 	stringValue(lookup, EnvListenAddr, &cfg.ListenAddr)
 	stringValue(lookup, EnvDatabasePath, &cfg.DatabasePath)
 	stringValue(lookup, EnvBlobRoot, &cfg.BlobRoot)
 	stringValue(lookup, EnvStagingPath, &cfg.StagingPath)
+	if value, ok := lookup(EnvUserBlobQuota); ok {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || strconv.FormatInt(parsed, 10) != value {
+			return Config{}, fmt.Errorf("parse %s: expected canonical positive integer bytes", EnvUserBlobQuota)
+		}
+		cfg.UserBlobQuotaBytes = parsed
+	}
 	for name, target := range map[string]*time.Duration{
 		EnvReadHeaderTimeout: &cfg.ReadHeaderTimeout,
 		EnvReadTimeout:       &cfg.ReadTimeout,
@@ -135,6 +145,9 @@ func (c Config) Validate() error {
 	}
 	if c.ReadHeaderTimeout > c.ReadTimeout {
 		return fmt.Errorf("%s must not exceed %s", EnvReadHeaderTimeout, EnvReadTimeout)
+	}
+	if c.UserBlobQuotaBytes <= 0 || c.UserBlobQuotaBytes > 1024*1024*1024*1024 {
+		return fmt.Errorf("%s must be between 1 byte and 1 TiB", EnvUserBlobQuota)
 	}
 	return nil
 }

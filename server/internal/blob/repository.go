@@ -19,12 +19,17 @@ import (
 	"github.com/google/uuid"
 )
 
-const MaxBlobBytes int64 = 8 * 1024 * 1024
+const (
+	MaxBlobBytes          int64 = 8 * 1024 * 1024
+	DefaultUserQuotaBytes int64 = 1024 * 1024 * 1024
+	MaxUserQuotaBytes     int64 = 1024 * 1024 * 1024 * 1024
+)
 
 var (
 	ErrUnavailable   = errors.New("blob unavailable")
 	ErrTooLarge      = errors.New("blob exceeds 8 MiB")
 	ErrHashMismatch  = errors.New("blob hash mismatch")
+	ErrQuotaExceeded = errors.New("user blob quota exceeded")
 	ErrIntegrity     = errors.New("blob integrity failure")
 	ErrUnsafeStorage = errors.New("unsafe blob storage")
 	ErrClosed        = errors.New("blob repository closed")
@@ -41,6 +46,7 @@ type Repository struct {
 	blobStorage           *securedRoot
 	stagingStorage        *securedRoot
 	clock                 Clock
+	userQuotaBytes        int64
 	mu                    sync.RWMutex
 	closed                bool
 }
@@ -68,11 +74,23 @@ func (r AuditReport) Healthy() bool {
 }
 
 func Open(db *sql.DB, blobRoot, stagingRoot string) (*Repository, error) {
-	return open(db, blobRoot, stagingRoot, systemClock{})
+	return OpenWithQuota(db, blobRoot, stagingRoot, DefaultUserQuotaBytes)
 }
+
+func OpenWithQuota(db *sql.DB, blobRoot, stagingRoot string, userQuotaBytes int64) (*Repository, error) {
+	return openWithQuota(db, blobRoot, stagingRoot, systemClock{}, userQuotaBytes)
+}
+
 func open(db *sql.DB, blobRoot, stagingRoot string, clock Clock) (*Repository, error) {
+	return openWithQuota(db, blobRoot, stagingRoot, clock, DefaultUserQuotaBytes)
+}
+
+func openWithQuota(db *sql.DB, blobRoot, stagingRoot string, clock Clock, userQuotaBytes int64) (*Repository, error) {
 	if db == nil || clock == nil {
 		return nil, errors.New("blob repository dependency is nil")
+	}
+	if userQuotaBytes <= 0 || userQuotaBytes > MaxUserQuotaBytes {
+		return nil, errors.New("invalid user blob quota")
 	}
 	blobs, err := prepareRoot(blobRoot)
 	if err != nil {
@@ -116,6 +134,7 @@ func open(db *sql.DB, blobRoot, stagingRoot string, clock Clock) (*Repository, e
 	return &Repository{
 		db: db, blobRoot: blobs, stagingRoot: staging,
 		blobStorage: blobStorage, stagingStorage: stagingStorage, clock: clock,
+		userQuotaBytes: userQuotaBytes,
 	}, nil
 }
 
@@ -223,23 +242,46 @@ func (u *UserRepository) Put(ctx context.Context, expected [sha256.Size]byte, so
 	if !bytes.Equal(actual[:], expected[:]) {
 		return PutResult{}, ErrHashMismatch
 	}
-	if err := publish(r.stagingStorage, stage, r.blobStorage, expected, written); err != nil {
-		return PutResult{}, err
-	}
-	keep = false // publish removes staging on success or verified dedupe.
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return PutResult{}, fmt.Errorf("begin blob entitlement: %w", err)
 	}
 	defer tx.Rollback()
-	var active int
-	if err := tx.QueryRowContext(ctx, "SELECT 1 FROM users WHERE id=? AND status='active'", u.userID[:]).Scan(&active); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return PutResult{}, ErrUnavailable
-		}
-		return PutResult{}, fmt.Errorf("validate blob user: %w", err)
+	// A write before quota reads serializes independent Repository instances on
+	// SQLite's durable state. This prevents two concurrent new entitlements from
+	// both observing the same remaining quota.
+	activeResult, err := tx.ExecContext(ctx, `UPDATE users SET id=id WHERE id=? AND status='active'`, u.userID[:])
+	if err != nil {
+		return PutResult{}, fmt.Errorf("lock blob user: %w", err)
 	}
+	activeRows, err := activeResult.RowsAffected()
+	if err != nil {
+		return PutResult{}, fmt.Errorf("count active blob user: %w", err)
+	}
+	if activeRows != 1 {
+		return PutResult{}, ErrUnavailable
+	}
+	var entitled int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM user_content_blobs WHERE user_id=? AND hash=?)`, u.userID[:], expected[:]).Scan(&entitled); err != nil {
+		return PutResult{}, fmt.Errorf("read blob entitlement: %w", err)
+	}
+	if entitled == 0 {
+		var usage int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(b.size_bytes),0)
+			FROM user_content_blobs ub JOIN content_blobs b ON b.hash=ub.hash
+			WHERE ub.user_id=?`, u.userID[:]).Scan(&usage); err != nil {
+			return PutResult{}, fmt.Errorf("read blob quota usage: %w", err)
+		}
+		if usage < 0 || written > r.userQuotaBytes || usage > r.userQuotaBytes-written {
+			return PutResult{}, ErrQuotaExceeded
+		}
+	}
+	if err := publish(r.stagingStorage, stage, r.blobStorage, expected, written); err != nil {
+		return PutResult{}, err
+	}
+	keep = false // publish removes staging on success or verified dedupe.
 	now := r.clock.Now().UTC().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO content_blobs(hash,size_bytes,available,created_at_ms)
 		VALUES(?,?,1,?) ON CONFLICT(hash) DO NOTHING`, expected[:], written, now); err != nil {

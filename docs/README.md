@@ -19,5 +19,6 @@
 | [0006](adr/0006-m2-blob-repository.md) | Internes Blob-Repository |
 | [0007](adr/0007-m2-sessions-devices-core.md) | Sessions- und Devices-Core |
 | [0008](adr/0008-m2-auth-http-transport.md) | Begrenzter Auth-HTTP-Transport |
+| [0009](adr/0009-m2-blob-http-transport.md) | Authentifizierter Blob-HTTP-Transport und Benutzerquota |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

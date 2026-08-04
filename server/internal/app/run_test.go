@@ -1,7 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -78,9 +82,50 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authResponse.Body.Close()
 	if authResponse.StatusCode != http.StatusOK {
-		t.Errorf("auth transport status = %d", authResponse.StatusCode)
+		authResponse.Body.Close()
+		t.Fatalf("auth transport status = %d", authResponse.StatusCode)
+	}
+	var authPayload struct {
+		Tokens struct {
+			AccessToken string `json:"access_token"`
+		} `json:"tokens"`
+	}
+	if err := json.NewDecoder(authResponse.Body).Decode(&authPayload); err != nil {
+		authResponse.Body.Close()
+		t.Fatal(err)
+	}
+	authResponse.Body.Close()
+	blobContent := []byte("# HTTP blob roundtrip\n")
+	blobHash := sha256.Sum256(blobContent)
+	blobURL := "http://" + address + "/v1/blobs/" + hex.EncodeToString(blobHash[:])
+	putRequest, err := http.NewRequest(http.MethodPut, blobURL, bytes.NewReader(blobContent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putRequest.Header.Set("Authorization", "Bearer "+authPayload.Tokens.AccessToken)
+	putRequest.Header.Set("Content-Type", "application/octet-stream")
+	putResponse, err := http.DefaultClient.Do(putRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putResponse.Body.Close()
+	if putResponse.StatusCode != http.StatusOK {
+		t.Fatalf("blob PUT status=%d", putResponse.StatusCode)
+	}
+	getRequest, err := http.NewRequest(http.MethodGet, blobURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getRequest.Header.Set("Authorization", "Bearer "+authPayload.Tokens.AccessToken)
+	getResponse, err := http.DefaultClient.Do(getRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBlob, readErr := io.ReadAll(getResponse.Body)
+	getResponse.Body.Close()
+	if readErr != nil || getResponse.StatusCode != http.StatusOK || !bytes.Equal(gotBlob, blobContent) {
+		t.Fatalf("blob GET status=%d body=%q err=%v", getResponse.StatusCode, gotBlob, readErr)
 	}
 
 	cancel()

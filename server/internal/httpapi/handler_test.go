@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/faulander/remember/server/internal/blob"
 	"github.com/faulander/remember/server/internal/database"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
@@ -24,6 +28,7 @@ import (
 const (
 	testAccess  = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	testRefresh = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	testAccessB = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 )
 
 var (
@@ -31,6 +36,7 @@ var (
 	testDeviceID  = uuid.MustParse("018f0000-0000-7000-8000-000000000002")
 	testSessionID = uuid.MustParse("018f0000-0000-7000-8000-000000000003")
 	targetID      = uuid.MustParse("018f0000-0000-7000-8000-000000000004")
+	testUserBID   = uuid.MustParse("018f0000-0000-7000-8000-000000000005")
 )
 
 func TestHealthAndReadiness(t *testing.T) {
@@ -328,6 +334,166 @@ func TestLogsContainNoCredentialsDynamicIDsOrQuery(t *testing.T) {
 	}
 }
 
+func TestBlobPutGetAndStrictTransport(t *testing.T) {
+	t.Parallel()
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	blobs := newFakeBlobUser()
+	api.blobForUser = func(userID uuid.UUID) (BlobUserService, error) {
+		if userID != testUserID {
+			t.Fatalf("blob binder user=%s", userID)
+		}
+		return blobs, nil
+	}
+	content := []byte("# authenticated blob\n")
+	hash := sha256.Sum256(content)
+	path := "/v1/blobs/" + hex.EncodeToString(hash[:])
+	request := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"size":21`) {
+		t.Fatalf("blob put=%d %s", response.Code, response.Body.String())
+	}
+	response = assertRequest(t, handler, http.MethodGet, path, "", testAccess, http.StatusOK)
+	if !bytes.Equal(response.Body.Bytes(), content) || response.Header().Get("Content-Type") != "application/octet-stream" ||
+		response.Header().Get("Content-Length") != fmt.Sprint(len(content)) || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("blob get headers/body=%v %q", response.Header(), response.Body.Bytes())
+	}
+
+	for _, mutate := range []func(*http.Request){
+		func(r *http.Request) { r.Header.Set("Content-Type", "application/octet-stream; charset=utf-8") },
+		func(r *http.Request) { r.Header.Set("Content-Encoding", "gzip") },
+		func(r *http.Request) { r.Header.Set("Range", "bytes=0-1") },
+		func(r *http.Request) { r.ContentLength = -1 },
+	} {
+		request = httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+		request.Header.Set("Authorization", "Bearer "+testAccess)
+		request.Header.Set("Content-Type", "application/octet-stream")
+		mutate(request)
+		response = httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		assertError(t, response, http.StatusBadRequest, "invalid_request")
+	}
+	request = httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.ContentLength = int64(len(content) - 1)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	request = httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.ContentLength = int64(len(content) + 1)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	request = httptest.NewRequest(http.MethodPut, path, http.NoBody)
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.ContentLength = blob.MaxBlobBytes + 1
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusRequestEntityTooLarge, "blob_too_large")
+}
+
+func TestBlobAuthOrderingErrorsAndLogSecrecy(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	handler, _, api, cleanup := newHandlerTestWithLogger(t, newFakeSessions(), nil, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer cleanup()
+	request := httptest.NewRequest(http.MethodGet, "/v1/blobs/NOT-A-HASH", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusUnauthorized, "invalid_session")
+	request = httptest.NewRequest(http.MethodGet, "/v1/blobs/NOT-A-HASH?probe=true", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusUnauthorized, "invalid_session")
+
+	content := []byte("private blob")
+	hash := sha256.Sum256(content)
+	rawHash := hex.EncodeToString(hash[:])
+	blobs := newFakeBlobUser()
+	blobs.getErr = blob.ErrUnavailable
+	api.blobForUser = func(uuid.UUID) (BlobUserService, error) { return blobs, nil }
+	response = assertRequest(t, handler, http.MethodGet, "/v1/blobs/"+rawHash, "", testAccess, http.StatusNotFound)
+	assertError(t, response, http.StatusNotFound, "blob_not_found")
+	blobs.putErr = blob.ErrQuotaExceeded
+	request = httptest.NewRequest(http.MethodPut, "/v1/blobs/"+rawHash, bytes.NewReader(content))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusRequestEntityTooLarge, "quota_exceeded")
+	if strings.Contains(logs.String(), rawHash) || !strings.Contains(logs.String(), `"route":"/v1/blobs/{hash}"`) {
+		t.Fatalf("blob log leaked hash or route missing: %s", logs.String())
+	}
+}
+
+func TestBlobCrossTenantAndUnknownAreIndistinguishable(t *testing.T) {
+	t.Parallel()
+	service := newFakeSessions()
+	service.principals = map[string]session.Principal{
+		testAccess:  service.principal,
+		testAccessB: {UserID: testUserBID, DeviceID: testDeviceID, SessionID: testSessionID},
+	}
+	handler, _, api, cleanup := newHandlerTest(t, service)
+	defer cleanup()
+	owner, foreign := newFakeBlobUser(), newFakeBlobUser()
+	content := []byte("tenant A only")
+	hash := sha256.Sum256(content)
+	owner.content[hash] = content
+	api.blobForUser = func(userID uuid.UUID) (BlobUserService, error) {
+		if userID == testUserID {
+			return owner, nil
+		}
+		return foreign, nil
+	}
+	foreignResponse := assertRequest(t, handler, http.MethodGet, "/v1/blobs/"+hex.EncodeToString(hash[:]), "", testAccessB, http.StatusNotFound)
+	unknown := sha256.Sum256([]byte("unknown"))
+	unknownResponse := assertRequest(t, handler, http.MethodGet, "/v1/blobs/"+hex.EncodeToString(unknown[:]), "", testAccessB, http.StatusNotFound)
+	if foreignResponse.Body.String() != unknownResponse.Body.String() {
+		t.Fatalf("foreign=%q unknown=%q", foreignResponse.Body.String(), unknownResponse.Body.String())
+	}
+}
+
+func TestBlobUploadConcurrencyIsBounded(t *testing.T) {
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	blobs := newFakeBlobUser()
+	blobs.block = make(chan struct{})
+	blobs.started = make(chan struct{}, maxConcurrentBlobs)
+	api.blobForUser = func(uuid.UUID) (BlobUserService, error) { return blobs, nil }
+	content := []byte("bounded blob")
+	hash := sha256.Sum256(content)
+	path := "/v1/blobs/" + hex.EncodeToString(hash[:])
+	var group sync.WaitGroup
+	for range maxConcurrentBlobs {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			request := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+			request.Header.Set("Authorization", "Bearer "+testAccess)
+			request.Header.Set("Content-Type", "application/octet-stream")
+			handler.ServeHTTP(httptest.NewRecorder(), request)
+		}()
+	}
+	for range maxConcurrentBlobs {
+		<-blobs.started
+	}
+	request := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusTooManyRequests, "rate_limited")
+	close(blobs.block)
+	group.Wait()
+}
+
 func TestNewRejectsMissingDependencies(t *testing.T) {
 	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
 	if err != nil {
@@ -362,9 +528,11 @@ func newHandlerTestWithLogger(t *testing.T, service *fakeSessions, clock Clock, 
 	if clock == nil {
 		clock = &fakeHTTPClock{now: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
 	}
+	fakeBlobs := newFakeBlobUser()
 	api := &handler{
 		db: db, state: state, sessions: service, limits: newAbuseLimiters(clock),
-		loginSlots: make(chan struct{}, maxConcurrentLogin),
+		loginSlots: make(chan struct{}, maxConcurrentLogin), blobSlots: make(chan struct{}, maxConcurrentBlobs),
+		blobForUser: func(uuid.UUID) (BlobUserService, error) { return fakeBlobs, nil },
 	}
 	wrapped := requestLog(loggerOrDiscard(logger), securityHeaders(api))
 	return wrapped, state, api, func() { db.Close() }
@@ -451,6 +619,7 @@ func assertJSONPath(t *testing.T, response *httptest.ResponseRecorder, object, k
 type fakeSessions struct {
 	mu                                    sync.Mutex
 	principal                             session.Principal
+	principals                            map[string]session.Principal
 	loginResult                           session.LoginResult
 	refreshTokens                         session.Tokens
 	items                                 []session.SessionInfo
@@ -496,6 +665,13 @@ func (f *fakeSessions) AuthenticateAccess(_ context.Context, access string) (ses
 	if f.authenticateErr != nil {
 		return session.Principal{}, f.authenticateErr
 	}
+	if f.principals != nil {
+		principal, ok := f.principals[access]
+		if !ok {
+			return session.Principal{}, session.ErrUnauthenticated
+		}
+		return principal, nil
+	}
 	if access != testAccess {
 		return session.Principal{}, session.ErrUnauthenticated
 	}
@@ -535,6 +711,55 @@ func (f *fakeSessions) RevokeDevice(_ context.Context, access string, id uuid.UU
 	f.receivedAccess = append(f.receivedAccess, access)
 	f.revokedDevice = id
 	return nil
+}
+
+type fakeBlobUser struct {
+	mu             sync.Mutex
+	content        map[[sha256.Size]byte][]byte
+	putErr, getErr error
+	block          chan struct{}
+	started        chan struct{}
+}
+
+func newFakeBlobUser() *fakeBlobUser {
+	return &fakeBlobUser{content: make(map[[sha256.Size]byte][]byte)}
+}
+
+func (f *fakeBlobUser) Put(_ context.Context, expected [sha256.Size]byte, source io.Reader) (blob.PutResult, error) {
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.block != nil {
+		<-f.block
+	}
+	content, err := io.ReadAll(source)
+	if err != nil {
+		return blob.PutResult{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.putErr != nil {
+		return blob.PutResult{}, f.putErr
+	}
+	actual := sha256.Sum256(content)
+	if actual != expected {
+		return blob.PutResult{}, blob.ErrHashMismatch
+	}
+	f.content[expected] = append([]byte(nil), content...)
+	return blob.PutResult{Hash: expected, Size: int64(len(content))}, nil
+}
+
+func (f *fakeBlobUser) Get(_ context.Context, hash [sha256.Size]byte) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	content, ok := f.content[hash]
+	if !ok {
+		return nil, blob.ErrUnavailable
+	}
+	return append([]byte(nil), content...), nil
 }
 
 type fakeHTTPClock struct {

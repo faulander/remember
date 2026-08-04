@@ -4,6 +4,7 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -17,13 +18,17 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/faulander/remember/server/internal/blob"
 	"github.com/faulander/remember/server/internal/database"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
 	"github.com/google/uuid"
 )
 
-const maxJSONBodyBytes int64 = 16 << 10
+const (
+	maxJSONBodyBytes   int64 = 16 << 10
+	maxConcurrentBlobs       = 4
+)
 
 // State controls whether the service may receive new work.
 type State struct{ ready atomic.Bool }
@@ -45,14 +50,22 @@ type SessionService interface {
 }
 
 // Dependencies are explicit and injectable for bounded transport tests.
+type BlobUserService interface {
+	Put(context.Context, [sha256.Size]byte, io.Reader) (blob.PutResult, error)
+	Get(context.Context, [sha256.Size]byte) ([]byte, error)
+}
+
+type BlobForUser func(uuid.UUID) (BlobUserService, error)
+
 type Dependencies struct {
-	Sessions SessionService
-	Clock    Clock
+	Sessions    SessionService
+	BlobForUser BlobForUser
+	Clock       Clock
 }
 
 // New returns the bounded public API.
 func New(db *sql.DB, state *State, logger *slog.Logger, dependencies Dependencies) (http.Handler, error) {
-	if db == nil || state == nil || dependencies.Sessions == nil {
+	if db == nil || state == nil || dependencies.Sessions == nil || dependencies.BlobForUser == nil {
 		return nil, errors.New("http API dependency is nil")
 	}
 	if dependencies.Clock == nil {
@@ -62,22 +75,26 @@ func New(db *sql.DB, state *State, logger *slog.Logger, dependencies Dependencie
 		logger = slog.New(slog.DiscardHandler)
 	}
 	api := &handler{
-		db: db, state: state, sessions: dependencies.Sessions,
+		db: db, state: state, sessions: dependencies.Sessions, blobForUser: dependencies.BlobForUser,
 		limits: newAbuseLimiters(dependencies.Clock), loginSlots: make(chan struct{}, maxConcurrentLogin),
+		blobSlots: make(chan struct{}, maxConcurrentBlobs),
 	}
 	return requestLog(logger, securityHeaders(api)), nil
 }
 
 type handler struct {
-	db         *sql.DB
-	state      *State
-	sessions   SessionService
-	limits     *abuseLimiters
-	loginSlots chan struct{}
+	db          *sql.DB
+	state       *State
+	sessions    SessionService
+	limits      *abuseLimiters
+	loginSlots  chan struct{}
+	blobForUser BlobForUser
+	blobSlots   chan struct{}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.RawQuery != "" {
+	blobRoute := onePathSegment(r.URL.Path, "/v1/blobs/")
+	if r.URL.RawQuery != "" && !blobRoute {
 		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -98,6 +115,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.device(w, r, strings.TrimPrefix(r.URL.Path, "/v1/devices/"))
 	case onePathSegment(r.URL.Path, "/v1/sessions/"):
 		h.session(w, r, strings.TrimPrefix(r.URL.Path, "/v1/sessions/"))
+	case blobRoute:
+		h.blob(w, r, strings.TrimPrefix(r.URL.Path, "/v1/blobs/"))
 	default:
 		writeAPIError(w, r, http.StatusNotFound, "not_found")
 	}
@@ -298,6 +317,166 @@ func (h *handler) session(w http.ResponseWriter, r *http.Request, rawID string) 
 		return
 	}
 	writeJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *handler) blob(w http.ResponseWriter, r *http.Request, rawHash string) {
+	if r.Method != http.MethodPut && r.Method != http.MethodGet {
+		methodNotAllowed(w, r, "PUT, GET")
+		return
+	}
+	_, principal, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	if r.URL.RawQuery != "" {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	hash, err := parseBlobHash(rawHash)
+	if err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if hasUnsupportedBlobHeaders(r) {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	userBlobs, err := h.blobForUser(principal.UserID)
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	if r.Method == http.MethodGet {
+		if err := requireEmptyBody(w, r); err != nil {
+			writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		if !h.acquireBlobSlot(w, r) {
+			return
+		}
+		defer func() { <-h.blobSlots }()
+		content, err := userBlobs.Get(r.Context(), hash)
+		if err != nil {
+			h.writeBlobError(w, r, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+		return
+	}
+
+	contentTypes := r.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	mediaType, parameters, err := mime.ParseMediaType(contentTypes[0])
+	if err != nil || mediaType != "application/octet-stream" || len(parameters) != 0 || r.ContentLength < 0 {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if r.ContentLength > blob.MaxBlobBytes {
+		writeAPIError(w, r, http.StatusRequestEntityTooLarge, "blob_too_large")
+		return
+	}
+	if !h.acquireBlobSlot(w, r) {
+		return
+	}
+	defer func() { <-h.blobSlots }()
+	r.Body = http.MaxBytesReader(w, r.Body, blob.MaxBlobBytes+1)
+	result, err := userBlobs.Put(r.Context(), hash, &exactLengthReader{source: r.Body, remaining: r.ContentLength})
+	if err != nil {
+		h.writeBlobError(w, r, err)
+		return
+	}
+	writeJSON(w, r, http.StatusOK, map[string]any{"hash": hex.EncodeToString(result.Hash[:]), "size": result.Size})
+}
+
+func (h *handler) acquireBlobSlot(w http.ResponseWriter, r *http.Request) bool {
+	select {
+	case h.blobSlots <- struct{}{}:
+		return true
+	default:
+		writeRateLimited(w, r, time.Second)
+		return false
+	}
+}
+
+var errBodyLength = errors.New("request body length mismatch")
+
+type exactLengthReader struct {
+	source    io.Reader
+	remaining int64
+	finished  bool
+}
+
+func (r *exactLengthReader) Read(buffer []byte) (int, error) {
+	if r.finished {
+		return 0, io.EOF
+	}
+	if r.remaining > 0 {
+		if int64(len(buffer)) > r.remaining {
+			buffer = buffer[:r.remaining]
+		}
+		count, err := r.source.Read(buffer)
+		r.remaining -= int64(count)
+		if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && r.remaining > 0 {
+			return count, errBodyLength
+		}
+		return count, err
+	}
+	var extra [1]byte
+	count, err := r.source.Read(extra[:])
+	if count != 0 || err == nil {
+		return 0, errBodyLength
+	}
+	if err != io.EOF {
+		return 0, err
+	}
+	r.finished = true
+	return 0, io.EOF
+}
+
+func parseBlobHash(raw string) ([sha256.Size]byte, error) {
+	var result [sha256.Size]byte
+	if len(raw) != sha256.Size*2 || raw != strings.ToLower(raw) {
+		return result, errors.New("invalid blob hash")
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != sha256.Size {
+		return result, errors.New("invalid blob hash")
+	}
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func hasUnsupportedBlobHeaders(r *http.Request) bool {
+	for _, name := range []string{"Content-Encoding", "Range", "Content-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		if len(r.Header.Values(name)) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *handler) writeBlobError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, blob.ErrUnavailable):
+		writeAPIError(w, r, http.StatusNotFound, "blob_not_found")
+	case errors.Is(err, blob.ErrQuotaExceeded):
+		writeAPIError(w, r, http.StatusRequestEntityTooLarge, "quota_exceeded")
+	case errors.Is(err, blob.ErrTooLarge):
+		writeAPIError(w, r, http.StatusRequestEntityTooLarge, "blob_too_large")
+	case errors.Is(err, blob.ErrHashMismatch):
+		writeAPIError(w, r, http.StatusUnprocessableEntity, "hash_mismatch")
+	case errors.Is(err, errBodyLength):
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+	default:
+		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+	}
 }
 
 func (h *handler) authenticate(w http.ResponseWriter, r *http.Request) (string, session.Principal, bool) {
@@ -533,6 +712,8 @@ func knownRoute(path string) string {
 			return "/v1/devices/{id}"
 		case onePathSegment(path, "/v1/sessions/"):
 			return "/v1/sessions/{id}"
+		case onePathSegment(path, "/v1/blobs/"):
+			return "/v1/blobs/{hash}"
 		default:
 			return "unknown"
 		}

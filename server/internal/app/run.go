@@ -15,6 +15,7 @@ import (
 	"github.com/faulander/remember/server/internal/httpapi"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
+	"github.com/google/uuid"
 )
 
 // Run binds the configured listener and serves until cancellation or failure.
@@ -42,7 +43,7 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 		listener.Close()
 		return err
 	}
-	blobs, err := blob.Open(db, cfg.BlobRoot, cfg.StagingPath)
+	blobs, err := blob.OpenWithQuota(db, cfg.BlobRoot, cfg.StagingPath, cfg.UserBlobQuotaBytes)
 	if err != nil {
 		listener.Close()
 		return fmt.Errorf("open blob repository: %w", err)
@@ -80,7 +81,12 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 		return fmt.Errorf("open session service: %w", err)
 	}
 	state := &httpapi.State{}
-	handler, err := httpapi.New(db, state, logger, httpapi.Dependencies{Sessions: sessionService})
+	handler, err := httpapi.New(db, state, logger, httpapi.Dependencies{
+		Sessions: sessionService,
+		BlobForUser: func(userID uuid.UUID) (httpapi.BlobUserService, error) {
+			return blobs.ForUser(userID)
+		},
+	})
 	if err != nil {
 		listener.Close()
 		return fmt.Errorf("open HTTP API: %w", err)

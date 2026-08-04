@@ -17,7 +17,7 @@ func TestLoadDefaults(t *testing.T) {
 		cfg.BlobRoot != "data/blobs" || cfg.StagingPath != "data/staging" {
 		t.Errorf("defaults = %#v", cfg)
 	}
-	if cfg.ShutdownTimeout != 15*time.Second || cfg.DatabaseBusy != 5*time.Second {
+	if cfg.ShutdownTimeout != 15*time.Second || cfg.DatabaseBusy != 5*time.Second || cfg.UserBlobQuotaBytes != 1<<30 {
 		t.Errorf("timeout defaults = %#v", cfg)
 	}
 }
@@ -36,6 +36,7 @@ func TestLoadOverrides(t *testing.T) {
 		EnvIdleTimeout:       "45s",
 		EnvShutdownTimeout:   "9s",
 		EnvDatabaseBusy:      "750ms",
+		EnvUserBlobQuota:     "536870912",
 	}
 	cfg, err := Load(func(name string) (string, bool) {
 		value, ok := values[name]
@@ -48,7 +49,7 @@ func TestLoadOverrides(t *testing.T) {
 		cfg.BlobRoot != values[EnvBlobRoot] || cfg.StagingPath != values[EnvStagingPath] {
 		t.Errorf("overrides = %#v", cfg)
 	}
-	if cfg.DatabaseBusy != 750*time.Millisecond || cfg.ShutdownTimeout != 9*time.Second {
+	if cfg.DatabaseBusy != 750*time.Millisecond || cfg.ShutdownTimeout != 9*time.Second || cfg.UserBlobQuotaBytes != 536870912 {
 		t.Errorf("duration overrides = %#v", cfg)
 	}
 }
@@ -70,6 +71,10 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		"negative duration":    {EnvDatabaseBusy: "-1s"},
 		"sub-millisecond busy": {EnvDatabaseBusy: "500us"},
 		"header exceeds read":  {EnvReadHeaderTimeout: "20s", EnvReadTimeout: "10s"},
+		"zero blob quota":      {EnvUserBlobQuota: "0"},
+		"negative blob quota":  {EnvUserBlobQuota: "-1"},
+		"noncanonical quota":   {EnvUserBlobQuota: "01"},
+		"quota above maximum":  {EnvUserBlobQuota: "1099511627777"},
 	}
 	for name, values := range tests {
 		t.Run(name, func(t *testing.T) {
