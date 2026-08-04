@@ -15,6 +15,7 @@ import (
 	"github.com/faulander/remember/server/internal/httpapi"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
+	synccore "github.com/faulander/remember/server/internal/sync"
 	"github.com/google/uuid"
 )
 
@@ -80,11 +81,19 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 		listener.Close()
 		return fmt.Errorf("open session service: %w", err)
 	}
+	syncService, err := synccore.NewService(db, nil)
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("open sync service: %w", err)
+	}
 	state := &httpapi.State{}
 	handler, err := httpapi.New(db, state, logger, httpapi.Dependencies{
 		Sessions: sessionService,
 		BlobForUser: func(userID uuid.UUID) (httpapi.BlobUserService, error) {
 			return blobs.ForUser(userID)
+		},
+		SyncForActor: func(userID, deviceID uuid.UUID) (httpapi.SyncActorService, error) {
+			return syncService.ForActor(userID, deviceID)
 		},
 	})
 	if err != nil {

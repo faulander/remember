@@ -12,9 +12,9 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - lokaler SQLite-Index, Reconcile, Watcher und Konflikterkennung
 - modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
 - interner Identity-, Sync-, Sessions- und Devices-Core
-- begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung und mandantengebundene Blob-Bytes
+- begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
 
-Öffentliche Registrierung, Sync-HTTP-Endpunkte, Reminder und sichere Client-Tokenablage folgen in späteren Schnitten.
+Öffentliche Registrierung, Reminder, Client-Outbox und sichere Client-Tokenablage folgen in späteren Schnitten.
 
 ## Repository
 
@@ -87,7 +87,7 @@ Die Entwicklungsstandards binden nur an `127.0.0.1:8080`. Konfiguration, Dockerb
 ## Sicherheitsgrenzen
 
 - Der Serverprozess terminiert kein TLS und darf nicht direkt öffentlich exponiert werden.
-- Öffentliche Registrierung, Recovery und Sync sind noch nicht freigegeben; Blob-Bytes erfordern gültige Sitzungen und unterliegen einer Benutzerquota.
+- Öffentliche Registrierung und Recovery sind noch nicht freigegeben; Blob- und Sync-Routen erfordern gültige Sitzungen, Blob-Bytes unterliegen zusätzlich einer Benutzerquota.
 - Refresh-Tokens müssen später im Betriebssystem-Schlüsselspeicher des Clients liegen; ein Klartext-Fallback ist nicht zulässig.
 - Der Blob-Speicher benötigt ein lokales Dateisystem; Netzwerkdateisysteme werden nicht unterstützt.
 

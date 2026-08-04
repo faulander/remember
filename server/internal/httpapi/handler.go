@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"strconv"
@@ -22,12 +24,15 @@ import (
 	"github.com/faulander/remember/server/internal/database"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
+	synccore "github.com/faulander/remember/server/internal/sync"
 	"github.com/google/uuid"
 )
 
 const (
 	maxJSONBodyBytes   int64 = 16 << 10
 	maxConcurrentBlobs       = 4
+	maxConcurrentSync        = 8
+	maxSyncPullLimit         = 500
 )
 
 // State controls whether the service may receive new work.
@@ -57,15 +62,23 @@ type BlobUserService interface {
 
 type BlobForUser func(uuid.UUID) (BlobUserService, error)
 
+type SyncActorService interface {
+	Submit(context.Context, synccore.Mutation) (synccore.SubmitResult, error)
+	Pull(context.Context, uint64, int) (synccore.PullResult, error)
+}
+
+type SyncForActor func(uuid.UUID, uuid.UUID) (SyncActorService, error)
+
 type Dependencies struct {
-	Sessions    SessionService
-	BlobForUser BlobForUser
-	Clock       Clock
+	Sessions     SessionService
+	BlobForUser  BlobForUser
+	SyncForActor SyncForActor
+	Clock        Clock
 }
 
 // New returns the bounded public API.
 func New(db *sql.DB, state *State, logger *slog.Logger, dependencies Dependencies) (http.Handler, error) {
-	if db == nil || state == nil || dependencies.Sessions == nil || dependencies.BlobForUser == nil {
+	if db == nil || state == nil || dependencies.Sessions == nil || dependencies.BlobForUser == nil || dependencies.SyncForActor == nil {
 		return nil, errors.New("http API dependency is nil")
 	}
 	if dependencies.Clock == nil {
@@ -76,25 +89,29 @@ func New(db *sql.DB, state *State, logger *slog.Logger, dependencies Dependencie
 	}
 	api := &handler{
 		db: db, state: state, sessions: dependencies.Sessions, blobForUser: dependencies.BlobForUser,
-		limits: newAbuseLimiters(dependencies.Clock), loginSlots: make(chan struct{}, maxConcurrentLogin),
-		blobSlots: make(chan struct{}, maxConcurrentBlobs),
+		syncForActor: dependencies.SyncForActor,
+		limits:       newAbuseLimiters(dependencies.Clock), loginSlots: make(chan struct{}, maxConcurrentLogin),
+		blobSlots: make(chan struct{}, maxConcurrentBlobs), syncSlots: make(chan struct{}, maxConcurrentSync),
 	}
 	return requestLog(logger, securityHeaders(api)), nil
 }
 
 type handler struct {
-	db          *sql.DB
-	state       *State
-	sessions    SessionService
-	limits      *abuseLimiters
-	loginSlots  chan struct{}
-	blobForUser BlobForUser
-	blobSlots   chan struct{}
+	db           *sql.DB
+	state        *State
+	sessions     SessionService
+	limits       *abuseLimiters
+	loginSlots   chan struct{}
+	blobForUser  BlobForUser
+	blobSlots    chan struct{}
+	syncForActor SyncForActor
+	syncSlots    chan struct{}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	blobRoute := onePathSegment(r.URL.Path, "/v1/blobs/")
-	if r.URL.RawQuery != "" && !blobRoute {
+	syncChangesRoute := r.URL.Path == "/v1/sync/changes"
+	if r.URL.RawQuery != "" && !blobRoute && !syncChangesRoute {
 		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -117,6 +134,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.session(w, r, strings.TrimPrefix(r.URL.Path, "/v1/sessions/"))
 	case blobRoute:
 		h.blob(w, r, strings.TrimPrefix(r.URL.Path, "/v1/blobs/"))
+	case r.URL.Path == "/v1/sync/operations":
+		h.submitSync(w, r)
+	case syncChangesRoute:
+		h.pullSync(w, r)
 	default:
 		writeAPIError(w, r, http.StatusNotFound, "not_found")
 	}
@@ -319,6 +340,247 @@ func (h *handler) session(w http.ResponseWriter, r *http.Request, rawID string) 
 	writeJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+type syncMutationRequest struct {
+	OperationID  string  `json:"operation_id"`
+	Mutation     string  `json:"mutation"`
+	ObjectID     string  `json:"object_id"`
+	ObjectType   string  `json:"object_type"`
+	BaseRevision uint64  `json:"base_revision"`
+	ParentID     *string `json:"parent_id"`
+	Name         string  `json:"name"`
+	BlobHash     *string `json:"blob_hash"`
+}
+
+type syncSubmitResponse struct {
+	Accepted bool    `json:"accepted"`
+	Conflict *string `json:"conflict"`
+	Revision *uint64 `json:"revision"`
+	Cursor   *uint64 `json:"cursor"`
+}
+
+type syncChangeResponse struct {
+	Cursor      uint64  `json:"cursor"`
+	Mutation    string  `json:"mutation"`
+	OperationID string  `json:"operation_id"`
+	ObjectID    string  `json:"object_id"`
+	ObjectType  string  `json:"object_type"`
+	Revision    uint64  `json:"revision"`
+	ParentID    *string `json:"parent_id"`
+	Name        string  `json:"name"`
+	BlobHash    *string `json:"blob_hash"`
+	Deleted     bool    `json:"deleted"`
+}
+
+func (h *handler) submitSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, r, http.MethodPost)
+		return
+	}
+	_, principal, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	var request syncMutationRequest
+	if err := decodeStrictJSONFields(w, r, &request,
+		"operation_id", "mutation", "object_id", "object_type", "base_revision", "parent_id", "name", "blob_hash"); err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	mutation, err := mapSyncMutation(request)
+	if err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	actor, err := h.syncForActor(principal.UserID, principal.DeviceID)
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	if !h.acquireSyncSlot(w, r) {
+		return
+	}
+	defer func() { <-h.syncSlots }()
+	result, err := actor.Submit(r.Context(), mutation)
+	if err != nil {
+		h.writeSyncError(w, r, err)
+		return
+	}
+	response := syncSubmitResponse{Accepted: result.Accepted}
+	if result.Accepted {
+		revision, cursor := result.Revision, result.Cursor
+		response.Revision, response.Cursor = &revision, &cursor
+	} else {
+		conflict := string(result.Conflict)
+		response.Conflict = &conflict
+	}
+	writeJSON(w, r, http.StatusOK, response)
+}
+
+func (h *handler) pullSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, r, http.MethodGet)
+		return
+	}
+	_, principal, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	after, limit, err := parseSyncQuery(r.URL.RawQuery)
+	if err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if err := requireEmptyBody(w, r); err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	actor, err := h.syncForActor(principal.UserID, principal.DeviceID)
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	if !h.acquireSyncSlot(w, r) {
+		return
+	}
+	defer func() { <-h.syncSlots }()
+	result, err := actor.Pull(r.Context(), after, limit)
+	if err != nil {
+		h.writeSyncError(w, r, err)
+		return
+	}
+	changes := make([]syncChangeResponse, 0, len(result.Changes))
+	for _, item := range result.Changes {
+		change := syncChangeResponse{
+			Cursor: item.Cursor, Mutation: string(item.Mutation), OperationID: item.OperationID.String(),
+			ObjectID: item.ObjectID.String(), ObjectType: string(item.ObjectType), Revision: item.Revision,
+			Name: item.Name, Deleted: item.Deleted,
+		}
+		if item.ParentID != nil {
+			parent := item.ParentID.String()
+			change.ParentID = &parent
+		}
+		if item.BlobHash != nil {
+			hash := hex.EncodeToString(item.BlobHash)
+			change.BlobHash = &hash
+		}
+		changes = append(changes, change)
+	}
+	writeJSON(w, r, http.StatusOK, map[string]any{
+		"changes": changes, "has_more": result.HasMore, "next_cursor": result.NextCursor,
+	})
+}
+
+func mapSyncMutation(request syncMutationRequest) (synccore.Mutation, error) {
+	operationID, err := parseUUIDv7(request.OperationID)
+	if err != nil {
+		return synccore.Mutation{}, err
+	}
+	objectID, err := parseUUIDv7(request.ObjectID)
+	if err != nil {
+		return synccore.Mutation{}, err
+	}
+	kind := synccore.MutationKind(request.Mutation)
+	if kind != synccore.MutationCreate && kind != synccore.MutationUpdate && kind != synccore.MutationMove && kind != synccore.MutationDelete {
+		return synccore.Mutation{}, synccore.ErrInvalidInput
+	}
+	objectType := synccore.ObjectType(request.ObjectType)
+	if objectType != synccore.ObjectNote && objectType != synccore.ObjectFolder {
+		return synccore.Mutation{}, synccore.ErrInvalidInput
+	}
+	if request.BaseRevision > math.MaxInt64 {
+		return synccore.Mutation{}, synccore.ErrInvalidInput
+	}
+	result := synccore.Mutation{
+		OperationID: operationID, Kind: kind, ObjectID: objectID, ObjectType: objectType,
+		BaseRevision: request.BaseRevision, Name: request.Name,
+	}
+	if request.ParentID != nil {
+		parent, err := parseUUIDv7(*request.ParentID)
+		if err != nil {
+			return synccore.Mutation{}, err
+		}
+		result.ParentID = &parent
+	}
+	if request.BlobHash != nil {
+		hash, err := parseBlobHash(*request.BlobHash)
+		if err != nil {
+			return synccore.Mutation{}, err
+		}
+		result.BlobHash = append([]byte(nil), hash[:]...)
+	}
+	return result, nil
+}
+
+func parseSyncQuery(raw string) (uint64, int, error) {
+	if raw == "" {
+		return 0, 0, nil
+	}
+	values := make(map[string]string, 2)
+	for _, part := range strings.Split(raw, "&") {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok || value == "" || (key != "after" && key != "limit") {
+			return 0, 0, synccore.ErrInvalidInput
+		}
+		if _, duplicate := values[key]; duplicate {
+			return 0, 0, synccore.ErrInvalidInput
+		}
+		values[key] = value
+	}
+	var after uint64
+	var err error
+	if rawAfter, ok := values["after"]; ok {
+		after, err = parseCanonicalUint(rawAfter)
+		if err != nil || after > math.MaxInt64 {
+			return 0, 0, synccore.ErrInvalidInput
+		}
+	}
+	var limit int
+	if rawLimit, ok := values["limit"]; ok {
+		parsed, err := parseCanonicalUint(rawLimit)
+		if err != nil || parsed > maxSyncPullLimit {
+			return 0, 0, synccore.ErrInvalidInput
+		}
+		limit = int(parsed)
+	}
+	return after, limit, nil
+}
+
+func parseCanonicalUint(raw string) (uint64, error) {
+	if raw == "" {
+		return 0, synccore.ErrInvalidInput
+	}
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || strconv.FormatUint(value, 10) != raw {
+		return 0, synccore.ErrInvalidInput
+	}
+	return value, nil
+}
+
+func (h *handler) acquireSyncSlot(w http.ResponseWriter, r *http.Request) bool {
+	select {
+	case h.syncSlots <- struct{}{}:
+		return true
+	default:
+		writeRateLimited(w, r, time.Second)
+		return false
+	}
+}
+
+func (h *handler) writeSyncError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, synccore.ErrInvalidInput):
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+	case errors.Is(err, synccore.ErrInactiveActor):
+		writeAPIError(w, r, http.StatusUnauthorized, "invalid_session")
+	case errors.Is(err, synccore.ErrBlobUnavailable):
+		writeAPIError(w, r, http.StatusConflict, "blob_unavailable")
+	case errors.Is(err, synccore.ErrOperationReplayMismatch):
+		writeAPIError(w, r, http.StatusConflict, "operation_replay_mismatch")
+	default:
+		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+	}
+}
+
 func (h *handler) blob(w http.ResponseWriter, r *http.Request, rawHash string) {
 	if r.Method != http.MethodPut && r.Method != http.MethodGet {
 		methodNotAllowed(w, r, "PUT, GET")
@@ -511,6 +773,10 @@ func (h *handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 }
 
 func decodeStrictJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	return decodeStrictJSONFields(w, r, target)
+}
+
+func decodeStrictJSONFields(w http.ResponseWriter, r *http.Request, target any, required ...string) error {
 	contentTypes := r.Header.Values("Content-Type")
 	if len(contentTypes) != 1 {
 		return errors.New("invalid JSON media type")
@@ -520,13 +786,91 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, target any) error 
 		return errors.New("invalid JSON media type")
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
-	decoder := json.NewDecoder(r.Body)
+	content, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	if err := rejectDuplicateJSONKeys(content); err != nil {
+		return err
+	}
+	if len(required) != 0 {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(content, &fields); err != nil || fields == nil {
+			return errors.New("JSON object required")
+		}
+		for _, name := range required {
+			if _, ok := fields[name]; !ok {
+				return errors.New("required JSON field missing")
+			}
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(content))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return errors.New("trailing JSON value")
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(content []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	if err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON value")
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, structured := token.(json.Delim)
+	if !structured {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("invalid JSON object key")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return errors.New("duplicate JSON object key")
+			}
+			seen[key] = struct{}{}
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return errors.New("invalid JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return errors.New("invalid JSON array")
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
 	}
 	return nil
 }
@@ -704,7 +1048,7 @@ func newRequestID() string {
 
 func knownRoute(path string) string {
 	switch path {
-	case "/healthz", "/readyz", "/v1/auth/login", "/v1/auth/refresh", "/v1/auth/logout", "/v1/sessions":
+	case "/healthz", "/readyz", "/v1/auth/login", "/v1/auth/refresh", "/v1/auth/logout", "/v1/sessions", "/v1/sync/operations", "/v1/sync/changes":
 		return path
 	default:
 		switch {

@@ -1,6 +1,6 @@
 # Remember Server
 
-Minimaler modularer Go-Monolith für Remember. Der aktuelle Stand enthält Konfiguration, SQLite-Migrationen, Betriebsprobes, einen internen Identity-Core, einen actor-gebundenen Sync-Core und einen mandantengebundenen, auditierbaren SHA-256-Blob-Speicher. Es gibt weiterhin keine öffentlichen Konto-, E-Mail- oder Sync-Endpunkte.
+Minimaler modularer Go-Monolith für Remember. Der aktuelle Stand enthält Konfiguration, SQLite-Migrationen, Betriebsprobes, Identity-, Sessions- und Sync-Cores sowie einen mandantengebundenen, auditierbaren SHA-256-Blob-Speicher. Öffentlich verfügbar sind begrenzte Auth-, Blob- und Sync-Transporte; Registrierung, E-Mail-Verifikation und Recovery bleiben intern.
 
 ## Lokal starten
 
@@ -38,7 +38,7 @@ Der Datenbankwert ist ein Dateipfad, kein frei konfigurierbarer SQLite-DSN. Date
 
 ## Öffentliche HTTP-Routen
 
-Neben `/healthz` und `/readyz` stellt der Server derzeit den begrenzten M2-Auth- und Blob-Transport bereit:
+Neben `/healthz` und `/readyz` stellt der Server derzeit den begrenzten M2-Auth-, Blob- und Sync-Transport bereit:
 
 - `POST /v1/auth/login`
 - `POST /v1/auth/refresh`
@@ -47,10 +47,14 @@ Neben `/healthz` und `/readyz` stellt der Server derzeit den begrenzten M2-Auth-
 - `PATCH|DELETE /v1/devices/{uuidv7}`
 - `DELETE /v1/sessions/{uuidv7}`
 - `PUT|GET /v1/blobs/{sha256}`
+- `POST /v1/sync/operations`
+- `GET /v1/sync/changes?after={cursor}&limit={n}`
+
+Sync-Operationen sind einzeln und idempotent; fachliche Konflikte bleiben erfolgreiche Antworten. Pull verwendet benutzerspezifische Cursor und höchstens 500 Änderungen pro Seite.
 
 Blob-PUT verlangt einen unkomprimierten `application/octet-stream` mit bekannter Länge bis 8 MiB; Blob-GET ist mandantengebunden und nicht cachebar. Fremde, unbekannte und nicht berechtigte Hashes sind öffentlich nicht unterscheidbar. Range- und Conditional-Requests werden noch nicht unterstützt.
 
-JSON-Requests sind auf 16 KiB begrenzt und werden strikt validiert. Login und Refresh besitzen feste globale und geheimnisgebundene Mindest-Rate-Limits; `429` liefert `Retry-After`. Der Limiter speichert nur SHA-256-Schlüssel und wertet weder `X-Forwarded-For` noch andere Client-IP-Header aus. Registrierung, Recovery und Sync sind noch nicht öffentlich.
+JSON-Requests sind auf 16 KiB begrenzt und werden strikt validiert. Login und Refresh besitzen feste globale und geheimnisgebundene Mindest-Rate-Limits; `429` liefert `Retry-After`. Der Limiter speichert nur SHA-256-Schlüssel und wertet weder `X-Forwarded-For` noch andere Client-IP-Header aus. Registrierung und Recovery sind noch nicht öffentlich; Batch-Sync, Streaming und Server Push sind nicht enthalten.
 
 ## Docker
 

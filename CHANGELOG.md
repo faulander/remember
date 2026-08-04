@@ -20,6 +20,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Sessions-/Devices-Core mit opaken Access-Tokens, rotierenden Refresh-Tokens, Replay-Erkennung und sofortigem Widerruf.
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
+- Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen und paginierten Cursor-Pull.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
 - PRD, technisches Design, Architekturentscheidungen und manuelle Testpläne.
 
@@ -33,7 +34,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Known limitations
 
-- Noch keine öffentliche Registrierung, Recovery, Sync-HTTP-Endpunkte oder Kontolöschung.
+- Noch keine öffentliche Registrierung, Recovery, Kontolöschung, Client-Outbox oder Apply-Journal.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
 - Windows- und Linux-Desktop-Builds wurden noch nicht real auf Zielgeräten geprüft.

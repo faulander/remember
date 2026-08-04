@@ -128,6 +128,83 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 		t.Fatalf("blob GET status=%d body=%q err=%v", getResponse.StatusCode, gotBlob, readErr)
 	}
 
+	operationID := "018f0000-0000-7000-8000-000000000101"
+	objectID := "018f0000-0000-7000-8000-000000000102"
+	syncBody, err := json.Marshal(map[string]any{
+		"operation_id": operationID, "mutation": "create", "object_id": objectID,
+		"object_type": "note", "base_revision": 0, "parent_id": nil,
+		"name": "HTTP Sync.md", "blob_hash": hex.EncodeToString(blobHash[:]),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitRequest, err := http.NewRequest(http.MethodPost, "http://"+address+"/v1/sync/operations", bytes.NewReader(syncBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitRequest.Header.Set("Authorization", "Bearer "+authPayload.Tokens.AccessToken)
+	submitRequest.Header.Set("Content-Type", "application/json")
+	submitResponse, err := http.DefaultClient.Do(submitRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var submitPayload struct {
+		Accepted bool   `json:"accepted"`
+		Cursor   uint64 `json:"cursor"`
+	}
+	if err := json.NewDecoder(submitResponse.Body).Decode(&submitPayload); err != nil {
+		submitResponse.Body.Close()
+		t.Fatal(err)
+	}
+	submitResponse.Body.Close()
+	if submitResponse.StatusCode != http.StatusOK || !submitPayload.Accepted || submitPayload.Cursor != 1 {
+		t.Fatalf("sync submit status=%d payload=%#v", submitResponse.StatusCode, submitPayload)
+	}
+	for _, replay := range []struct {
+		body   []byte
+		status int
+	}{{syncBody, http.StatusOK}, {bytes.Replace(syncBody, []byte("HTTP Sync.md"), []byte("Changed.md"), 1), http.StatusConflict}} {
+		replayRequest, err := http.NewRequest(http.MethodPost, "http://"+address+"/v1/sync/operations", bytes.NewReader(replay.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		replayRequest.Header.Set("Authorization", "Bearer "+authPayload.Tokens.AccessToken)
+		replayRequest.Header.Set("Content-Type", "application/json")
+		replayResponse, err := http.DefaultClient.Do(replayRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replayResponse.Body.Close()
+		if replayResponse.StatusCode != replay.status {
+			t.Fatalf("sync replay status=%d want=%d", replayResponse.StatusCode, replay.status)
+		}
+	}
+	pullRequest, err := http.NewRequest(http.MethodGet, "http://"+address+"/v1/sync/changes?after=0&limit=10", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullRequest.Header.Set("Authorization", "Bearer "+authPayload.Tokens.AccessToken)
+	pullResponse, err := http.DefaultClient.Do(pullRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pullPayload struct {
+		Changes []struct {
+			ObjectID string  `json:"object_id"`
+			BlobHash *string `json:"blob_hash"`
+		} `json:"changes"`
+		NextCursor uint64 `json:"next_cursor"`
+	}
+	if err := json.NewDecoder(pullResponse.Body).Decode(&pullPayload); err != nil {
+		pullResponse.Body.Close()
+		t.Fatal(err)
+	}
+	pullResponse.Body.Close()
+	if pullResponse.StatusCode != http.StatusOK || len(pullPayload.Changes) != 1 || pullPayload.Changes[0].ObjectID != objectID ||
+		pullPayload.Changes[0].BlobHash == nil || *pullPayload.Changes[0].BlobHash != hex.EncodeToString(blobHash[:]) || pullPayload.NextCursor != 1 {
+		t.Fatalf("sync pull status=%d payload=%#v", pullResponse.StatusCode, pullPayload)
+	}
+
 	cancel()
 	select {
 	case err := <-result:

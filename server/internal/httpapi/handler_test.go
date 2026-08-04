@@ -22,6 +22,7 @@ import (
 	"github.com/faulander/remember/server/internal/database"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
+	synccore "github.com/faulander/remember/server/internal/sync"
 	"github.com/google/uuid"
 )
 
@@ -111,6 +112,7 @@ func TestStrictJSONMediaBodyAndMethods(t *testing.T) {
 		{"media parameters", "application/json; charset=utf-8", `{}`},
 		{"unknown field", "application/json", `{"email":"a","password":"b","device_name":"c","user_id":"x"}`},
 		{"trailing value", "application/json", `{"email":"a","password":"b","device_name":"c"} {}`},
+		{"duplicate key", "application/json", `{"email":"a","email":"b","password":"c","device_name":"d"}`},
 		{"malformed", "application/json", `{`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -494,6 +496,248 @@ func TestBlobUploadConcurrencyIsBounded(t *testing.T) {
 	group.Wait()
 }
 
+func TestSyncSubmitPullDTOAndPrincipalBinding(t *testing.T) {
+	t.Parallel()
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	actor := newFakeSyncActor()
+	blobHash := sha256.Sum256([]byte("sync blob"))
+	parent := targetID
+	actor.submitResult = synccore.SubmitResult{Accepted: true, Revision: 3, Cursor: 7}
+	actor.pullResult = synccore.PullResult{
+		Changes: []synccore.VersionState{
+			{Cursor: 7, Mutation: synccore.MutationCreate, OperationID: testSessionID, ObjectID: targetID, ObjectType: synccore.ObjectNote, Revision: 3, Name: "Note.md", BlobHash: blobHash[:]},
+			{Cursor: 8, Mutation: synccore.MutationMove, OperationID: testDeviceID, ObjectID: testUserID, ObjectType: synccore.ObjectFolder, Revision: 2, ParentID: &parent, Name: "Folder", Deleted: false},
+		}, HasMore: true, NextCursor: 8,
+	}
+	var boundUser, boundDevice uuid.UUID
+	api.syncForActor = func(userID, deviceID uuid.UUID) (SyncActorService, error) {
+		boundUser, boundDevice = userID, deviceID
+		return actor, nil
+	}
+	body := validSyncMutationBody(blobHash)
+	response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/operations", body, testAccess, http.StatusOK)
+	var submitted syncSubmitResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &submitted); err != nil {
+		t.Fatal(err)
+	}
+	if !submitted.Accepted || submitted.Revision == nil || *submitted.Revision != 3 || submitted.Cursor == nil || *submitted.Cursor != 7 || submitted.Conflict != nil {
+		t.Fatalf("submit response=%#v", submitted)
+	}
+	actor.mu.Lock()
+	mutation := actor.lastMutation
+	actor.mu.Unlock()
+	if boundUser != testUserID || boundDevice != testDeviceID || mutation.OperationID != testSessionID || mutation.ObjectID != targetID ||
+		mutation.Kind != synccore.MutationCreate || mutation.ObjectType != synccore.ObjectNote || mutation.BaseRevision != 0 || mutation.ParentID != nil ||
+		mutation.Name != "Note.md" || !bytes.Equal(mutation.BlobHash, blobHash[:]) {
+		t.Fatalf("bound=%s/%s mutation=%#v", boundUser, boundDevice, mutation)
+	}
+
+	response = assertRequest(t, handler, http.MethodGet, "/v1/sync/changes?after=6&limit=2", "", testAccess, http.StatusOK)
+	var pulled struct {
+		Changes    []syncChangeResponse `json:"changes"`
+		HasMore    bool                 `json:"has_more"`
+		NextCursor uint64               `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &pulled); err != nil {
+		t.Fatal(err)
+	}
+	if len(pulled.Changes) != 2 || !pulled.HasMore || pulled.NextCursor != 8 || pulled.Changes[0].ParentID != nil ||
+		pulled.Changes[0].BlobHash == nil || *pulled.Changes[0].BlobHash != hex.EncodeToString(blobHash[:]) ||
+		pulled.Changes[1].ParentID == nil || *pulled.Changes[1].ParentID != parent.String() || pulled.Changes[1].BlobHash != nil {
+		t.Fatalf("pull response=%#v", pulled)
+	}
+	actor.mu.Lock()
+	defer actor.mu.Unlock()
+	if actor.lastAfter != 6 || actor.lastLimit != 2 {
+		t.Fatalf("pull arguments=%d/%d", actor.lastAfter, actor.lastLimit)
+	}
+}
+
+func TestSyncConflictReplayAndErrorMapping(t *testing.T) {
+	t.Parallel()
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	actor := newFakeSyncActor()
+	api.syncForActor = func(uuid.UUID, uuid.UUID) (SyncActorService, error) { return actor, nil }
+	hash := sha256.Sum256([]byte("blob"))
+	body := validSyncMutationBody(hash)
+	actor.submitResult = synccore.SubmitResult{Conflict: synccore.ConflictPathCollision}
+	for range 2 {
+		response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/operations", body, testAccess, http.StatusOK)
+		var result syncSubmitResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Accepted || result.Conflict == nil || *result.Conflict != string(synccore.ConflictPathCollision) || result.Revision != nil || result.Cursor != nil {
+			t.Fatalf("conflict response=%#v", result)
+		}
+	}
+	for _, test := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{synccore.ErrInvalidInput, http.StatusBadRequest, "invalid_request"},
+		{synccore.ErrInactiveActor, http.StatusUnauthorized, "invalid_session"},
+		{synccore.ErrBlobUnavailable, http.StatusConflict, "blob_unavailable"},
+		{synccore.ErrOperationReplayMismatch, http.StatusConflict, "operation_replay_mismatch"},
+		{errors.New("sensitive database detail"), http.StatusInternalServerError, "internal_error"},
+	} {
+		actor.submitErr = test.err
+		response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/operations", body, testAccess, test.status)
+		assertError(t, response, test.status, test.code)
+		if strings.Contains(response.Body.String(), "database") {
+			t.Fatal("sync error leaked detail")
+		}
+	}
+	actor.submitErr = nil
+	for _, test := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{synccore.ErrInvalidInput, http.StatusBadRequest, "invalid_request"},
+		{synccore.ErrInactiveActor, http.StatusUnauthorized, "invalid_session"},
+		{errors.New("sensitive pull detail"), http.StatusInternalServerError, "internal_error"},
+	} {
+		actor.pullErr = test.err
+		response := assertRequest(t, handler, http.MethodGet, "/v1/sync/changes", "", testAccess, test.status)
+		assertError(t, response, test.status, test.code)
+	}
+}
+
+func TestSyncStrictInputAuthOrderingMethodsAndQuery(t *testing.T) {
+	t.Parallel()
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	actor := newFakeSyncActor()
+	api.syncForActor = func(uuid.UUID, uuid.UUID) (SyncActorService, error) { return actor, nil }
+	hash := sha256.Sum256([]byte("blob"))
+	valid := validSyncMutationBody(hash)
+	invalidBodies := []string{
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `","user_id":"` + testUserID.String() + `"}`,
+		`{"operation_id":"` + strings.ToUpper(testSessionID.String()) + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + uuid.New().String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + strings.ToUpper(hex.EncodeToString(hash[:])) + `"}`,
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"unknown","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"folder","name":"Folder"}`,
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","mutation":"delete","object_id":"` + targetID.String() + `","object_type":"folder","base_revision":0,"parent_id":null,"name":"Folder","blob_hash":null}`,
+		`{"operation_id":"` + testSessionID.String() + `","mutation":"update","object_id":"` + targetID.String() + `","object_type":"note","base_revision":9223372036854775808,"parent_id":null,"name":"","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
+	}
+	for _, body := range invalidBodies {
+		request := httptest.NewRequest(http.MethodPost, "/v1/sync/operations", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+testAccess)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		assertError(t, response, http.StatusBadRequest, "invalid_request")
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/sync/operations", strings.NewReader(`{`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusUnauthorized, "invalid_session")
+	request = httptest.NewRequest(http.MethodPost, "/v1/sync/operations", strings.NewReader(string(mustJSON(t, valid))+` {}`))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	request = httptest.NewRequest(http.MethodPost, "/v1/sync/operations", bytes.NewReader(mustJSON(t, valid)))
+	request.Header.Set("Authorization", "Bearer "+testAccess)
+	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+
+	for _, query := range []string{
+		"after=", "after=00", "after=%30", "after=%2B1", "after=-1", "after=9223372036854775808", "after=18446744073709551616",
+		"after=0&", "after=1&after=2", "limit=01", "limit=-1", "limit=501", "limit=18446744073709551616", "limit=1&limit=2", "unknown=1",
+	} {
+		response := assertRequest(t, handler, http.MethodGet, "/v1/sync/changes?"+query, "", testAccess, http.StatusBadRequest)
+		assertError(t, response, http.StatusBadRequest, "invalid_request")
+	}
+	response = assertRequest(t, handler, http.MethodGet, "/v1/sync/changes?after=bad", "invalid body", "", http.StatusUnauthorized)
+	assertError(t, response, http.StatusUnauthorized, "invalid_session")
+	response = assertRequest(t, handler, http.MethodGet, "/v1/sync/changes", "x", testAccess, http.StatusBadRequest)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	response = assertRequest(t, handler, http.MethodGet, "/v1/sync/changes", "", testAccess, http.StatusOK)
+	actor.mu.Lock()
+	if actor.lastAfter != 0 || actor.lastLimit != 0 {
+		t.Fatalf("default pull arguments=%d/%d", actor.lastAfter, actor.lastLimit)
+	}
+	actor.mu.Unlock()
+	for _, test := range []struct{ method, path, allow string }{
+		{http.MethodGet, "/v1/sync/operations", "POST"},
+		{http.MethodPost, "/v1/sync/changes", "GET"},
+	} {
+		response = assertRequest(t, handler, test.method, test.path, "", "", http.StatusMethodNotAllowed)
+		if response.Header().Get("Allow") != test.allow {
+			t.Fatalf("Allow=%q want=%q", response.Header().Get("Allow"), test.allow)
+		}
+	}
+}
+
+func TestSyncConcurrencyAndLogSecrecy(t *testing.T) {
+	var logs bytes.Buffer
+	handler, _, api, cleanup := newHandlerTestWithLogger(t, newFakeSessions(), nil, slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer cleanup()
+	actor := newFakeSyncActor()
+	actor.block = make(chan struct{})
+	actor.started = make(chan struct{}, maxConcurrentSync)
+	api.syncForActor = func(uuid.UUID, uuid.UUID) (SyncActorService, error) { return actor, nil }
+	hash := sha256.Sum256([]byte("highly private sync blob"))
+	body := validSyncMutationBody(hash)
+	encoded := mustJSON(t, body)
+	var group sync.WaitGroup
+	for range maxConcurrentSync {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			request := httptest.NewRequest(http.MethodPost, "/v1/sync/operations", bytes.NewReader(encoded))
+			request.Header.Set("Authorization", "Bearer "+testAccess)
+			request.Header.Set("Content-Type", "application/json")
+			handler.ServeHTTP(httptest.NewRecorder(), request)
+		}()
+	}
+	for range maxConcurrentSync {
+		<-actor.started
+	}
+	response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/operations", body, testAccess, http.StatusTooManyRequests)
+	assertError(t, response, http.StatusTooManyRequests, "rate_limited")
+	close(actor.block)
+	group.Wait()
+	querySecret := "987654321"
+	assertRequest(t, handler, http.MethodGet, "/v1/sync/changes?after="+querySecret+"&limit=1", "", testAccess, http.StatusOK)
+	output := logs.String()
+	for _, secret := range []string{testSessionID.String(), targetID.String(), hex.EncodeToString(hash[:]), querySecret, "Note.md"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("sync log leaked %q: %s", secret, output)
+		}
+	}
+	if !strings.Contains(output, `"route":"/v1/sync/operations"`) || !strings.Contains(output, `"route":"/v1/sync/changes"`) {
+		t.Fatalf("sync log routes missing: %s", output)
+	}
+}
+
+func validSyncMutationBody(hash [sha256.Size]byte) map[string]any {
+	return map[string]any{
+		"operation_id": testSessionID.String(), "mutation": "create", "object_id": targetID.String(),
+		"object_type": "note", "base_revision": uint64(0), "parent_id": nil, "name": "Note.md",
+		"blob_hash": hex.EncodeToString(hash[:]),
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
 func TestNewRejectsMissingDependencies(t *testing.T) {
 	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
 	if err != nil {
@@ -529,10 +773,13 @@ func newHandlerTestWithLogger(t *testing.T, service *fakeSessions, clock Clock, 
 		clock = &fakeHTTPClock{now: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
 	}
 	fakeBlobs := newFakeBlobUser()
+	fakeSync := newFakeSyncActor()
 	api := &handler{
 		db: db, state: state, sessions: service, limits: newAbuseLimiters(clock),
 		loginSlots: make(chan struct{}, maxConcurrentLogin), blobSlots: make(chan struct{}, maxConcurrentBlobs),
-		blobForUser: func(uuid.UUID) (BlobUserService, error) { return fakeBlobs, nil },
+		syncSlots:    make(chan struct{}, maxConcurrentSync),
+		blobForUser:  func(uuid.UUID) (BlobUserService, error) { return fakeBlobs, nil },
+		syncForActor: func(uuid.UUID, uuid.UUID) (SyncActorService, error) { return fakeSync, nil },
 	}
 	wrapped := requestLog(loggerOrDiscard(logger), securityHeaders(api))
 	return wrapped, state, api, func() { db.Close() }
@@ -760,6 +1007,49 @@ func (f *fakeBlobUser) Get(_ context.Context, hash [sha256.Size]byte) ([]byte, e
 		return nil, blob.ErrUnavailable
 	}
 	return append([]byte(nil), content...), nil
+}
+
+type fakeSyncActor struct {
+	mu           sync.Mutex
+	submitResult synccore.SubmitResult
+	pullResult   synccore.PullResult
+	submitErr    error
+	pullErr      error
+	lastMutation synccore.Mutation
+	lastAfter    uint64
+	lastLimit    int
+	block        chan struct{}
+	started      chan struct{}
+}
+
+func newFakeSyncActor() *fakeSyncActor {
+	return &fakeSyncActor{submitResult: synccore.SubmitResult{Accepted: true, Revision: 1, Cursor: 1}}
+}
+
+func (f *fakeSyncActor) Submit(_ context.Context, mutation synccore.Mutation) (synccore.SubmitResult, error) {
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.block != nil {
+		<-f.block
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastMutation = mutation
+	return f.submitResult, f.submitErr
+}
+
+func (f *fakeSyncActor) Pull(_ context.Context, after uint64, limit int) (synccore.PullResult, error) {
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.block != nil {
+		<-f.block
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastAfter, f.lastLimit = after, limit
+	return f.pullResult, f.pullErr
 }
 
 type fakeHTTPClock struct {
