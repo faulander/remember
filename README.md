@@ -1,0 +1,98 @@
+# Remember
+
+Remember ist eine plattformübergreifende Local-first-Anwendung für persönliche Markdown-Notizen, Ordner und Erinnerungen. Normale `.md`-Dateien bleiben die kanonische lokale Datenquelle; ein zentraler Server synchronisiert mehrere eigene Geräte.
+
+> **Status:** frühe Entwicklung, noch kein produktionsreifes Release. Builds sind derzeit unsigniert und werden manuell aktualisiert.
+
+## Aktueller Stand
+
+- lokaler macOS-Desktop-Client mit Wails, Go, Svelte 5 und TypeScript
+- echte Markdown-Dateien mit versioniertem YAML-Frontmatter
+- verschachtelte Ordner, Tags, Vorschau, Themes und recoverbares Löschen
+- lokaler SQLite-Index, Reconcile, Watcher und Konflikterkennung
+- modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
+- interner Identity-, Sync-, Sessions- und Devices-Core
+- begrenzter HTTP-Transport für Login, Tokenrotation und Sitzungs-/Geräteverwaltung
+
+Öffentliche Registrierung, Sync-/Blob-HTTP-Endpunkte, Reminder und sichere Client-Tokenablage folgen in späteren Schnitten.
+
+## Repository
+
+```text
+client/        Wails-Desktop-Client und Svelte-Frontend
+server/        modularer Go-Server und Dockerfile
+docs/          PRD, Design, ADRs und manuelle Testpläne
+go.work        gemeinsamer Workspace für getrennte Go-Module
+```
+
+Die Go-Module unter `client/` und `server/` bleiben bewusst getrennt.
+
+## Voraussetzungen
+
+- Go gemäß `client/go.mod` und `server/go.mod`
+- Node.js und npm
+- Wails 2 für Desktop-Builds
+- für produktionsnahe Serverläufe ein zuverlässiges lokales Linux-Dateisystem
+
+## Entwicklung
+
+### Tests
+
+```bash
+go test ./client/... ./server/...
+go test -race ./client/...
+go test -race ./server/...
+go vet ./client/... ./server/...
+
+cd client/frontend
+npm ci
+npm run check
+npm test -- --run
+npm run build
+```
+
+### Desktop-Client
+
+```bash
+cd client
+wails dev
+```
+
+Produktionsnaher lokaler Build:
+
+```bash
+cd client
+wails build -clean
+```
+
+Unter macOS entsteht die App unter `client/build/bin/Remember.app`.
+
+### Server
+
+```bash
+cd server
+go run ./cmd/remember-server
+```
+
+Die Entwicklungsstandards binden nur an `127.0.0.1:8080`. Konfiguration, Dockerbetrieb und öffentliche Routen sind in [`server/README.md`](server/README.md) beschrieben.
+
+## Dokumentation
+
+- [Produktanforderungen](docs/PRD.md)
+- [Technisches Design](docs/DESIGN.md)
+- [Architekturentscheidungen](docs/adr/)
+- [macOS-Manuelltests](docs/MANUAL_TESTS_MAC_CLIENT.md)
+- [Änderungshistorie](CHANGELOG.md)
+
+## Sicherheitsgrenzen
+
+- Der Serverprozess terminiert kein TLS und darf nicht direkt öffentlich exponiert werden.
+- Öffentliche Registrierung, Recovery, Sync und Blob-Bytes sind noch nicht freigegeben.
+- Refresh-Tokens müssen später im Betriebssystem-Schlüsselspeicher des Clients liegen; ein Klartext-Fallback ist nicht zulässig.
+- Der Blob-Speicher benötigt ein lokales Dateisystem; Netzwerkdateisysteme werden nicht unterstützt.
+
+Sicherheitsprobleme sollten nicht über öffentliche Issues mit Geheimnissen oder Nutzerdaten gemeldet werden.
+
+## Lizenz
+
+Eine öffentliche Lizenz wurde noch nicht festgelegt. Bis dahin gelten die gesetzlichen Standardrechte; Nutzung oder Weiterverteilung ist nicht automatisch gestattet.
