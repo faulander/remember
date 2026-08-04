@@ -84,6 +84,15 @@ func (h *PasswordHasher) Hash(password string) (string, error) {
 	), nil
 }
 
+func (h *PasswordHasher) dummyEncoded() string {
+	salt := make([]byte, h.params.SaltLength)
+	hash := make([]byte, h.params.HashLength)
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version, h.params.Memory, h.params.Iterations, h.params.Parallelism,
+		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(hash),
+	)
+}
+
 // Verify returns whether password matches and whether a successful login should
 // rehash it with the current policy.
 func (h *PasswordHasher) Verify(password, encoded string, storedPolicy int) (bool, bool, error) {

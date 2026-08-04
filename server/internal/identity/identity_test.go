@@ -126,6 +126,43 @@ func TestPasswordPolicyBoundariesAndPHCLimits(t *testing.T) {
 	}
 }
 
+func TestAuthenticateCredentialUsesGenericFailures(t *testing.T) {
+	t.Parallel()
+	clock := &fakeClock{now: time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)}
+	service, db := testService(t, clock)
+	ctx := context.Background()
+	registration, err := service.Register(ctx, "login@example.com", "correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AuthenticateCredential(ctx, "login@example.com", "correct horse battery staple"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("pending credential error = %v", err)
+	}
+	if err := service.VerifyEmail(ctx, registration.VerificationToken); err != nil {
+		t.Fatal(err)
+	}
+	userID, err := service.AuthenticateCredential(ctx, " LOGIN@example.com ", "correct horse battery staple")
+	if err != nil || userID != registration.UserID {
+		t.Fatalf("active credential = %s, %v", userID, err)
+	}
+	for _, attempt := range []struct{ email, password string }{
+		{"missing@example.com", "correct horse battery staple"},
+		{"not an email", "correct horse battery staple"},
+		{"login@example.com", "incorrect horse battery staple"},
+		{"login@example.com", strings.Repeat("x", 1025)},
+	} {
+		if _, err := service.AuthenticateCredential(ctx, attempt.email, attempt.password); !errors.Is(err, ErrInvalidCredentials) {
+			t.Errorf("credential failure for %q = %v", attempt.email, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE users SET status='deletion_pending' WHERE id=?", registration.UserID[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AuthenticateCredential(ctx, "login@example.com", "correct horse battery staple"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("inactive credential error = %v", err)
+	}
+}
+
 func TestRegisterDuplicateAndVerifySingleUse(t *testing.T) {
 	t.Parallel()
 

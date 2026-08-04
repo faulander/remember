@@ -1,6 +1,7 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
@@ -46,8 +47,8 @@ func TestOpenConfiguresSQLiteAndMigrateIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
-		t.Errorf("migration count = %d, want 3", count)
+	if count != 4 {
+		t.Errorf("migration count = %d, want 4", count)
 	}
 
 	info, err := os.Stat(path)
@@ -71,6 +72,122 @@ func TestIdentitySchemaRejectsTextInBlobIdentifiers(t *testing.T) {
 		VALUES ('1234567890123456', 'a@example.com', 'a@example.com', 'hash', 1, 'pending_verification', 1)`)
 	if err == nil {
 		t.Fatal("users accepted a TEXT identifier")
+	}
+}
+
+func TestSessionMigrationUpgradesExistingDevicesStrictly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestDatabase(t)
+	if err := migrateFS(ctx, db, migrationFiles, "migrations/00[1-3]_*.sql"); err != nil {
+		t.Fatal(err)
+	}
+	user, device := []byte("aaaaaaaaaaaaaaaa"), []byte("dddddddddddddddd")
+	if _, err := db.Exec(`INSERT INTO users(id,email_delivery,email_canonical,password_hash,password_policy,status,created_at_ms)
+		VALUES(?,'a@example.com','a@example.com','hash',1,'active',1)`, user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,revoked_at_ms)
+		VALUES(?,?,'existing','active',42,10)`, user, device); err != nil {
+		t.Fatal(err)
+	}
+	revokedDevice := []byte("rrrrrrrrrrrrrrrr")
+	if _, err := db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms)
+		VALUES(?,?,'legacy revoked','revoked',43)`, user, revokedDevice); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var updated int64
+	var activeRevoked sql.NullInt64
+	if err := db.QueryRow("SELECT updated_at_ms,revoked_at_ms FROM devices WHERE user_id=? AND id=?", user, device).Scan(&updated, &activeRevoked); err != nil || updated != 42 || activeRevoked.Valid {
+		t.Fatalf("normalized active device updated=%d revoked=%v err=%v", updated, activeRevoked, err)
+	}
+	var revokedAt int64
+	if err := db.QueryRow("SELECT revoked_at_ms FROM devices WHERE user_id=? AND id=?", user, revokedDevice).Scan(&revokedAt); err != nil || revokedAt != 43 {
+		t.Fatalf("normalized revoked device timestamp=%d err=%v", revokedAt, err)
+	}
+	if _, err := db.Exec("UPDATE devices SET status='revoked' WHERE user_id=? AND id=?", user, device); err == nil {
+		t.Fatal("upgraded device accepted inconsistent revoked lifecycle")
+	}
+	rows, err := db.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("foreign_key_check reported an upgraded-schema violation")
+	}
+}
+
+func TestSessionSchemaEnforcesTenantAndTokenIntegrity(t *testing.T) {
+	t.Parallel()
+	db := openTestDatabase(t)
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	userA := []byte("aaaaaaaaaaaaaaaa")
+	userB := []byte("bbbbbbbbbbbbbbbb")
+	for _, user := range []struct {
+		id, email []byte
+	}{{userA, []byte("a@example.com")}, {userB, []byte("b@example.com")}} {
+		if _, err := db.Exec(`INSERT INTO users(id,email_delivery,email_canonical,password_hash,password_policy,status,created_at_ms)
+			VALUES(?,?,?,'hash',1,'active',1)`, user.id, user.email, user.email); err != nil {
+			t.Fatal(err)
+		}
+	}
+	device := []byte("dddddddddddddddd")
+	if _, err := db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms)
+		VALUES(?,?,'invalid','active',1)`, userA, []byte("xxxxxxxxxxxxxxxx")); err == nil {
+		t.Fatal("device accepted a missing updated timestamp")
+	}
+	if _, err := db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms,revoked_at_ms)
+		VALUES(?,?,'invalid','active',1,1,1)`, userA, []byte("yyyyyyyyyyyyyyyy")); err == nil {
+		t.Fatal("active device accepted a revocation timestamp")
+	}
+	if _, err := db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms)
+		VALUES(?,?,'device','active',1,1)`, userA, device); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := []byte("ssssssssssssssss")
+	absoluteExpiry := int64(1 + (30 * 24 * time.Hour / time.Millisecond))
+	_, err := db.Exec(`INSERT INTO sessions(user_id,id,device_id,status,created_at_ms,expires_at_ms)
+		VALUES(?,?,?,'active',1,?)`, userB, sessionID, device, absoluteExpiry)
+	if err == nil {
+		t.Fatal("session accepted a cross-tenant device")
+	}
+	if _, err := db.Exec(`INSERT INTO sessions(user_id,id,device_id,status,created_at_ms,expires_at_ms)
+		VALUES(?,?,?,'active',1,?)`, userA, sessionID, device, absoluteExpiry); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO access_tokens(token_hash,user_id,session_id,device_id,issued_at_ms,expires_at_ms)
+		VALUES('not-a-blob-hash',?,?,?,1,2)`, userA, sessionID, device)
+	if err == nil {
+		t.Fatal("access token accepted TEXT hash")
+	}
+
+	deviceB := []byte("eeeeeeeeeeeeeeee")
+	sessionB := []byte("tttttttttttttttt")
+	if _, err := db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms)
+		VALUES(?,?,'device B','active',1,1)`, userB, deviceB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions(user_id,id,device_id,status,created_at_ms,expires_at_ms)
+		VALUES(?,?,?,'active',1,?)`, userB, sessionB, deviceB, absoluteExpiry); err != nil {
+		t.Fatal(err)
+	}
+	hashA, hashB := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	if _, err := db.Exec(`INSERT INTO refresh_tokens(token_hash,user_id,session_id,device_id,issued_at_ms,expires_at_ms)
+		VALUES(?,?,?,?,1,?)`, hashA, userA, sessionID, device, absoluteExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO refresh_tokens(token_hash,user_id,session_id,device_id,issued_at_ms,expires_at_ms)
+		VALUES(?,?,?,?,1,?)`, hashB, userB, sessionB, deviceB, absoluteExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE refresh_tokens SET consumed_at_ms=2,replaced_by_hash=? WHERE token_hash=?`, hashB, hashA); err == nil {
+		t.Fatal("refresh lineage accepted a cross-session successor")
 	}
 }
 

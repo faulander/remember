@@ -149,7 +149,8 @@ func TestBlobActorValidationAndInvalidInputsDoNotPersist(t *testing.T) {
 	if _, err := actor.Pull(ctx, 0, 501); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("limit error=%v", err)
 	}
-	if _, err := f.db.Exec("UPDATE devices SET status='revoked' WHERE user_id=? AND id=?", f.users[0][:], f.devices[0][:]); err != nil {
+	if _, err := f.db.Exec(`UPDATE devices SET status='revoked',revoked_at_ms=created_at_ms,updated_at_ms=created_at_ms
+		WHERE user_id=? AND id=?`, f.users[0][:], f.devices[0][:]); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := actor.Submit(ctx, createFolder(newID(t), "Nope", nil)); !errors.Is(err, ErrInactiveActor) {
@@ -436,7 +437,7 @@ func newFixture(t *testing.T, count int) *fixture {
 		if _, err := db.Exec("INSERT INTO users(id,email_delivery,email_canonical,password_hash,password_policy,status,created_at_ms) VALUES(?,?,?,?,1,'active',1)", user[:], user.String()+"@example.com", user.String()+"@example.com", "hash"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec("INSERT INTO devices(user_id,id,display_name,status,created_at_ms) VALUES(?,?,?,'active',1)", user[:], device[:], "Device"); err != nil {
+		if _, err := db.Exec("INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms) VALUES(?,?,?,'active',1,1)", user[:], device[:], "Device"); err != nil {
 			t.Fatal(err)
 		}
 		for _, blob := range [][]byte{f.blob, f.blob2} {

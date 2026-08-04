@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -22,7 +23,10 @@ const (
 	tokenBytes                = 32
 )
 
-var ErrInvalidVerificationToken = errors.New("invalid verification token")
+var (
+	ErrInvalidVerificationToken = errors.New("invalid verification token")
+	ErrInvalidCredentials       = errors.New("invalid credentials")
+)
 
 var verificationDomain = []byte("remember:email-verification:v1\x00")
 
@@ -115,6 +119,50 @@ func (s *Service) Register(ctx context.Context, emailInput, passwordInput string
 		return Registration{}, fmt.Errorf("commit registration: %w", err)
 	}
 	return Registration{Created: true, UserID: userID, VerificationToken: token}, nil
+}
+
+// AuthenticateCredential verifies a login without revealing whether an
+// address exists, is unverified, or is inactive. Unknown identities still pay
+// one bounded Argon2 verification.
+func (s *Service) AuthenticateCredential(ctx context.Context, emailInput, passwordInput string) (uuid.UUID, error) {
+	candidate := passwordInput
+	if !utf8.ValidString(candidate) || len(candidate) > 1024 {
+		candidate = "remember invalid credential"
+	}
+	email, emailErr := CanonicalizeEmail(emailInput)
+	var idBytes []byte
+	var encoded string
+	var policy int
+	var status string
+	if emailErr == nil {
+		err := s.db.QueryRowContext(ctx, `SELECT id,password_hash,password_policy,status
+			FROM users WHERE email_canonical=?`, email.Canonical).Scan(&idBytes, &encoded, &policy, &status)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return uuid.Nil, fmt.Errorf("read credential record: %w", err)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			emailErr = ErrInvalidCredentials
+		}
+	}
+	if emailErr != nil {
+		_, _, _ = s.password.Verify(candidate, s.password.dummyEncoded(), PasswordPolicyVersion)
+		return uuid.Nil, ErrInvalidCredentials
+	}
+	matches, _, err := s.password.Verify(candidate, encoded, policy)
+	if err != nil {
+		if errors.Is(err, ErrInvalidPassword) {
+			return uuid.Nil, ErrInvalidCredentials
+		}
+		return uuid.Nil, fmt.Errorf("verify credential record: %w", err)
+	}
+	if !matches || status != StatusActive || len(idBytes) != 16 {
+		return uuid.Nil, ErrInvalidCredentials
+	}
+	id, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return uuid.Nil, ErrInvalidCredentials
+	}
+	return id, nil
 }
 
 // VerifyEmail consumes a token and activates its pending user atomically.
