@@ -13,6 +13,8 @@ import (
 	"github.com/faulander/remember/server/internal/config"
 	"github.com/faulander/remember/server/internal/database"
 	"github.com/faulander/remember/server/internal/httpapi"
+	"github.com/faulander/remember/server/internal/identity"
+	"github.com/faulander/remember/server/internal/session"
 )
 
 // Run binds the configured listener and serves until cancellation or failure.
@@ -67,9 +69,24 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 		logger.Warn("blob_orphans_detected", "event_code", "BLOB_ORPHANS_DETECTED", "count", audit.Orphans)
 	}
 
+	identityService, err := identity.NewProductionService(db)
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("open identity service: %w", err)
+	}
+	sessionService, err := session.NewProductionService(db, identityService)
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("open session service: %w", err)
+	}
 	state := &httpapi.State{}
+	handler, err := httpapi.New(db, state, logger, httpapi.Dependencies{Sessions: sessionService})
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("open HTTP API: %w", err)
+	}
 	server := &http.Server{
-		Handler:           httpapi.New(db, state, logger),
+		Handler:           handler,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

@@ -35,6 +35,19 @@ Standardwerte:
 
 Der Datenbankwert ist ein Dateipfad, kein frei konfigurierbarer SQLite-DSN. Datenbankdatei, Blob-Root und Staging-Root müssen verschieden sein; Blob und Staging müssen auf demselben lokalen Dateisystem liegen. Ein Blob ist in V1 fest auf **8 MiB** begrenzt. Vor Readiness werden abgebrochene Uploads bereinigt und alle registrierten Blobs vollständig geprüft.
 
+## Öffentliche HTTP-Routen
+
+Neben `/healthz` und `/readyz` stellt der Server derzeit ausschließlich den begrenzten M2-Auth-Transport bereit:
+
+- `POST /v1/auth/login`
+- `POST /v1/auth/refresh`
+- `POST /v1/auth/logout`
+- `GET /v1/sessions`
+- `PATCH|DELETE /v1/devices/{uuidv7}`
+- `DELETE /v1/sessions/{uuidv7}`
+
+JSON-Requests sind auf 16 KiB begrenzt und werden strikt validiert. Login und Refresh besitzen feste globale und geheimnisgebundene Mindest-Rate-Limits; `429` liefert `Retry-After`. Der Limiter speichert nur SHA-256-Schlüssel und wertet weder `X-Forwarded-For` noch andere Client-IP-Header aus. Registrierung, Recovery, Sync und Blob-Bytes sind noch nicht öffentlich.
+
 ## Docker
 
 ```bash
@@ -52,7 +65,7 @@ Der Container läuft als numerischer Nicht-Root-Benutzer `65532` und erwartet ei
 
 - Genau **eine** Serverinstanz darf auf die SQLite-Datei schreiben.
 - SQLite und spätere Blobs benötigen ein zuverlässiges lokales Linux-Dateisystem; Netzwerkdateisysteme werden nicht unterstützt.
-- TLS wird an einem vorgeschalteten Reverse Proxy terminiert. Der Container darf nicht direkt öffentlich exponiert werden.
+- TLS wird zwingend an einem vorgeschalteten Reverse Proxy terminiert. Der Container darf nicht direkt öffentlich exponiert werden; Proxy-Header verleihen keine Autorität.
 - Serverdatenträger und Backups müssen durch die Deployment-Umgebung verschlüsselt werden.
 - Liveness hängt absichtlich nicht von SQLite ab; Readiness wird bei Datenbankfehlern oder während des Draining deaktiviert.
 - Logs enthalten stabile Ereigniscodes, aber keine Datenbankpfade, Request-Inhalte, Querywerte, Dateinamen oder Notizinhalte.

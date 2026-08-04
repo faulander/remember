@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/faulander/remember/server/internal/config"
 	"github.com/faulander/remember/server/internal/database"
+	"github.com/faulander/remember/server/internal/identity"
 )
 
 func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
@@ -23,6 +25,27 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cfg.StagingPath, ".upload-0123456789abcdef0123456789abcdef"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setupDB, err := database.Open(context.Background(), cfg.DatabasePath, cfg.DatabaseBusy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(context.Background(), setupDB); err != nil {
+		t.Fatal(err)
+	}
+	identityService, err := identity.NewProductionService(setupDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration, err := identityService.Register(context.Background(), "login@example.com", "correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := identityService.VerifyEmail(context.Background(), registration.VerificationToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := setupDB.Close(); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -45,6 +68,19 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Errorf("health status = %d", response.StatusCode)
+	}
+	authRequest, err := http.NewRequest(http.MethodPost, "http://"+address+"/v1/auth/login", strings.NewReader(`{"email":"login@example.com","password":"correct horse battery staple","device_name":"Integration Mac"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authRequest.Header.Set("Content-Type", "application/json")
+	authResponse, err := http.DefaultClient.Do(authRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authResponse.Body.Close()
+	if authResponse.StatusCode != http.StatusOK {
+		t.Errorf("auth transport status = %d", authResponse.StatusCode)
 	}
 
 	cancel()

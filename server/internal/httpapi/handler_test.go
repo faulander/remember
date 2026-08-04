@@ -3,134 +3,548 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/faulander/remember/server/internal/database"
+	"github.com/faulander/remember/server/internal/identity"
+	"github.com/faulander/remember/server/internal/session"
+	"github.com/google/uuid"
+)
+
+const (
+	testAccess  = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	testRefresh = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+)
+
+var (
+	testUserID    = uuid.MustParse("018f0000-0000-7000-8000-000000000001")
+	testDeviceID  = uuid.MustParse("018f0000-0000-7000-8000-000000000002")
+	testSessionID = uuid.MustParse("018f0000-0000-7000-8000-000000000003")
+	targetID      = uuid.MustParse("018f0000-0000-7000-8000-000000000004")
 )
 
 func TestHealthAndReadiness(t *testing.T) {
 	t.Parallel()
+	handler, state, _, cleanup := newHandlerTest(t, nil)
+	defer cleanup()
 
-	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	state := &State{}
-	handler := New(db, state, nil)
-
-	assertProbe(t, handler, http.MethodGet, "/healthz", http.StatusOK, true)
-	assertProbe(t, handler, http.MethodGet, "/readyz", http.StatusServiceUnavailable, true)
+	assertRequest(t, handler, http.MethodGet, "/healthz", "", "", http.StatusOK)
+	assertRequest(t, handler, http.MethodGet, "/readyz", "", "", http.StatusServiceUnavailable)
 	state.MarkReady()
-	assertProbe(t, handler, http.MethodGet, "/readyz", http.StatusOK, true)
-	assertProbe(t, handler, http.MethodHead, "/healthz", http.StatusOK, false)
-	assertProbe(t, handler, http.MethodHead, "/readyz", http.StatusOK, false)
-	state.MarkDraining()
-	assertProbe(t, handler, http.MethodGet, "/healthz", http.StatusOK, true)
-	assertProbe(t, handler, http.MethodGet, "/readyz", http.StatusServiceUnavailable, true)
-}
-
-func TestReadinessHidesDatabaseFailure(t *testing.T) {
-	t.Parallel()
-
-	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "sensitive-name.db"), time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := &State{}
-	state.MarkReady()
-	handler := New(db, state, nil)
-	db.Close()
-
-	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	assertRequest(t, handler, http.MethodGet, "/readyz", "", "", http.StatusOK)
+	request := httptest.NewRequest(http.MethodHead, "/healthz", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", response.Code)
-	}
-	if strings.Contains(response.Body.String(), "sensitive-name") || strings.Contains(response.Body.String(), "closed") {
-		t.Errorf("response leaked database details: %s", response.Body.String())
+	if response.Code != http.StatusOK || response.Body.Len() != 0 {
+		t.Fatalf("HEAD probe status/body = %d/%q", response.Code, response.Body.String())
 	}
 }
 
-func TestProbeMethodAndHeaders(t *testing.T) {
+func TestAuthAndManagementSuccessContracts(t *testing.T) {
 	t.Parallel()
+	service := newFakeSessions()
+	handler, _, _, cleanup := newHandlerTest(t, service)
+	defer cleanup()
 
-	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
-	if err != nil {
-		t.Fatal(err)
+	login := jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{
+		"email": "user@example.com", "password": "secret password value", "device_name": "My Mac",
+	}, "", http.StatusOK)
+	assertJSONPath(t, login, "principal", "user_id", testUserID.String())
+	assertJSONPath(t, login, "tokens", "access_token", testAccess)
+	if strings.Contains(login.Body.String(), "secret password value") {
+		t.Fatal("login response echoed password")
 	}
-	defer db.Close()
-	handler := New(db, &State{}, nil)
 
-	request := httptest.NewRequest(http.MethodPost, "/healthz", strings.NewReader("ignored"))
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, HEAD" {
-		t.Errorf("method response = %d, Allow=%q", response.Code, response.Header().Get("Allow"))
+	refresh := jsonRequest(t, handler, http.MethodPost, "/v1/auth/refresh", map[string]string{"refresh_token": testRefresh}, "", http.StatusOK)
+	assertJSONPath(t, refresh, "", "access_token", testAccess)
+
+	list := assertRequest(t, handler, http.MethodGet, "/v1/sessions", "", testAccess, http.StatusOK)
+	if !strings.Contains(list.Body.String(), `"device_name":"My Mac"`) {
+		t.Fatalf("session list = %s", list.Body.String())
 	}
-	for name, want := range map[string]string{
-		"Cache-Control":          "no-store",
-		"Content-Type":           "application/json; charset=utf-8",
-		"X-Content-Type-Options": "nosniff",
-		"Referrer-Policy":        "no-referrer",
-		"X-Frame-Options":        "DENY",
-	} {
-		if got := response.Header().Get(name); got != want {
-			t.Errorf("header %s = %q, want %q", name, got, want)
+	jsonRequest(t, handler, http.MethodPatch, "/v1/devices/"+targetID.String(), map[string]string{"display_name": "Renamed"}, testAccess, http.StatusOK)
+	assertRequest(t, handler, http.MethodDelete, "/v1/sessions/"+targetID.String(), "", testAccess, http.StatusOK)
+	assertRequest(t, handler, http.MethodDelete, "/v1/devices/"+targetID.String(), "", testAccess, http.StatusOK)
+	assertRequest(t, handler, http.MethodPost, "/v1/auth/logout", "", testAccess, http.StatusOK)
+
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.renamedID != targetID || service.renamedName != "Renamed" || service.revokedDevice != targetID {
+		t.Fatalf("device calls = rename %s/%q revoke %s", service.renamedID, service.renamedName, service.revokedDevice)
+	}
+	if len(service.revokedSessions) != 2 || service.revokedSessions[0] != targetID || service.revokedSessions[1] != testSessionID {
+		t.Fatalf("session revocations = %v", service.revokedSessions)
+	}
+	for _, access := range service.receivedAccess {
+		if access != testAccess {
+			t.Fatalf("service received unexpected access credential %q", access)
 		}
 	}
-	if response.Header().Get("X-Request-ID") == "" {
-		t.Error("missing request ID")
+}
+
+func TestStrictJSONMediaBodyAndMethods(t *testing.T) {
+	t.Parallel()
+	handler, _, _, cleanup := newHandlerTest(t, nil)
+	defer cleanup()
+
+	for _, test := range []struct {
+		name, contentType, body string
+	}{
+		{"missing media", "", `{}`},
+		{"wrong media", "text/plain", `{}`},
+		{"media parameters", "application/json; charset=utf-8", `{}`},
+		{"unknown field", "application/json", `{"email":"a","password":"b","device_name":"c","user_id":"x"}`},
+		{"trailing value", "application/json", `{"email":"a","password":"b","device_name":"c"} {}`},
+		{"malformed", "application/json", `{`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/auth/login", strings.NewReader(test.body))
+			if test.contentType != "" {
+				request.Header.Set("Content-Type", test.contentType)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			assertError(t, response, http.StatusBadRequest, "invalid_request")
+		})
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/auth/login", strings.NewReader(`{"email":"a","password":"b","device_name":"c"}`))
+	request.Header.Add("Content-Type", "application/json")
+	request.Header.Add("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+
+	large := `{"email":"a","password":"` + strings.Repeat("x", int(maxJSONBodyBytes)) + `","device_name":"c"}`
+	request = httptest.NewRequest(http.MethodPost, "/v1/auth/login", strings.NewReader(large))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+
+	response = assertRequest(t, handler, http.MethodDelete, "/v1/devices/"+targetID.String(), "unexpected", testAccess, http.StatusBadRequest)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	response = assertRequest(t, handler, http.MethodGet, "/v1/sessions", strings.Repeat("x", int(maxJSONBodyBytes)+1), testAccess, http.StatusBadRequest)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+
+	for _, test := range []struct{ method, path, allow string }{
+		{http.MethodGet, "/v1/auth/login", "POST"},
+		{http.MethodPost, "/v1/sessions", "GET"},
+		{http.MethodPost, "/v1/devices/" + targetID.String(), "PATCH, DELETE"},
+		{http.MethodPatch, "/v1/sessions/" + targetID.String(), "DELETE"},
+	} {
+		response := assertRequest(t, handler, test.method, test.path, "", "", http.StatusMethodNotAllowed)
+		if response.Header().Get("Allow") != test.allow {
+			t.Errorf("%s %s Allow=%q", test.method, test.path, response.Header().Get("Allow"))
+		}
 	}
 }
 
-func TestRequestLogDoesNotContainUnknownPathOrQuery(t *testing.T) {
+func TestBearerUUIDAndTenantOverrideAreRejected(t *testing.T) {
 	t.Parallel()
+	service := newFakeSessions()
+	handler, _, _, cleanup := newHandlerTest(t, service)
+	defer cleanup()
 
-	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
-	if err != nil {
-		t.Fatal(err)
+	for _, authorization := range []string{"", "bearer " + testAccess, "Bearer", "Bearer short", "Bearer " + testAccess + " extra"} {
+		response := assertRequest(t, handler, http.MethodGet, "/v1/sessions", "", authorization, http.StatusUnauthorized)
+		assertError(t, response, http.StatusUnauthorized, "invalid_session")
 	}
-	defer db.Close()
+	request := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	request.Header.Add("Authorization", "Bearer "+testAccess)
+	request.Header.Add("Authorization", "Bearer "+testAccess)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertError(t, response, http.StatusUnauthorized, "invalid_session")
+
+	for _, raw := range []string{uuid.New().String(), strings.ToUpper(targetID.String())} {
+		response := assertRequest(t, handler, http.MethodDelete, "/v1/devices/"+raw, "", testAccess, http.StatusBadRequest)
+		assertError(t, response, http.StatusBadRequest, "invalid_request")
+	}
+	response = assertRequest(t, handler, http.MethodDelete, "/v1/devices/"+targetID.String()+"/extra", "", testAccess, http.StatusNotFound)
+	assertError(t, response, http.StatusNotFound, "not_found")
+	response = assertRequest(t, handler, http.MethodDelete, "/v1/devices/"+targetID.String()+"?user_id="+testUserID.String(), "", testAccess, http.StatusBadRequest)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.revokedDevice != uuid.Nil {
+		t.Fatal("tenant override request reached service")
+	}
+}
+
+func TestGenericErrorMappingNeverLeaksInternalErrors(t *testing.T) {
+	t.Parallel()
+	service := newFakeSessions()
+	handler, _, _, cleanup := newHandlerTest(t, service)
+	defer cleanup()
+
+	service.loginErr = identity.ErrInvalidCredentials
+	response := jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": "missing@example.com", "password": "x", "device_name": "Mac"}, "", http.StatusUnauthorized)
+	assertError(t, response, http.StatusUnauthorized, "invalid_credentials")
+	service.loginErr = errors.New("database sensitive detail")
+	response = jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": "user2@example.com", "password": "x", "device_name": "Mac"}, "", http.StatusInternalServerError)
+	assertError(t, response, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(response.Body.String(), "database") {
+		t.Fatal("internal login error leaked")
+	}
+
+	service.loginErr = nil
+	service.refreshErr = session.ErrUnauthenticated
+	response = jsonRequest(t, handler, http.MethodPost, "/v1/auth/refresh", map[string]string{"refresh_token": testRefresh}, "", http.StatusUnauthorized)
+	assertError(t, response, http.StatusUnauthorized, "invalid_session")
+	service.authenticateErr = errors.New("secret storage failure")
+	response = assertRequest(t, handler, http.MethodGet, "/v1/sessions", "", testAccess, http.StatusInternalServerError)
+	assertError(t, response, http.StatusInternalServerError, "internal_error")
+}
+
+func TestLoginAndRefreshRateLimitsAreGeneric(t *testing.T) {
+	t.Parallel()
+	clock := &fakeHTTPClock{now: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
+	service := newFakeSessions()
+	handler, _, api, cleanup := newHandlerTestWithClock(t, service, clock)
+	defer cleanup()
+
+	for index := 0; index < loginKeyLimit; index++ {
+		email := " User@Example.com "
+		if index%2 == 1 {
+			email = "user@example.COM"
+		}
+		jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": email, "password": "x", "device_name": "Mac"}, "", http.StatusOK)
+	}
+	limited := jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": "user@example.com", "password": "x", "device_name": "Mac"}, "", http.StatusTooManyRequests)
+	assertError(t, limited, http.StatusTooManyRequests, "rate_limited")
+	if limited.Header().Get("Retry-After") == "" {
+		t.Fatal("login rate limit omitted Retry-After")
+	}
+	if len(api.limits.loginKey.entries) != 1 {
+		t.Fatalf("normalized login keys=%d", len(api.limits.loginKey.entries))
+	}
+	for key := range api.limits.loginKey.entries {
+		if key != limitKey(loginKeyDomain, "user@example.com") {
+			t.Fatal("login limiter retained a non-hashed or unexpected key")
+		}
+	}
+
+	for index := 0; index < loginKeyLimit; index++ {
+		email := "person@bücher.example"
+		if index%2 == 1 {
+			email = "person@xn--bcher-kva.example"
+		}
+		jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": email, "password": "x", "device_name": "Mac"}, "", http.StatusOK)
+	}
+	limited = jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{
+		"email": "person@xn--bcher-kva.example", "password": "x", "device_name": "Mac",
+	}, "", http.StatusTooManyRequests)
+	assertError(t, limited, http.StatusTooManyRequests, "rate_limited")
+
+	for index := 0; index < refreshKeyLimit; index++ {
+		jsonRequest(t, handler, http.MethodPost, "/v1/auth/refresh", map[string]string{"refresh_token": "unknown-secret-token"}, "", http.StatusOK)
+	}
+	limited = jsonRequest(t, handler, http.MethodPost, "/v1/auth/refresh", map[string]string{"refresh_token": "unknown-secret-token"}, "", http.StatusTooManyRequests)
+	assertError(t, limited, http.StatusTooManyRequests, "rate_limited")
+	if len(api.limits.refreshKey.entries) != 1 {
+		t.Fatalf("refresh keys=%d", len(api.limits.refreshKey.entries))
+	}
+	clock.advance(loginWindow)
+	jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": "USER@example.com", "password": "x", "device_name": "Mac"}, "", http.StatusOK)
+
+	unknownClock := &fakeHTTPClock{now: clock.Now()}
+	unknownService := newFakeSessions()
+	unknownService.loginErr = identity.ErrInvalidCredentials
+	unknownHandler, _, _, unknownCleanup := newHandlerTestWithClock(t, unknownService, unknownClock)
+	defer unknownCleanup()
+	for index := 0; index < loginKeyLimit; index++ {
+		response := jsonRequest(t, unknownHandler, http.MethodPost, "/v1/auth/login", map[string]string{
+			"email": "unknown@example.com", "password": "x", "device_name": "Mac",
+		}, "", http.StatusUnauthorized)
+		assertError(t, response, http.StatusUnauthorized, "invalid_credentials")
+	}
+	limited = jsonRequest(t, unknownHandler, http.MethodPost, "/v1/auth/login", map[string]string{
+		"email": "unknown@example.com", "password": "x", "device_name": "Mac",
+	}, "", http.StatusTooManyRequests)
+	assertError(t, limited, http.StatusTooManyRequests, "rate_limited")
+}
+
+func TestConcurrentLoginWorkIsBounded(t *testing.T) {
+	service := newFakeSessions()
+	service.loginBlock = make(chan struct{})
+	service.loginStarted = make(chan struct{}, maxConcurrentLogin)
+	handler, _, api, cleanup := newHandlerTest(t, service)
+	defer cleanup()
+
+	var group sync.WaitGroup
+	for index := 0; index < maxConcurrentLogin; index++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{
+				"email": fmt.Sprintf("person-%d@example.com", index), "password": "x", "device_name": "Mac",
+			}, "", http.StatusOK)
+		}(index)
+	}
+	for range maxConcurrentLogin {
+		<-service.loginStarted
+	}
+	limited := jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{
+		"email": "overflow@example.com", "password": "x", "device_name": "Mac",
+	}, "", http.StatusTooManyRequests)
+	assertError(t, limited, http.StatusTooManyRequests, "rate_limited")
+	if len(api.limits.loginKey.entries) != maxConcurrentLogin {
+		t.Fatalf("slot overflow consumed limiter key: keys=%d", len(api.limits.loginKey.entries))
+	}
+	close(service.loginBlock)
+	group.Wait()
+}
+
+func TestLogsContainNoCredentialsDynamicIDsOrQuery(t *testing.T) {
+	t.Parallel()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	handler := New(db, &State{}, logger)
+	handler, _, _, cleanup := newHandlerTestWithLogger(t, newFakeSessions(), nil, logger)
+	defer cleanup()
 
-	request := httptest.NewRequest(http.MethodGet, "/private-note-name?token=secret-value", nil)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", response.Code)
-	}
-	for _, secret := range []string{"private-note-name", "secret-value", "token"} {
-		if strings.Contains(logs.String(), secret) {
-			t.Errorf("log leaked %q: %s", secret, logs.String())
+	email, password := "private-person@example.com", "extremely-secret-password"
+	jsonRequest(t, handler, http.MethodPost, "/v1/auth/login", map[string]string{"email": email, "password": password, "device_name": "Secret Device"}, "", http.StatusOK)
+	assertRequest(t, handler, http.MethodDelete, "/v1/devices/"+targetID.String(), "", testAccess, http.StatusOK)
+	assertRequest(t, handler, http.MethodGet, "/unknown-private-path?refresh_token="+testRefresh, "", "", http.StatusBadRequest)
+
+	output := logs.String()
+	for _, secret := range []string{email, password, testAccess, testRefresh, targetID.String(), "unknown-private-path", "Secret Device"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("log leaked %q: %s", secret, output)
 		}
 	}
-	if !strings.Contains(logs.String(), `"route":"unknown"`) {
-		t.Errorf("log missing bounded route: %s", logs.String())
+	if !strings.Contains(output, `"route":"/v1/devices/{id}"`) || !strings.Contains(output, `"route":"unknown"`) {
+		t.Fatalf("logs missing bounded routes: %s", output)
 	}
 }
 
-func assertProbe(t *testing.T, handler http.Handler, method, path string, status int, wantBody bool) {
+func TestNewRejectsMissingDependencies(t *testing.T) {
+	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := New(db, &State{}, nil, Dependencies{}); err == nil {
+		t.Fatal("New accepted missing session dependency")
+	}
+}
+
+func newHandlerTest(t *testing.T, service *fakeSessions) (http.Handler, *State, *handler, func()) {
 	t.Helper()
-	request := httptest.NewRequest(method, path, nil)
+	return newHandlerTestWithLogger(t, service, nil, nil)
+}
+
+func newHandlerTestWithClock(t *testing.T, service *fakeSessions, clock Clock) (http.Handler, *State, *handler, func()) {
+	t.Helper()
+	return newHandlerTestWithLogger(t, service, clock, nil)
+}
+
+func newHandlerTestWithLogger(t *testing.T, service *fakeSessions, clock Clock, logger *slog.Logger) (http.Handler, *State, *handler, func()) {
+	t.Helper()
+	if service == nil {
+		service = newFakeSessions()
+	}
+	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &State{}
+	if clock == nil {
+		clock = &fakeHTTPClock{now: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
+	}
+	api := &handler{
+		db: db, state: state, sessions: service, limits: newAbuseLimiters(clock),
+		loginSlots: make(chan struct{}, maxConcurrentLogin),
+	}
+	wrapped := requestLog(loggerOrDiscard(logger), securityHeaders(api))
+	return wrapped, state, api, func() { db.Close() }
+}
+
+func loggerOrDiscard(logger *slog.Logger) *slog.Logger {
+	if logger == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return logger
+}
+
+func jsonRequest(t *testing.T, handler http.Handler, method, path string, body any, access string, status int) *httptest.ResponseRecorder {
+	t.Helper()
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+	request.Header.Set("Content-Type", "application/json")
+	if access != "" {
+		request.Header.Set("Authorization", "Bearer "+access)
+	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != status {
-		t.Errorf("%s %s status = %d, want %d", method, path, response.Code, status)
+		t.Fatalf("%s %s status=%d body=%s want=%d", method, path, response.Code, response.Body.String(), status)
 	}
-	if wantBody && response.Body.Len() == 0 {
-		t.Errorf("%s %s has empty body", method, path)
+	return response
+}
+
+func assertRequest(t *testing.T, handler http.Handler, method, path, body, authorization string, status int) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	if authorization != "" {
+		if strings.HasPrefix(authorization, "Bearer") || strings.HasPrefix(authorization, "bearer") {
+			request.Header.Set("Authorization", authorization)
+		} else {
+			request.Header.Set("Authorization", "Bearer "+authorization)
+		}
 	}
-	if !wantBody && response.Body.Len() != 0 {
-		t.Errorf("%s %s body = %q, want empty", method, path, response.Body.String())
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != status {
+		t.Fatalf("%s %s status=%d body=%s want=%d", method, path, response.Code, response.Body.String(), status)
 	}
+	return response
+}
+
+func assertError(t *testing.T, response *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if response.Code != status || !strings.Contains(response.Body.String(), `"error":"`+code+`"`) {
+		t.Fatalf("error response status/body=%d/%s want=%d/%s", response.Code, response.Body.String(), status, code)
+	}
+	for name, want := range map[string]string{
+		"Cache-Control": "no-store", "Content-Type": "application/json; charset=utf-8",
+		"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+	} {
+		if got := response.Header().Get(name); got != want {
+			t.Errorf("header %s=%q want=%q", name, got, want)
+		}
+	}
+}
+
+func assertJSONPath(t *testing.T, response *httptest.ResponseRecorder, object, key, want string) {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	container := decoded
+	if object != "" {
+		value, ok := decoded[object].(map[string]any)
+		if !ok {
+			t.Fatalf("missing object %q in %#v", object, decoded)
+		}
+		container = value
+	}
+	if got := fmt.Sprint(container[key]); got != want {
+		t.Fatalf("%s.%s=%q want=%q", object, key, got, want)
+	}
+}
+
+type fakeSessions struct {
+	mu                                    sync.Mutex
+	principal                             session.Principal
+	loginResult                           session.LoginResult
+	refreshTokens                         session.Tokens
+	items                                 []session.SessionInfo
+	loginErr, refreshErr, authenticateErr error
+	loginBlock                            chan struct{}
+	loginStarted                          chan struct{}
+	renamedID, revokedDevice              uuid.UUID
+	renamedName                           string
+	revokedSessions                       []uuid.UUID
+	receivedAccess                        []string
+}
+
+func newFakeSessions() *fakeSessions {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	principal := session.Principal{UserID: testUserID, DeviceID: testDeviceID, SessionID: testSessionID}
+	tokens := session.Tokens{AccessToken: testAccess, RefreshToken: testRefresh, AccessExpiresAt: now.Add(15 * time.Minute), RefreshExpiresAt: now.Add(30 * 24 * time.Hour)}
+	return &fakeSessions{
+		principal: principal, loginResult: session.LoginResult{Principal: principal, Tokens: tokens}, refreshTokens: tokens,
+		items: []session.SessionInfo{{SessionID: testSessionID, DeviceID: testDeviceID, DeviceName: "My Mac", Status: "active", CreatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), Current: true}},
+	}
+}
+
+func (f *fakeSessions) Login(_ context.Context, email, _, _ string) (session.LoginResult, error) {
+	f.mu.Lock()
+	err, result := f.loginErr, f.loginResult
+	block, started := f.loginBlock, f.loginStarted
+	f.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if block != nil {
+		<-block
+	}
+	if err != nil {
+		return session.LoginResult{}, err
+	}
+	return result, nil
+}
+func (f *fakeSessions) AuthenticateAccess(_ context.Context, access string) (session.Principal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedAccess = append(f.receivedAccess, access)
+	if f.authenticateErr != nil {
+		return session.Principal{}, f.authenticateErr
+	}
+	if access != testAccess {
+		return session.Principal{}, session.ErrUnauthenticated
+	}
+	return f.principal, nil
+}
+func (f *fakeSessions) Refresh(_ context.Context, _ string) (session.Tokens, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.refreshErr != nil {
+		return session.Tokens{}, f.refreshErr
+	}
+	return f.refreshTokens, nil
+}
+func (f *fakeSessions) ListForUser(_ context.Context, access string) ([]session.SessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedAccess = append(f.receivedAccess, access)
+	return append([]session.SessionInfo(nil), f.items...), nil
+}
+func (f *fakeSessions) RenameDevice(_ context.Context, access string, id uuid.UUID, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedAccess = append(f.receivedAccess, access)
+	f.renamedID, f.renamedName = id, name
+	return nil
+}
+func (f *fakeSessions) RevokeSession(_ context.Context, access string, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedAccess = append(f.receivedAccess, access)
+	f.revokedSessions = append(f.revokedSessions, id)
+	return nil
+}
+func (f *fakeSessions) RevokeDevice(_ context.Context, access string, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedAccess = append(f.receivedAccess, access)
+	f.revokedDevice = id
+	return nil
+}
+
+type fakeHTTPClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeHTTPClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *fakeHTTPClock) advance(value time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(value)
+	c.mu.Unlock()
 }
