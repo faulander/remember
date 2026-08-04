@@ -377,7 +377,7 @@ Eine Änderung der Gerätezeitzone darf den tatsächlichen Termin nicht verschie
 
 ### REM-011 – App-geöffnete Zustellung
 
-Native Benachrichtigungen müssen erscheinen, solange der App-Prozess geöffnet ist. Eine Zustellung bei vollständig geschlossener App ist nicht erforderlich.
+Ist mindestens ein benachrichtigungsfähiger App-Prozess geöffnet, muss die Anwendung die native Zustellung einer fälligen Erinnerung versuchen. Online wird ein nicht bestätigter Zustellversuch nach Lease-Ablauf auf einem erreichbaren Gerät wiederholt; seltene Duplikate sind zulässig. Verweigert das Betriebssystem Benachrichtigungen oder schlagen alle Adapter fehl, muss die Erinnerung sichtbar in der geöffneten App beziehungsweise beim nächsten Öffnen als verpasst erscheinen. Eine Zustellung bei vollständig geschlossener App ist nicht erforderlich.
 
 ### REM-012 – Verpasste Erinnerungen
 
@@ -667,11 +667,15 @@ DST-Sprungfälle, doppelte Uhrzeiten, Monatsenden, Ausnahmen und Endbedingungen 
 
 ### M3-AC-003
 
-Online wird höchstens ein ausgewähltes Gerät benachrichtigt; offline darf jedes Gerät benachrichtigen.
+Online wählt der Server genau ein Gerät pro Zustell-Lease aus. Seltene doppelte Benachrichtigungen nach Lease-Ablauf oder Verbindungsabbruch sind zulässig und werden in Partitionstests nachgewiesen; offline darf jedes Gerät benachrichtigen.
 
 ### M3-AC-004
 
 Erledigen und Schlummern werden synchronisiert; widersprüchliche Offline-Aktionen führen nicht zum stillen Verlust einer Benutzerentscheidung.
+
+### M3-AC-005
+
+Vor Abschluss des Meilensteins ist eine versionierte Regel für verpasste Instanzen festgelegt und durch Testvektoren abgedeckt. Sie definiert mindestens Rückblickgrenze, Aggregation langer Serien, Reihenfolge, maximale Einzelanzeigen und den resultierenden benutzersichtbaren Zustand.
 
 ### M4-AC-001
 
@@ -745,7 +749,6 @@ Folgende Entscheidungen werden vor oder innerhalb des zuständigen Meilensteins 
 - Backupgenerationen, Restore-Testfrequenz und Blob-GC-Schutzfrist,
 - genaue Definition von bestätigtem Datenverlust,
 - Ersatz-Solo-Stabilitätsgate und externe Pilotentscheidung,
-- SvelteKit versus Svelte + Vite,
 - Release-Schlüsselrotation und Verhalten kompromittierter Clients.
 
 ## 14. Offene Produktfragen

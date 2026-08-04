@@ -137,9 +137,7 @@ SQLite speichert relationale Zustände und Referenzen. Markdown-Inhaltsversionen
 
 ## 5.1 UI-Schicht
 
-Die UI wird mit TypeScript und bevorzugt SvelteKit gebaut. Im Wails-Kontext wird sie vollständig statisch erzeugt; SSR und ein Node-Server sind nicht vorgesehen.
-
-Vor der endgültigen Wahl ist zu prüfen, ob SvelteKit gegenüber Svelte + Vite einen konkreten Nutzen bietet. Falls Routing, Layouts und Build-Konventionen von SvelteKit nicht benötigt werden, reduziert Svelte + Vite Komplexität.
+Die UI wird gemäß [`ADR 0002`](./adr/0002-client-ui-stack.md) mit Svelte 5, TypeScript und Vite gebaut. Im Wails-Kontext wird sie vollständig statisch erzeugt; SSR und ein Node-Server sind nicht vorgesehen. SvelteKit wird erst geprüft, wenn konkrete Anforderungen an Routing oder dessen Load-/Layout-Konventionen entstehen.
 
 Die UI darf keine direkten Dateisystem-, Netzwerk- oder Tokenzugriffe ausführen. Sie kommuniziert ausschließlich über typisierte Wails-Bindings und Ereignisse mit Go.
 
@@ -213,8 +211,9 @@ App-interne Änderungen verwenden soweit möglich:
 3. Frontmatter und Markdown erneut validieren,
 4. atomar auf den Zielnamen umbenennen,
 5. Elternverzeichnis synchronisieren, soweit die Plattform dies unterstützt,
-6. Indextransaktion aktualisieren,
-7. lokale Outbox-Operation anlegen.
+6. beobachteten Indexzustand und lokale Outbox-Operation in **derselben lokalen SQLite-Transaktion** dauerhaft schreiben.
+
+Ein Absturz nach dem Dateisystem-Rename, aber vor dieser SQLite-Transaktion hinterlässt einen vom Index abweichenden Dateistand. Der verpflichtende Start-/Overflow-Reconcile erkennt ihn anhand von UUID und Hash und erzeugt die fehlende Outbox-Operation idempotent. Der Index darf einen neuen fachlichen Dateistand niemals als vollständig verarbeitet markieren, ohne dass dieselbe Transaktion entweder die zugehörige Outbox-Operation oder eine bereits bestätigte Remote-Operations-ID enthält.
 
 Der Watcher muss eigene Schreibvorgänge erkennen, ohne echte externe Folgeänderungen zu verschlucken. Dafür werden keine zeitbasierten pauschalen Ignore-Fenster verwendet, sondern erwartete Pfade, Hashes und Operations-IDs abgeglichen.
 
@@ -519,7 +518,9 @@ Fachliche Reminder-Definitionen bleiben Bestandteil der Notizversion. Der Server
 
 ## 12.1 Layout
 
-Empfohlenes Layout:
+Der interne M2-Schnitt ist in `docs/adr/0006-m2-blob-repository.md` präzisiert: maximal 8 MiB, Blob-Root `0700`, Dateien `0600`, separates Staging auf demselben Dateisystem, mandantengebundene Berechtigungen sowie vollständiger Recovery-/Startup-Audit. Öffentliche Transport-, GC-, Reparatur- und Backupfunktionen bleiben spätere Schnitte.
+
+Kanonisches Layout:
 
 ```text
 /blobs/sha256/ab/cd/abcdef...rest
@@ -591,13 +592,31 @@ Ablauf:
 1. Batch laden,
 2. Blobs vorab verifizieren,
 3. gegen noch nicht hochgeladene lokale Änderungen prüfen,
-4. normale Änderungen atomar lokal anwenden,
-5. Konflikte materialisieren,
-6. Index und Cursor gemeinsam fortschreiben.
+4. einen dauerhaften lokalen Apply-Plan mit erwarteten Vorzuständen im Index anlegen,
+5. neue Dateifassungen vollständig im Staging-Bereich vorbereiten,
+6. einzelne Dateisystemoperationen idempotent anwenden und ihren Abschluss journalisieren,
+7. Konflikte materialisieren,
+8. Indexzustand und Cursor nach Abschluss des gesamten Plans gemeinsam fortschreiben,
+9. Apply-Plan und Staging-Dateien bereinigen.
 
-Ein Cursor darf erst bestätigt werden, wenn die lokale Anwendung des Batches dauerhaft abgeschlossen ist.
+Ein Cursor darf erst bestätigt werden, wenn die lokale Anwendung des Batches dauerhaft abgeschlossen ist. „Batch anwenden“ bedeutet dabei keine unmögliche gemeinsame Atomizität von Dateisystem und SQLite, sondern einen wiederaufnehmbaren, journalisierten Ablauf.
 
-## 13.4 Konflikterkennung
+## 13.4 Crash-Recovery beim lokalen Apply
+
+Jeder Apply-Schritt speichert Operationstyp, erwartete Objekt-/Ordner-UUID, Quell- und Zielpfad, erwartete Eltern-UUID, erwartete Existenzzustände, bei Dateien Vorher-/Nachher-Hash und Status. Nach einem Absturz wird ein unvollständiger Plan vor neuem Pull fortgesetzt oder kontrolliert kompensiert.
+
+Vor jeder Wiederholung prüft der Client operationsspezifische Replay-Prädikate:
+
+- **Datei erstellen/ändern:** Entspricht sie bereits UUID und Nachher-Hash, gilt der Schritt als abgeschlossen. Entspricht sie UUID und Vorher-Hash, darf er erneut angewendet werden. Jeder andere Inhalt wird als externe Konkurrenz erhalten.
+- **Datei oder Ordner verschieben:** Stimmen UUID-Zuordnung, Quell-/Zielexistenz und erwartete Eltern-UUID mit dem Vorzustand überein, wird der Move wiederholt. Liegt das Objekt bereits eindeutig am Ziel, gilt er als abgeschlossen. Ein belegtes oder mehrdeutiges Ziel erzeugt einen Strukturkonflikt.
+- **Datei oder Ordner löschen:** Das Objekt wird zunächst atomar in einen planbezogenen Quarantänepfad unter `.remember/staging` verschoben, nicht sofort endgültig entfernt. Fehlt es am Ursprung und liegt mit erwarteter UUID in Quarantäne, gilt der Schritt als angewendet. Abweichende Inhalte oder Nachfahren werden gerettet beziehungsweise als Konflikt behandelt.
+- **Leeren Ordner erstellen:** Existenz und UUID-Pfad-Zuordnung werden gemeinsam geprüft. Ein fremdes Objekt am Ziel löst die Pfadkollisionsregel aus.
+
+Da Ordner-UUIDs nicht im sichtbaren Verzeichnis liegen, ist die journalisierte Indexzuordnung Teil des Replay-Prädikats. Wurde der Ordner nach dem Absturz extern bewegt und ist die Zuordnung nicht mehr eindeutig, wird niemals geraten; es entsteht ein sichtbarer Strukturkonflikt.
+
+Staging- und Quarantänedaten tragen Plan- und Operations-IDs. Sie werden erst endgültig gelöscht, nachdem Dateisystemschritte, Indexzustand und Cursor gemeinsam abgeschlossen sind. Fehler-Injektionstests decken Dateien, leere/nichtleere Ordner, Moves, Löschungen und jeden Übergang zwischen Dateisystemoperation, Indexupdate und Cursorfortschritt ab.
+
+## 13.5 Konflikterkennung
 
 Ein Inhaltskonflikt liegt vor, wenn:
 
@@ -730,6 +749,8 @@ Solange der App-Prozess läuft:
 
 Beim App-Start wird seit dem letzten erfolgreichen Lauf ein begrenztes Rückblickfenster ausgewertet. Die Produktregel für lange Serien ist noch offen. Technisch muss eine Aggregation möglich sein, damit tausende verpasste tägliche Instanzen nicht tausende Systembenachrichtigungen erzeugen.
 
+Vor dem Exit von Meilenstein 3 wird diese Regel versioniert festgelegt. Sie definiert Rückblickgrenze, maximale Zahl einzeln dargestellter Instanzen, Aggregation pro Reminder-Serie, Sortierung und den daraus entstehenden fachlichen Zustand. Gemeinsame Testvektoren prüfen identisches Verhalten auf allen drei Plattformen (`M3-AC-005`).
+
 ## 15.7 Online-Gerätewahl
 
 Geöffnete Apps halten eine authentifizierte langlebige Verbindung oder senden kurze Heartbeats. Der Server führt kurzlebige Presence-Daten.
@@ -737,12 +758,13 @@ Geöffnete Apps halten eine authentifizierte langlebige Verbindung oder senden k
 Für eine fällige Instanz:
 
 1. Geräte melden Kandidatur mit stabiler Instanz-ID.
-2. Der Server wählt deterministisch ein aktives Gerät.
+2. Der Server wählt deterministisch ein aktives, benachrichtigungsfähiges Gerät.
 3. Er erteilt eine kurze Lease.
-4. Das Gerät bestätigt Anzeige oder Benutzeraktion.
-5. Bei Verbindungsabbruch kann nach Ablauf eine neue Lease entstehen.
+4. Das Gerät bestätigt erst nach erfolgreicher Übergabe an den nativen Adapter die Anzeige.
+5. Bleibt diese Bestätigung aus, wird nach Lease-Ablauf ein erreichbares Gerät erneut ausgewählt.
+6. Verweigert das Betriebssystem die Berechtigung oder meldet der Adapter einen dauerhaften Fehler, zeigt der Client die Instanz in-app als nicht nativ zugestellt an.
 
-Exactly-once-Zustellung ist bei Netzwerkpartitionen nicht garantiert. Ziel ist „online normalerweise höchstens einmal, offline mindestens lokal“, wobei Duplikate sicherer als Auslassung sind.
+Exactly-once-Zustellung ist bei Netzwerkpartitionen nicht garantiert. Ziel ist „online normalerweise einmal, bei fehlender Bestätigung erneut versuchen, offline mindestens lokal“. Lease-Failover kann seltene Duplikate erzeugen; Duplikate sind sicherer als still ausgelassene Erinnerungen. Sind alle Apps geschlossen oder alle Adapter nicht benachrichtigungsfähig, wird die Instanz beim nächsten Öffnen als verpasst behandelt (`REM-011`, `REM-012`).
 
 ## 15.8 Widersprüchliche Offline-Aktionen
 
@@ -904,6 +926,10 @@ Zwingende Invariante: Kein Blob darf gelöscht werden, solange eine aufbewahrte 
 
 ## 22.1 Clientdiagnose
 
+Vor dem ersten Versand zeigt der Client Zweck, Felder und Aufbewahrung der Diagnose an. Im Pilot wird erst nach ausdrücklicher Zustimmung ein pseudonymer Diagnoseschlüssel erzeugt und serverseitig als erteilte Einwilligung registriert (`TEL-001`). Ohne Zustimmung werden keine Clientdiagnosen übertragen.
+
+In der offenen Beta besitzt die Einstellung einen jederzeit erreichbaren Schalter (`TEL-005`). Abschalten stoppt neue Erfassung und Versand unmittelbar und verwirft noch nicht gesendete Ereignisse. Aggregierte, ohnehin serverseitig erzeugte Betriebsmetriken bleiben davon unberührt. Der Widerruf darf Synchronisation und lokale Nutzung nicht beeinträchtigen.
+
 Zulässige Felder gemäß `TEL-002`:
 
 - pseudonyme Geräte-/Sitzungs-ID,
@@ -922,6 +948,8 @@ Explizit verboten gemäß `TEL-003`:
 - Reminder-Texte.
 
 Redigierung erfolgt vor Versand. Automatisierte Tests speisen künstliche Geheimnisse und Pfade ein und prüfen, dass sie nicht in Diagnoseereignissen erscheinen.
+
+Der Diagnose-Endpunkt erzwingt eine konfigurierbare maximale Aufbewahrung und trennt Schreib-, Auswertungs- und Administrationsrechte (`TEL-006`). Abgelaufene Rohereignisse werden automatisiert gelöscht; längerfristig verbleiben nur ausreichend aggregierte Metriken. Konkrete Fristen werden vor Meilenstein 4 dokumentiert und in Löschtests geprüft.
 
 ## 22.2 Servermetriken
 
@@ -1135,7 +1163,7 @@ Technische Ergebnisse:
 - Presence und Zustell-Leases,
 - Konflikttests für Offline-Aktionen.
 
-Exit-Kriterien: `M3-AC-001` bis `M3-AC-004`.
+Exit-Kriterien: `M3-AC-001` bis `M3-AC-005`.
 
 ## 26.4 Meilenstein 4 – Öffentliche Betriebsreife
 
@@ -1268,9 +1296,8 @@ Vor den jeweiligen Meilensteinen sind ADRs oder ergänzende Spezifikationen erfo
 10. Rate Limits und E-Mail-Anbieter,
 11. Audit- und Diagnosedatenaufbewahrung,
 12. Backupgenerationen, Restore-Frequenz und GC-Schutzfrist,
-13. SvelteKit versus Svelte + Vite,
-14. Release-Signaturalgorithmus, Schlüsselrotation und Sperrprozess,
-15. genaue Installationsformate pro Plattform.
+13. Release-Signaturalgorithmus, Schlüsselrotation und Sperrprozess,
+14. genaue Installationsformate pro Plattform.
 
 ## 30. Architektur-Invarianten
 

@@ -1,0 +1,168 @@
+//go:build darwin || linux
+
+package repository
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/google/uuid"
+)
+
+func TestRootedSavePreservesConcurrentReplacementAndDisplacedBytes(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "Note.md")
+	original := []byte("original")
+	external := []byte("external replacement")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterRootedSaveStage = func() {
+		if err := os.WriteFile(path, external, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { testHookAfterRootedSaveStage = nil }()
+	err := WriteRootedExpected(root, "Note.md", original, []byte("editor save"), nil)
+	if !errors.Is(err, ErrConcurrentModification) {
+		t.Fatalf("error = %v", err)
+	}
+	got, _ := os.ReadFile(path)
+	if !bytes.Equal(got, external) {
+		t.Fatalf("replacement changed to %q", got)
+	}
+	recoveries, _ := filepath.Glob(filepath.Join(root, ".remember-save-recovery-*"))
+	if len(recoveries) != 1 {
+		t.Fatalf("recoveries = %q", recoveries)
+	}
+	displaced, _ := os.ReadFile(recoveries[0])
+	if !bytes.Equal(displaced, original) {
+		t.Errorf("displaced = %q", displaced)
+	}
+}
+
+func TestRootedMoveNeverUnlinksRecreatedSource(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "Source.md")
+	original := []byte("original")
+	external := []byte("new source")
+	if err := os.WriteFile(source, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterRootedMoveStage = func() {
+		if err := os.WriteFile(source, external, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { testHookAfterRootedMoveStage = nil }()
+	if err := MoveRootedExpected(root, "Source.md", "Moved.md", original); err != nil {
+		t.Fatal(err)
+	}
+	gotSource, _ := os.ReadFile(source)
+	gotDestination, _ := os.ReadFile(filepath.Join(root, "Moved.md"))
+	if !bytes.Equal(gotSource, external) || !bytes.Equal(gotDestination, original) {
+		t.Fatalf("source=%q destination=%q", gotSource, gotDestination)
+	}
+}
+
+func TestRootedSaveParentSwapCannotEscapeRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	folder := filepath.Join(root, "Folder")
+	held := filepath.Join(root, "Held")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "Note.md"), []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "Note.md"), []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterRootedSaveStage = func() {
+		if err := os.Rename(folder, held); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, folder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { testHookAfterRootedSaveStage = nil }()
+	if err := WriteRootedExpected(root, "Folder/Note.md", []byte("original"), []byte("saved"), nil); err != nil {
+		t.Fatal(err)
+	}
+	outsideBytes, _ := os.ReadFile(filepath.Join(outside, "Note.md"))
+	heldBytes, _ := os.ReadFile(filepath.Join(held, "Note.md"))
+	if string(outsideBytes) != "outside" || string(heldBytes) != "saved" {
+		t.Fatalf("outside=%q held=%q", outsideBytes, heldBytes)
+	}
+}
+
+func TestRootedIdentityAssignmentParentSwapCannotEscapeRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	folder := filepath.Join(root, "Folder")
+	held := filepath.Join(root, "Held")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "Note.md"), []byte("inside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "Note.md"), []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterRootedSaveStage = func() {
+		if err := os.Rename(folder, held); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, folder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { testHookAfterRootedSaveStage = nil }()
+	id := uuid.MustParse("018f4c3a-1234-7abc-8123-123456789abc")
+	if _, err := EnsureRootedNoteIdentity(root, "Folder/Note.md", id); err != nil {
+		t.Fatal(err)
+	}
+	outsideBytes, _ := os.ReadFile(filepath.Join(outside, "Note.md"))
+	heldBytes, _ := os.ReadFile(filepath.Join(held, "Note.md"))
+	if string(outsideBytes) != "outside" || !bytes.Contains(heldBytes, []byte(id.String())) {
+		t.Fatalf("outside=%q held=%q", outsideBytes, heldBytes)
+	}
+}
+
+func TestRootedTrashSwapCannotEscapeRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	trash := filepath.Join(root, ".remember", "trash")
+	held := filepath.Join(root, ".remember", "trash-held")
+	if err := os.MkdirAll(trash, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Note.md"), []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterRootedMoveStage = func() {
+		if err := os.Rename(trash, held); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, trash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { testHookAfterRootedMoveStage = nil }()
+	if err := MoveRootedExpected(root, "Note.md", ".remember/trash/Note.md", []byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "Note.md")); !os.IsNotExist(err) {
+		t.Fatalf("outside destination exists: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(held, "Note.md"))
+	if err != nil || string(got) != "original" {
+		t.Fatalf("held=%q err=%v", got, err)
+	}
+}

@@ -1,0 +1,31 @@
+{
+  "name": "remember-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/clean-dist.mjs && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run --environment jsdom"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.2.0",
+    "@tsconfig/svelte": "5.0.8",
+    "@types/node": "^24.10.1",
+    "jsdom": "27.4.0",
+    "svelte": "5.56.8",
+    "svelte-check": "4.7.4",
+    "typescript": "5.9.3",
+    "vite": "8.2.0",
+    "vitest": "4.1.0"
+  },
+  "dependencies": {
+    "dompurify": "3.4.12",
+    "marked": "16.4.1"
+  }
+}
