@@ -31,4 +31,4 @@ Apply-Pläne und Schritte werden crash-sicher persistiert. Ein begrenzter Execut
 
 ## Folgen
 
-Ausgehende Absichten und die dazugehörigen exakten Bytes überleben Neustarts. Eingehende Notiz-Creates/-Updates können nach Abstürzen idempotent fortgesetzt werden; Cursor und Baselines wechseln erst nach vollständig angewendetem Plan. Der nächste Schnitt verbindet Outbox, Blob-Resolver und Pull mit dem HTTP-Transport und ergänzt die sicher fehlenden Mutationsarten.
+Ausgehende Absichten und die dazugehörigen exakten Bytes überleben Neustarts. Eingehende Notiz-Creates/-Updates können nach Abstürzen idempotent fortgesetzt werden; Cursor und Baselines wechseln erst nach vollständig angewendetem Plan. ADR 0012 verbindet Outbox, Blob-Resolver und Pull mit dem HTTP-Transport; weitere Schnitte ergänzen die sicher fehlenden Mutationsarten.

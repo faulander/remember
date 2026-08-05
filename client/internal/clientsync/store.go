@@ -97,6 +97,11 @@ func NewStore(index *localindex.Index) (*Store, error) {
 
 func validObjectID(id uuid.UUID) bool    { return id != uuid.Nil && id.Variant() == uuid.RFC4122 }
 func validOperationID(id uuid.UUID) bool { return validObjectID(id) && id.Version() == 7 }
+
+// ValidateMutation enforces the same immutable operation shape accepted by the
+// server before a transport may send bearer-authenticated data.
+func ValidateMutation(m Mutation) error { return validateMutation(m) }
+
 func validateMutation(m Mutation) error {
 	if !validOperationID(m.OperationID) || !validObjectID(m.ObjectID) || (m.ObjectType != Note && m.ObjectType != Folder) {
 		return errors.New("invalid sync mutation identity")
@@ -295,13 +300,28 @@ func (s *Store) enqueueTx(ctx context.Context, tx *sql.Tx, mutations []Mutation)
 }
 
 func (s *Store) ListPending(ctx context.Context, limit int) ([]OutboxItem, error) {
+	return s.listReady(ctx, limit, false)
+}
+
+// ListReady returns dependency-ready immutable operations, including attempted
+// operations whose prior HTTP outcome was ambiguous and must be replayed with
+// the same operation ID.
+func (s *Store) ListReady(ctx context.Context, limit int) ([]OutboxItem, error) {
+	return s.listReady(ctx, limit, true)
+}
+
+func (s *Store) listReady(ctx context.Context, limit int, includeAttempted bool) ([]OutboxItem, error) {
 	if limit <= 0 || limit > 500 {
-		return nil, errors.New("invalid pending limit")
+		return nil, errors.New("invalid ready limit")
+	}
+	statuses := "o.status='pending'"
+	if includeAttempted {
+		statuses = "o.status IN ('pending','attempted')"
 	}
 	var result []OutboxItem
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.operation_id,o.mutation,o.object_id,o.object_type,o.base_revision,o.parent_id,o.name,o.blob_hash,o.dependency_operation_id,o.status
-			FROM sync_outbox o WHERE o.status='pending' AND NOT EXISTS(
+			FROM sync_outbox o WHERE `+statuses+` AND NOT EXISTS(
 				SELECT 1 FROM sync_outbox_dependencies d JOIN sync_outbox prerequisite ON prerequisite.operation_id=d.dependency_operation_id
 				WHERE d.operation_id=o.operation_id AND prerequisite.status<>'accepted')
 			ORDER BY o.sequence LIMIT ?`, limit)
@@ -338,7 +358,7 @@ func (s *Store) MarkAttempted(ctx context.Context, operationID uuid.UUID) error 
 		return errors.New("invalid operation id")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE sync_outbox SET status='attempted',attempted_at_ms=? WHERE operation_id=? AND status='pending' AND NOT EXISTS(
+		res, err := tx.ExecContext(ctx, `UPDATE sync_outbox SET status='attempted',attempted_at_ms=COALESCE(attempted_at_ms,?) WHERE operation_id=? AND status IN ('pending','attempted') AND NOT EXISTS(
 			SELECT 1 FROM sync_outbox_dependencies d JOIN sync_outbox prerequisite ON prerequisite.operation_id=d.dependency_operation_id
 			WHERE d.operation_id=sync_outbox.operation_id AND prerequisite.status<>'accepted')`, s.clock().UTC().UnixMilli(), operationID.String())
 		if err != nil {
@@ -477,13 +497,21 @@ func (s *Store) ProjectionTx(ctx context.Context, tx *sql.Tx, objectID uuid.UUID
 	return revision, dependency, durable, rows.Err()
 }
 
+func (s *Store) HasUnresolvedOutbox(ctx context.Context) (bool, error) {
+	var exists int
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE status IN ('pending','attempted','conflict','replay_mismatch'))`).Scan(&exists)
+	})
+	return exists != 0, err
+}
+
 func (s *Store) HasUnresolvedLocalIntent(ctx context.Context, objectID uuid.UUID) (bool, error) {
 	if !validObjectID(objectID) {
 		return false, errors.New("invalid object id")
 	}
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE object_id=? AND status IN ('pending','attempted'))`, objectID.String()).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE object_id=? AND status IN ('pending','attempted','conflict','replay_mismatch'))`, objectID.String()).Scan(&exists)
 	})
 	return exists != 0, err
 }

@@ -46,6 +46,10 @@ func (c *LocalCore) ExecuteActiveApplyPlan(ctx context.Context, resolver clients
 	if closed {
 		return ErrCoreClosed
 	}
+	return c.executeActiveApplyPlanLocked(ctx, resolver)
+}
+
+func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver clientsync.BlobResolver) error {
 	if resolver == nil {
 		return errors.New("nil blob resolver")
 	}

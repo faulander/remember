@@ -24,6 +24,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Lokaler Index v2 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor und persistenten Apply-Plänen.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
 - Crash-resumierbarer Remote-Apply für Notiz-Create/-Update mit Blob-Prüfung, Echo-Unterdrückung und atomarem Cursor-/Baseline-Abschluss.
+- Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
 - Expliziter Bootstrap für bestehende v1-Roots und UUIDv4-kompatible Sync-Objektidentitäten.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
 - PRD, technisches Design, Architekturentscheidungen und manuelle Testpläne.
@@ -39,7 +40,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 ### Known limitations
 
 - Noch keine öffentliche Registrierung, Recovery oder Kontolöschung.
-- Ordner-, Move- und Delete-Apply fehlen weiterhin; der HTTP-Scheduler fehlt.
+- Ordner-, Move- und Delete-Apply fehlen weiterhin; Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
 - Windows- und Linux-Desktop-Builds wurden noch nicht real auf Zielgeräten geprüft.

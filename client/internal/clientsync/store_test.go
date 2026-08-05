@@ -84,6 +84,42 @@ func TestOutboxUUIDv4CoalescingResultsAndReopen(t *testing.T) {
 	}
 }
 
+func TestAttemptedOperationRemainsReadyWithStableAttemptTimestamp(t *testing.T) {
+	ctx := context.Background()
+	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	defer index.Close()
+	store, _ := NewStore(index)
+	now := time.Unix(20, 0)
+	store.clock = func() time.Time { return now }
+	op, _ := uuid.NewV7()
+	if err := store.Enqueue(ctx, []Mutation{{OperationID: op, Kind: Create, ObjectID: uuid.New(), ObjectType: Folder, Name: "F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAttempted(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	store.clock = func() time.Time { return now.Add(time.Hour) }
+	if err := store.MarkAttempted(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.ListPending(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+	ready, err := store.ListReady(ctx, 10)
+	if err != nil || len(ready) != 1 || ready[0].Mutation.OperationID != op || ready[0].Status != "attempted" {
+		t.Fatalf("ready=%#v err=%v", ready, err)
+	}
+	var attempted int64
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT attempted_at_ms FROM sync_outbox WHERE operation_id=?`, op.String()).Scan(&attempted)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempted != now.UnixMilli() {
+		t.Fatalf("attempted_at=%d", attempted)
+	}
+}
+
 func TestConflictAndReplayMismatchPersistence(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
