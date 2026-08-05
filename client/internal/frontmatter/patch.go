@@ -35,7 +35,7 @@ func EnsureIdentity(markdown []byte, candidate uuid.UUID) (PatchResult, error) {
 			Changed:  false,
 		}, nil
 	}
-	if candidate == uuid.Nil || candidate.Variant() != uuid.RFC4122 || candidate.Version() != 7 {
+	if candidate == uuid.Nil || candidate.Variant() != uuid.RFC4122 {
 		return PatchResult{}, &ValidationError{Problem: ProblemInvalidNoteID, Detail: candidate.String()}
 	}
 

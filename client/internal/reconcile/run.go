@@ -31,6 +31,9 @@ type Options struct {
 	NewID             func() (uuid.UUID, error)
 	// NewOperationID creates durable UUIDv7 Outbox operation identities.
 	NewOperationID func() (uuid.UUID, error)
+	// AppliedRemoteNotes suppresses Outbox derivation only for authenticated
+	// remote note bytes whose exact observed SHA-256 matches the supplied hash.
+	AppliedRemoteNotes map[uuid.UUID][32]byte
 }
 
 // Report summarizes one completed reconciliation.

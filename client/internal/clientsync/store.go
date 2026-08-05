@@ -19,6 +19,17 @@ import (
 type MutationKind string
 type ObjectType string
 
+// BlobResolver returns immutable bytes for an authenticated remote blob hash.
+type BlobResolver interface {
+	ResolveBlob(context.Context, [sha256.Size]byte) ([]byte, error)
+}
+
+type BlobResolverFunc func(context.Context, [sha256.Size]byte) ([]byte, error)
+
+func (f BlobResolverFunc) ResolveBlob(ctx context.Context, hash [sha256.Size]byte) ([]byte, error) {
+	return f(ctx, hash)
+}
+
 const (
 	Create MutationKind = "create"
 	Update MutationKind = "update"
@@ -62,6 +73,7 @@ type Change struct {
 	Name                  string
 	BlobHash              []byte
 	Deleted               bool
+	State                 string
 }
 
 type ApplyPlan struct {
@@ -465,6 +477,17 @@ func (s *Store) ProjectionTx(ctx context.Context, tx *sql.Tx, objectID uuid.UUID
 	return revision, dependency, durable, rows.Err()
 }
 
+func (s *Store) HasUnresolvedLocalIntent(ctx context.Context, objectID uuid.UUID) (bool, error) {
+	if !validObjectID(objectID) {
+		return false, errors.New("invalid object id")
+	}
+	var exists int
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE object_id=? AND status IN ('pending','attempted'))`, objectID.String()).Scan(&exists)
+	})
+	return exists != 0, err
+}
+
 func (s *Store) Baseline(ctx context.Context, objectID uuid.UUID) (uint64, bool, error) {
 	if !validObjectID(objectID) {
 		return 0, false, errors.New("invalid object id")
@@ -558,19 +581,53 @@ func (s *Store) CreateApplyPlan(ctx context.Context, plan ApplyPlan) error {
 		return errors.New("invalid apply plan")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,?,?,'prepared',?)`, plan.ID.String(), plan.FromCursor, plan.ThroughCursor, s.clock().UTC().UnixMilli())
+		var raw string
+		confirmed := uint64(0)
+		err := tx.QueryRowContext(ctx, `SELECT value FROM sync_state WHERE key='confirmed_cursor'`).Scan(&raw)
+		if err == nil {
+			confirmed, err = strconv.ParseUint(raw, 10, 63)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if confirmed != plan.FromCursor {
+			return errors.New("apply plan does not start at confirmed cursor")
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,?,?,'prepared',?)`, plan.ID.String(), plan.FromCursor, plan.ThroughCursor, s.clock().UTC().UnixMilli())
 		if err != nil {
 			return err
 		}
 		previousCursor := plan.FromCursor
+		projectedRevisions := make(map[uuid.UUID]uint64)
+		loadedProjection := make(map[uuid.UUID]bool)
 		for n, step := range plan.Steps {
 			if previousCursor == math.MaxInt64 || step.Cursor != previousCursor+1 || step.Cursor > plan.ThroughCursor || !validOperationID(step.OperationID) || !validObjectID(step.ObjectID) ||
 				(step.ObjectType != Note && step.ObjectType != Folder) ||
 				(step.Mutation != Create && step.Mutation != Update && step.Mutation != Move && step.Mutation != Delete) ||
 				step.Revision == 0 || step.Revision > math.MaxInt64 ||
-				(step.ParentID != nil && !validObjectID(*step.ParentID)) ||
-				(len(step.BlobHash) != 0 && len(step.BlobHash) != sha256.Size) {
+				(step.Mutation == Create && step.Revision != 1) || (step.Mutation != Create && step.Revision < 2) ||
+				(step.ParentID != nil && !validObjectID(*step.ParentID)) || step.Name == "" || naming.ValidateComponent(step.Name) != nil ||
+				(step.ObjectType == Note && len(step.BlobHash) != sha256.Size) || (step.ObjectType == Folder && len(step.BlobHash) != 0) ||
+				(step.Deleted != (step.Mutation == Delete)) {
 				return errors.New("invalid apply step")
+			}
+			if !loadedProjection[step.ObjectID] {
+				var baseline uint64
+				err := tx.QueryRowContext(ctx, `SELECT revision FROM sync_baselines WHERE object_id=?`, step.ObjectID.String()).Scan(&baseline)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				projectedRevisions[step.ObjectID] = baseline
+				loadedProjection[step.ObjectID] = true
+			}
+			state := "pending"
+			projected := projectedRevisions[step.ObjectID]
+			if step.Revision <= projected {
+				state = "applied"
+			} else if projected == math.MaxInt64 || step.Revision != projected+1 {
+				return errors.New("apply step revision is not contiguous")
+			} else {
+				projectedRevisions[step.ObjectID] = step.Revision
 			}
 			var parent, blob any
 			if step.ParentID != nil {
@@ -579,7 +636,7 @@ func (s *Store) CreateApplyPlan(ctx context.Context, plan ApplyPlan) error {
 			if len(step.BlobHash) != 0 {
 				blob = step.BlobHash
 			}
-			_, err = tx.ExecContext(ctx, `INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending')`, plan.ID.String(), n, step.Cursor, step.OperationID.String(), step.ObjectID.String(), step.Mutation, step.ObjectType, step.Revision, parent, step.Name, blob)
+			_, err = tx.ExecContext(ctx, `INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, plan.ID.String(), n, step.Cursor, step.OperationID.String(), step.ObjectID.String(), step.Mutation, step.ObjectType, step.Revision, parent, step.Name, blob, state)
 			if err != nil {
 				return err
 			}
@@ -604,7 +661,7 @@ func (s *Store) ActiveApplyPlan(ctx context.Context) (*ApplyPlan, error) {
 			return err
 		}
 		p.ID, _ = uuid.Parse(id)
-		rows, err := tx.QueryContext(ctx, `SELECT cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash FROM apply_steps WHERE plan_id=? ORDER BY step_index`, id)
+		rows, err := tx.QueryContext(ctx, `SELECT cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state FROM apply_steps WHERE plan_id=? ORDER BY step_index`, id)
 		if err != nil {
 			return err
 		}
@@ -613,11 +670,12 @@ func (s *Store) ActiveApplyPlan(ctx context.Context) (*ApplyPlan, error) {
 			var c Change
 			var op, obj string
 			var parent sql.NullString
-			if err := rows.Scan(&c.Cursor, &op, &obj, &c.Mutation, &c.ObjectType, &c.Revision, &parent, &c.Name, &c.BlobHash); err != nil {
+			if err := rows.Scan(&c.Cursor, &op, &obj, &c.Mutation, &c.ObjectType, &c.Revision, &parent, &c.Name, &c.BlobHash, &c.State); err != nil {
 				return err
 			}
 			c.OperationID, _ = uuid.Parse(op)
 			c.ObjectID, _ = uuid.Parse(obj)
+			c.Deleted = c.Mutation == Delete
 			if parent.Valid {
 				x, _ := uuid.Parse(parent.String)
 				c.ParentID = &x
@@ -628,6 +686,122 @@ func (s *Store) ActiveApplyPlan(ctx context.Context) (*ApplyPlan, error) {
 		return rows.Err()
 	})
 	return plan, err
+}
+
+func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
+	if !validOperationID(planID) {
+		return errors.New("invalid apply plan id")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='applying' WHERE plan_id=? AND status='prepared'`, planID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return nil
+		}
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM apply_plans WHERE plan_id=?`, planID.String()).Scan(&status); err != nil {
+			return err
+		}
+		if status != "applying" {
+			return errors.New("apply plan is not active")
+		}
+		return nil
+	})
+}
+
+func (s *Store) MarkApplyStepApplied(ctx context.Context, planID uuid.UUID, stepIndex int) error {
+	if !validOperationID(planID) || stepIndex < 0 {
+		return errors.New("invalid apply step")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE apply_steps SET state='applied' WHERE plan_id=? AND step_index=? AND state='pending'
+			AND EXISTS(SELECT 1 FROM apply_plans WHERE plan_id=? AND status='applying')`, planID.String(), stepIndex, planID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return nil
+		}
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT s.state FROM apply_steps s JOIN apply_plans p ON p.plan_id=s.plan_id WHERE s.plan_id=? AND s.step_index=? AND p.status='applying'`, planID.String(), stepIndex).Scan(&state); err != nil {
+			return err
+		}
+		if state != "applied" {
+			return errors.New("apply step is not active")
+		}
+		return nil
+	})
+}
+
+func (s *Store) CompleteApplyPlan(ctx context.Context, planID uuid.UUID) error {
+	if !validOperationID(planID) {
+		return errors.New("invalid apply plan id")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var from, through uint64
+		if err := tx.QueryRowContext(ctx, `SELECT from_cursor,through_cursor FROM apply_plans WHERE plan_id=? AND status='applying'`, planID.String()).Scan(&from, &through); err != nil {
+			return err
+		}
+		var pending int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM apply_steps WHERE plan_id=? AND state<>'applied'`, planID.String()).Scan(&pending); err != nil {
+			return err
+		}
+		if pending != 0 {
+			return errors.New("apply plan has pending steps")
+		}
+		var raw string
+		current := uint64(0)
+		err := tx.QueryRowContext(ctx, `SELECT value FROM sync_state WHERE key='confirmed_cursor'`).Scan(&raw)
+		if err == nil {
+			current, err = strconv.ParseUint(raw, 10, 63)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if current != from {
+			return errors.New("confirmed cursor changed during apply")
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT object_id,revision,operation_id FROM apply_steps WHERE plan_id=? ORDER BY step_index`, planID.String())
+		if err != nil {
+			return err
+		}
+		type baseline struct {
+			object    string
+			revision  uint64
+			operation string
+		}
+		var values []baseline
+		for rows.Next() {
+			var value baseline
+			if err := rows.Scan(&value.object, &value.revision, &value.operation); err != nil {
+				rows.Close()
+				return err
+			}
+			values = append(values, value)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, value := range values {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,?,?)
+				ON CONFLICT(object_id) DO UPDATE SET revision=excluded.revision,operation_id=excluded.operation_id WHERE excluded.revision>sync_baselines.revision`, value.object, value.revision, value.operation); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sync_state(key,value) VALUES('confirmed_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, fmt.Sprint(through)); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='completed',completed_at_ms=? WHERE plan_id=? AND status='applying'`, s.clock().UTC().UnixMilli(), planID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("apply plan completion race")
+		}
+		return nil
+	})
 }
 
 func mutationDependsOn(m Mutation, expected uuid.UUID) bool {

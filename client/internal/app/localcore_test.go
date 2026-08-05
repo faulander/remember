@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,7 +12,405 @@ import (
 	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/localindex"
+	"github.com/faulander/remember/client/internal/reconcile"
+	"github.com/google/uuid"
 )
+
+func TestExecuteActiveApplyPlanCreateUpdateAndRejectUnsupported(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	createBytes, err := frontmatter.EnsureIdentity([]byte("# Remote\n"), object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createHash := sha256.Sum256(createBytes.Markdown)
+	planID, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "Remote.md", BlobHash: createHash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(_ context.Context, hash [32]byte) ([]byte, error) {
+		if hash == createHash {
+			return createBytes.Markdown, nil
+		}
+		return nil, errors.New("unknown blob")
+	})
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Remote.md")); err != nil || string(got) != string(createBytes.Markdown) {
+		t.Fatalf("created=%q err=%v", got, err)
+	}
+	if pending, err := store.ListPending(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("remote apply echoed outbox=%#v err=%v", pending, err)
+	}
+
+	updateBytes := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + object.String() + "\"\n---\n# Updated\n")
+	updateHash := sha256.Sum256(updateBytes)
+	updatePlan, updateOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: updatePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: updateOp, ObjectID: object, Mutation: clientsync.Update, ObjectType: clientsync.Note, Revision: 2, Name: "Remote.md", BlobHash: updateHash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver = clientsync.BlobResolverFunc(func(_ context.Context, hash [32]byte) ([]byte, error) {
+		if hash == updateHash {
+			return updateBytes, nil
+		}
+		return nil, errors.New("unknown blob")
+	})
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Remote.md")); err != nil || string(got) != string(updateBytes) {
+		t.Fatalf("updated=%q err=%v", got, err)
+	}
+
+	unsupportedID, unsupportedOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: unsupportedID, FromCursor: 2, ThroughCursor: 3, Steps: []clientsync.Change{{Cursor: 3, OperationID: unsupportedOp, ObjectID: uuid.New(), Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "Folder"}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(root, "Remote.md"))
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); !errors.Is(err, ErrUnsupportedApplyPlan) {
+		t.Fatalf("unsupported error=%v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(root, "Remote.md"))
+	if string(before) != string(after) {
+		t.Fatal("unsupported plan mutated filesystem")
+	}
+}
+
+func TestExecuteActiveApplyPlanRejectsBlobMismatchBeforeFilesystemMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	expected := sha256.Sum256([]byte("expected"))
+	planID, operationID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: operationID, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "Mismatch.md", BlobHash: expected[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return []byte("different"), nil })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("blob mismatch accepted")
+	}
+	if _, err := os.Stat(filepath.Join(root, "Mismatch.md")); !os.IsNotExist(err) {
+		t.Fatalf("mismatch mutated filesystem: %v", err)
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || active.Status != "prepared" {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanResumesCreatePublishedBeforeJournalMark(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	patched, err := frontmatter.EnsureIdentity([]byte("resume\n"), object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(patched.Markdown)
+	planID, operationID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: operationID, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "Resume.md", BlobHash: hash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after durable filesystem publication but before reconcile
+	// and the apply-step journal transition.
+	if err := os.WriteFile(filepath.Join(root, "Resume.md"), patched.Markdown, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return patched.Markdown, nil })
+	if err := reopened.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	reopenedStore, _ := clientsync.NewStore(reopened.index)
+	if cursor, err := reopenedStore.ConfirmedCursor(ctx); err != nil || cursor != 1 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if active, err := reopenedStore.ActiveApplyPlan(ctx); err != nil || active != nil {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanPreservesOfflineEditAfterBeginCrash(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	initial, _ := frontmatter.EnsureIdentity([]byte("initial\n"), object)
+	initialHash := sha256.Sum256(initial.Markdown)
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "N.md", BlobHash: initialHash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return initial.Markdown, nil })); err != nil {
+		t.Fatal(err)
+	}
+	remote := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + object.String() + "\"\n---\nremote\n")
+	remoteHash := sha256.Sum256(remote)
+	updatePlan, updateOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: updatePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: updateOp, ObjectID: object, Mutation: clientsync.Update, ObjectType: clientsync.Note, Revision: 2, Name: "N.md", BlobHash: remoteHash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, updatePlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	local := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + object.String() + "\"\n---\nlocal offline\n")
+	if err := os.WriteFile(filepath.Join(root, "N.md"), local, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, _, err := reopened.CreateNote(ctx, "Blocked.md", "blocked", nil); !errors.Is(err, ErrApplyPlanActive) {
+		t.Fatalf("mutation during active plan error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Blocked.md")); !os.IsNotExist(err) {
+		t.Fatalf("blocked mutation changed filesystem: %v", err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return remote, nil })
+	if err := reopened.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("offline edit was overwritten")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "N.md")); err != nil || string(got) != string(local) {
+		t.Fatalf("local bytes=%q err=%v", got, err)
+	}
+	if _, err := reopened.Reconcile(ctx); !errors.Is(err, ErrApplyPlanActive) {
+		t.Fatalf("reconcile during active plan error=%v", err)
+	}
+	reopenedStore, _ := clientsync.NewStore(reopened.index)
+	if active, err := reopenedStore.ActiveApplyPlan(ctx); err != nil || active == nil {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanRejectsIdentitylessBlobAndPortableCollision(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		localName  string
+		remoteName string
+		identity   bool
+	}{
+		{name: "identityless", remoteName: "Remote.md"},
+		{name: "portable collision", localName: "note.md", remoteName: "Note.md", identity: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			if test.localName != "" {
+				if err := os.WriteFile(filepath.Join(root, test.localName), []byte("local\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			core, _, err := Initialize(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer core.Close()
+			store, _ := clientsync.NewStore(core.index)
+			object := uuid.New()
+			blob := []byte("identityless\n")
+			if test.identity {
+				patched, patchErr := frontmatter.EnsureIdentity([]byte("remote\n"), object)
+				if patchErr != nil {
+					t.Fatal(patchErr)
+				}
+				blob = patched.Markdown
+			}
+			hash := sha256.Sum256(blob)
+			planID, operationID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+			if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: operationID, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: test.remoteName, BlobHash: hash[:]}}}); err != nil {
+				t.Fatal(err)
+			}
+			resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return blob, nil })
+			if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+				t.Fatal("unsafe remote blob accepted")
+			}
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.Name() == test.remoteName {
+					t.Fatal("remote create mutated disk")
+				}
+			}
+		})
+	}
+}
+
+func TestExecuteActiveApplyPlanResumesLaterPublishedStepForSameObject(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	created, _ := frontmatter.EnsureIdentity([]byte("created\n"), object)
+	updated := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + object.String() + "\"\n---\nupdated\n")
+	createHash, updateHash := sha256.Sum256(created.Markdown), sha256.Sum256(updated)
+	planID, op1, op2 := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	plan := clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 2, Steps: []clientsync.Change{
+		{Cursor: 1, OperationID: op1, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "N.md", BlobHash: createHash[:]},
+		{Cursor: 2, OperationID: op2, ObjectID: object, Mutation: clientsync.Update, ObjectType: clientsync.Note, Revision: 2, Name: "N.md", BlobHash: updateHash[:]},
+	}}
+	if err := store.CreateApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "N.md"), updated, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, root, core.index, reconcile.Options{AppliedRemoteNotes: map[uuid.UUID][32]byte{object: updateHash}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, planID, 0); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(_ context.Context, hash [32]byte) ([]byte, error) {
+		if hash == createHash {
+			return created.Markdown, nil
+		}
+		if hash == updateHash {
+			return updated, nil
+		}
+		return nil, errors.New("unknown blob")
+	})
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "N.md")); err != nil || string(got) != string(updated) {
+		t.Fatalf("content=%q err=%v", got, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanRejectsInternalCollisionBeforeWrite(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	firstID, secondID := uuid.New(), uuid.New()
+	first, _ := frontmatter.EnsureIdentity([]byte("first\n"), firstID)
+	second, _ := frontmatter.EnsureIdentity([]byte("second\n"), secondID)
+	firstHash, secondHash := sha256.Sum256(first.Markdown), sha256.Sum256(second.Markdown)
+	planID, op1, op2 := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	plan := clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 2, Steps: []clientsync.Change{
+		{Cursor: 1, OperationID: op1, ObjectID: firstID, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "note.md", BlobHash: firstHash[:]},
+		{Cursor: 2, OperationID: op2, ObjectID: secondID, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "Note.md", BlobHash: secondHash[:]},
+	}}
+	if err := store.CreateApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(_ context.Context, hash [32]byte) ([]byte, error) {
+		if hash == firstHash {
+			return first.Markdown, nil
+		}
+		if hash == secondHash {
+			return second.Markdown, nil
+		}
+		return nil, errors.New("unknown blob")
+	})
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("internal path collision accepted")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "note.md" || entry.Name() == "Note.md" {
+			t.Fatalf("partial plan publication: %s", entry.Name())
+		}
+	}
+}
+
+func TestExecuteActiveApplyPlanDetectsEditDuringSuppressedReconcileGap(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	remote, _ := frontmatter.EnsureIdentity([]byte("remote\n"), object)
+	hash := sha256.Sum256(remote.Markdown)
+	planID, operationID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: operationID, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "Race.md", BlobHash: hash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	local := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + object.String() + "\"\n---\nlocal race\n")
+	testHookAfterApplyPublication = func() {
+		testHookAfterApplyPublication = nil
+		if err := os.WriteFile(filepath.Join(root, "Race.md"), local, 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { testHookAfterApplyPublication = nil }()
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return remote.Markdown, nil })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("concurrent local edit was absorbed")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Race.md")); err != nil || string(got) != string(local) {
+		t.Fatalf("local bytes=%q err=%v", got, err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 0 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if active, err := store.ActiveApplyPlan(ctx); err != nil || active == nil || active.Status != "applying" {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+	if pending, err := store.ListPending(ctx, 10); err != nil || len(pending) != 1 || pending[0].Mutation.ObjectID != object {
+		t.Fatalf("concurrent local intent=%#v err=%v", pending, err)
+	}
+}
 
 func TestInitializeOpenAndReconcileExternalChanges(t *testing.T) {
 	ctx := context.Background()

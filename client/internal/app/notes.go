@@ -54,6 +54,9 @@ func (c *LocalCore) CreateNote(ctx context.Context, relative string, body string
 	if err := c.ensureUsable(ctx); err != nil {
 		return NoteDocument{}, reconcile.Report{}, err
 	}
+	if err := c.ensureNoActiveApplyPlan(ctx); err != nil {
+		return NoteDocument{}, reconcile.Report{}, err
+	}
 	if _, err := c.resolveNewNote(relative, ""); err != nil {
 		return NoteDocument{}, reconcile.Report{}, err
 	}
@@ -96,6 +99,9 @@ func (c *LocalCore) CreateFolder(ctx context.Context, relative string) (reconcil
 	if err := c.ensureUsable(ctx); err != nil {
 		return reconcile.Report{}, err
 	}
+	if err := c.ensureNoActiveApplyPlan(ctx); err != nil {
+		return reconcile.Report{}, err
+	}
 	if err := c.resolveNewFolder(relative); err != nil {
 		return reconcile.Report{}, err
 	}
@@ -114,6 +120,9 @@ func (c *LocalCore) SaveNote(ctx context.Context, relative, expectedRevision, bo
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
 	if err := c.ensureUsable(ctx); err != nil {
+		return NoteDocument{}, reconcile.Report{}, err
+	}
+	if err := c.ensureNoActiveApplyPlan(ctx); err != nil {
 		return NoteDocument{}, reconcile.Report{}, err
 	}
 	if len(body) > MaxNoteBytes {
@@ -155,6 +164,9 @@ func (c *LocalCore) MoveNote(ctx context.Context, sourceRelative, destinationRel
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
 	if err := c.ensureUsable(ctx); err != nil {
+		return NoteDocument{}, reconcile.Report{}, err
+	}
+	if err := c.ensureNoActiveApplyPlan(ctx); err != nil {
 		return NoteDocument{}, reconcile.Report{}, err
 	}
 	source, err := c.resolveNote(sourceRelative)
@@ -204,6 +216,9 @@ func (c *LocalCore) DeleteNote(ctx context.Context, relative, expectedRevision s
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
 	if err := c.ensureUsable(ctx); err != nil {
+		return reconcile.Report{}, err
+	}
+	if err := c.ensureNoActiveApplyPlan(ctx); err != nil {
 		return reconcile.Report{}, err
 	}
 	if _, err := c.resolveNote(relative); err != nil {

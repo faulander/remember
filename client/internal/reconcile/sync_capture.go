@@ -52,6 +52,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 		}
 		var creates, changes, deletes []localindex.Object
 		for id, o := range current {
+			if expected, ok := options.AppliedRemoteNotes[id]; ok && bytes.Equal(o.ContentHash, expected[:]) {
+				continue
+			}
 			before, was := old[id]
 			projected, err := loadProjection(id)
 			if err != nil {

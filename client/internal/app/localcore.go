@@ -24,6 +24,7 @@ var (
 	ErrRootInUse          = errors.New("remember root is already open")
 	ErrCoreClosed         = errors.New("local core is closed")
 	ErrWatcherStarted     = errors.New("filesystem watcher already started")
+	ErrApplyPlanActive    = errors.New("remote apply plan must be resumed before reconciliation")
 )
 
 // Update is one watcher-triggered full reconciliation result.
@@ -134,7 +135,26 @@ func Open(ctx context.Context, root string) (*LocalCore, reconcile.Report, error
 		recoveryMode = exists && value == "1"
 	}
 	core := &LocalCore{root: absolute, index: index, rootLock: rootLock, recoveryMode: recoveryMode}
-	report, err := core.Reconcile(ctx)
+	if store, storeErr := clientsync.NewStore(index); storeErr != nil {
+		index.Close()
+		rootLock.Unlock()
+		return nil, reconcile.Report{}, storeErr
+	} else if active, activeErr := store.ActiveApplyPlan(ctx); activeErr != nil {
+		index.Close()
+		rootLock.Unlock()
+		return nil, reconcile.Report{}, activeErr
+	} else if active != nil {
+		// Preserve the last durable snapshot until the executor can distinguish
+		// published remote bytes from unrelated offline edits.
+		snapshot, snapshotErr := index.ReadSnapshot(ctx)
+		if snapshotErr != nil {
+			index.Close()
+			rootLock.Unlock()
+			return nil, reconcile.Report{}, snapshotErr
+		}
+		return core, reconcile.Report{Objects: len(snapshot.Objects)}, nil
+	}
+	report, err := core.reconcileWithOptions(ctx, reconcile.Options{RecoveryMode: recoveryMode})
 	if err != nil {
 		index.Close()
 		rootLock.Unlock()
@@ -160,7 +180,33 @@ func (c *LocalCore) reconcileWithOptions(ctx context.Context, options reconcile.
 	if closed {
 		return reconcile.Report{}, ErrCoreClosed
 	}
+	store, err := clientsync.NewStore(c.index)
+	if err != nil {
+		return reconcile.Report{}, err
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil {
+		return reconcile.Report{}, err
+	}
+	if active != nil {
+		return reconcile.Report{}, ErrApplyPlanActive
+	}
 	return reconcile.Run(ctx, c.root, c.index, options)
+}
+
+func (c *LocalCore) ensureNoActiveApplyPlan(ctx context.Context) error {
+	store, err := clientsync.NewStore(c.index)
+	if err != nil {
+		return err
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil {
+		return err
+	}
+	if active != nil {
+		return ErrApplyPlanActive
+	}
+	return nil
 }
 
 // Snapshot returns current reconstructable metadata and local issues.
@@ -189,6 +235,9 @@ func (c *LocalCore) PrepareSyncBootstrap(ctx context.Context) error {
 	}
 	if recovery {
 		return errors.New("sync bootstrap is disabled in index recovery mode")
+	}
+	if err := c.ensureNoActiveApplyPlan(ctx); err != nil {
+		return err
 	}
 	return clientsync.PrepareBootstrap(ctx, c.root, c.index, nil)
 }

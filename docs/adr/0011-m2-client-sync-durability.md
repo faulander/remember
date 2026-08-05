@@ -19,16 +19,16 @@ Actor- und Operations-IDs bleiben UUIDv7. Objekt- und Parent-IDs akzeptieren jed
 
 Ein neu initialisierter Root darf seine gültigen Objekte als Creates erfassen. Ein Upgrade eines vorhandenen v1-Index setzt dagegen `bootstrap_required`; erst `clientsync.PrepareBootstrap` übernimmt den aktuellen gültigen Baum explizit. Indexverlust-/Folder-Recovery bootstrapped niemals automatisch geratenen Zustand.
 
-Apply-Pläne und Schritte werden bereits crash-sicher persistiert, aber in diesem Schnitt noch nicht auf das Dateisystem ausgeführt.
+Apply-Pläne und Schritte werden crash-sicher persistiert. Ein begrenzter Executor führt Remote-Create und -Update für Notizen aus: Der vollständige Plan wird vor jeder Dateisystemmutation validiert, Blobs werden auf Größe und SHA-256 geprüft und müssen die erwartete Identität bereits in den authentifizierten, unveränderten Bytes tragen; Veröffentlichungen erfolgen descriptor-verankert. `prepared -> applying`, `pending -> applied` und die abschließende Cursor-/Baseline-Transaktion sind monoton und wiederholbar. Nach jeder Veröffentlichung baut Reconcile den Index neu auf; Outbox-Erfassung wird ausschließlich für die erwartete Objekt-ID und nur bei exakt passendem SHA-256 unterdrückt. Andere oder konkurrierend veränderte Bytes werden weiterhin als lokale Absicht erfasst. Beim Öffnen mit aktivem Plan bleibt der letzte persistierte Snapshot unangetastet, bis der Executor veröffentlichte Remote-Bytes von konkurrierenden Offline-Änderungen unterschieden hat; allgemeine Reconcile-/Watcher-Läufe bleiben bis dahin gesperrt. Ordner-, Move- und Delete-Pläne schlagen vor jeder Mutation geschlossen fehl; Windows bleibt bis zur handle-sicheren Reparse-Point-Implementierung ebenfalls geschlossen.
 
 ## Nicht enthalten
 
 - HTTP-Client, Authentifizierung oder Tokenablage in Keychain/Credential Manager/Secret Service,
 - Scheduler, Retry/Backoff oder automatischer Blob-/Operations-Upload,
-- tatsächliche Ausführung eines Apply-Plans, Konfliktmaterialisierung oder Remote-Blob-Download,
+- Ordner-, Move- und Delete-Ausführung, Konfliktmaterialisierung oder der eigentliche Remote-Blob-HTTP-Download,
 - UI für Konto, Sync-Fortschritt oder Konflikte,
 - Bereinigung nicht mehr referenzierter lokaler Staging-Blobs, Geräte-Acknowledgements und Tombstone-GC.
 
 ## Folgen
 
-Ausgehende Absichten und die dazugehörigen exakten Bytes überleben Neustarts und können später deterministisch übertragen werden. Der nächste Schnitt führt Apply-Pläne mit descriptor-sicheren Dateisystemoperationen aus und verbindet Outbox/Pull mit dem HTTP-Transport.
+Ausgehende Absichten und die dazugehörigen exakten Bytes überleben Neustarts. Eingehende Notiz-Creates/-Updates können nach Abstürzen idempotent fortgesetzt werden; Cursor und Baselines wechseln erst nach vollständig angewendetem Plan. Der nächste Schnitt verbindet Outbox, Blob-Resolver und Pull mit dem HTTP-Transport und ergänzt die sicher fehlenden Mutationsarten.

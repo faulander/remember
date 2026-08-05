@@ -3,6 +3,7 @@ package reconcile
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -531,6 +532,34 @@ func TestRunCapturesDeletesChildBeforeParent(t *testing.T) {
 	pending, err = store.ListPending(ctx, 10)
 	if err != nil || len(pending) != 1 || pending[0].Mutation.ObjectID != folderID {
 		t.Fatalf("parent delete=%#v err=%v", pending, err)
+	}
+}
+
+func TestRunSuppressesOnlyExactAppliedRemoteNote(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remoteID, localID := uuid.New(), uuid.New()
+	remote := noteWithID(remoteID.String())
+	local := append(noteWithID(localID.String()), []byte("local change\n")...)
+	writeTestFile(t, root, "Remote.md", remote)
+	writeTestFile(t, root, "Local.md", local)
+	index := openTestIndex(t, ctx, root)
+	remoteHash, localHash := sha256.Sum256(remote), sha256.Sum256(local)
+	previous := localindex.Snapshot{Objects: []localindex.Object{
+		{ID: remoteID, Type: localindex.ObjectNote, RelativePath: "Remote.md", CollisionPath: "remote.md", ContentHash: make([]byte, 32), IdentityState: localindex.IdentityKnown},
+		{ID: localID, Type: localindex.ObjectNote, RelativePath: "Local.md", CollisionPath: "local.md", ContentHash: make([]byte, 32), IdentityState: localindex.IdentityKnown},
+	}}
+	if err := index.ReplaceSnapshot(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	op, _ := uuid.NewV7()
+	if _, err := Run(ctx, root, index, Options{AppliedRemoteNotes: map[uuid.UUID][32]byte{remoteID: remoteHash}, NewOperationID: sequenceGenerator(t, op)}); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(index)
+	pending, err := store.ListPending(ctx, 10)
+	if err != nil || len(pending) != 1 || pending[0].Mutation.ObjectID != localID || !bytes.Equal(pending[0].Mutation.BlobHash, localHash[:]) {
+		t.Fatalf("selective capture=%#v err=%v", pending, err)
 	}
 }
 

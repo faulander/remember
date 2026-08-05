@@ -121,13 +121,12 @@ func TestEnsureIdentityUsesExistingCRLFWithoutFrontmatter(t *testing.T) {
 	}
 }
 
-func TestEnsureIdentityRejectsNonV7Candidate(t *testing.T) {
+func TestEnsureIdentityAcceptsCanonicalRFC4122Candidate(t *testing.T) {
 	t.Parallel()
 
-	_, err := EnsureIdentity([]byte("Body\n"), uuid.MustParse(existingID))
-	var validationErr *ValidationError
-	if !errors.As(err, &validationErr) || validationErr.Problem != ProblemInvalidNoteID {
-		t.Fatalf("EnsureIdentity() error = %v, want invalid note ID", err)
+	result, err := EnsureIdentity([]byte("Body\n"), uuid.MustParse(existingID))
+	if err != nil || result.NoteID.String() != existingID {
+		t.Fatalf("EnsureIdentity() result=%#v error=%v", result, err)
 	}
 }
 

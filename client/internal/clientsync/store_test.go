@@ -302,13 +302,59 @@ func TestApplyPlanPersistence(t *testing.T) {
 	planID, _ := uuid.NewV7()
 	op, _ := uuid.NewV7()
 	obj := uuid.New()
+	if err := store.SetConfirmedCursor(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
 	plan := ApplyPlan{ID: planID, FromCursor: 2, ThroughCursor: 3, Steps: []Change{{Cursor: 3, OperationID: op, ObjectID: obj, Mutation: Create, ObjectType: Folder, Revision: 1, Name: "Folder"}}}
 	if err := store.CreateApplyPlan(ctx, plan); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.ActiveApplyPlan(ctx)
-	if err != nil || got == nil || got.ID != planID || len(got.Steps) != 1 || got.Steps[0].ObjectID != obj {
+	if err != nil || got == nil || got.ID != planID || len(got.Steps) != 1 || got.Steps[0].ObjectID != obj || got.Steps[0].State != "pending" {
 		t.Fatalf("plan=%#v err=%v", got, err)
+	}
+}
+
+func TestApplyPlanTransitionsCompleteAtomically(t *testing.T) {
+	ctx := context.Background()
+	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	defer index.Close()
+	store, _ := NewStore(index)
+	planID, op := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	object := uuid.New()
+	plan := ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []Change{{Cursor: 1, OperationID: op, ObjectID: object, Mutation: Create, ObjectType: Note, Revision: 1, Name: "N.md", BlobHash: make([]byte, 32)}}}
+	if err := store.CreateApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteApplyPlan(ctx, planID); err == nil {
+		t.Fatal("prepared plan completed")
+	}
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal("begin replay failed:", err)
+	}
+	if err := store.CompleteApplyPlan(ctx, planID); err == nil {
+		t.Fatal("pending plan completed")
+	}
+	if err := store.MarkApplyStepApplied(ctx, planID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, planID, 0); err != nil {
+		t.Fatal("step replay failed:", err)
+	}
+	if err := store.CompleteApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 1 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if revision, found, err := store.Baseline(ctx, object); err != nil || !found || revision != 1 {
+		t.Fatalf("baseline=%d/%t err=%v", revision, found, err)
+	}
+	if active, err := store.ActiveApplyPlan(ctx); err != nil || active != nil {
+		t.Fatalf("active=%#v err=%v", active, err)
 	}
 }
 
@@ -318,6 +364,9 @@ func TestApplyPlanRejectsCursorGaps(t *testing.T) {
 	defer index.Close()
 	store, _ := NewStore(index)
 	planID, op1, op2 := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.SetConfirmedCursor(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
 	plan := ApplyPlan{ID: planID, FromCursor: 2, ThroughCursor: 5, Steps: []Change{
 		{Cursor: 3, OperationID: op1, ObjectID: uuid.New(), Mutation: Create, ObjectType: Folder, Revision: 1, Name: "A"},
 		{Cursor: 5, OperationID: op2, ObjectID: uuid.New(), Mutation: Create, ObjectType: Folder, Revision: 1, Name: "B"},
