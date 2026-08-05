@@ -112,7 +112,10 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		expected := after
 		for _, change := range page.Changes {
 			expected++
-			if change.Cursor != expected || change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update) || change.Deleted || change.ParentID != nil {
+			if change.Cursor != expected {
+				return remotehttp.ErrInvalidResponse
+			}
+			if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update && change.Mutation != clientsync.Move && change.Mutation != clientsync.Delete) {
 				return ErrUnsupportedPullPage
 			}
 		}

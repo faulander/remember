@@ -89,6 +89,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 			if _, ok := current[id]; ok {
 				continue
 			}
+			if options.AppliedRemoteDeletes[id] {
+				continue
+			}
 			projected, err := loadProjection(id)
 			if err != nil {
 				return nil, nil, err

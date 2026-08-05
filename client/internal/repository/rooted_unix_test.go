@@ -12,6 +12,24 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestMoveRootedExpectedRecoversUniqueStagedSource(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("staged exact")
+	staged := filepath.Join(root, ".remember-move-recovery-test")
+	if err := os.WriteFile(staged, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveRootedExpected(root, "missing.md", "moved.md", content); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "moved.md")); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("moved=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("staged source remains: %v", err)
+	}
+}
+
 func TestRootedSavePreservesConcurrentReplacementAndDisplacedBytes(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "Note.md")

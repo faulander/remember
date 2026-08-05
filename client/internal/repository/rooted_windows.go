@@ -15,6 +15,10 @@ func EnsurePrivateStagingSupported() error {
 	return errors.New("private sync staging is not yet supported on Windows")
 }
 
+func RootedStagedMoveExists(string, string, []byte) (bool, error) {
+	return false, errors.New("handle-safe move recovery is not yet supported on Windows")
+}
+
 func ReadRootedPrivate(string, string, int64) ([]byte, error) {
 	return nil, errors.New("private sync staging is not yet supported on Windows")
 }

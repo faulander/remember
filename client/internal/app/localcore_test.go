@@ -13,6 +13,7 @@ import (
 	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/localindex"
 	"github.com/faulander/remember/client/internal/reconcile"
+	"github.com/faulander/remember/client/internal/repository"
 	"github.com/google/uuid"
 )
 
@@ -81,6 +82,263 @@ func TestExecuteActiveApplyPlanCreateUpdateAndRejectUnsupported(t *testing.T) {
 	after, _ := os.ReadFile(filepath.Join(root, "Remote.md"))
 	if string(before) != string(after) {
 		t.Fatal("unsupported plan mutated filesystem")
+	}
+}
+
+func TestExecuteActiveApplyPlanMovesAndRecoverablyDeletesNote(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	content, _ := frontmatter.EnsureIdentity([]byte("remote\n"), object)
+	hash := sha256.Sum256(content.Markdown)
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return content.Markdown, nil })
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "N.md", BlobHash: hash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	movePlan, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: movePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: moveOp, ObjectID: object, Mutation: clientsync.Move, ObjectType: clientsync.Note, Revision: 2, Name: "Moved.md", BlobHash: hash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Moved.md")); err != nil || string(got) != string(content.Markdown) {
+		t.Fatalf("moved=%q err=%v", got, err)
+	}
+	deletePlan, deleteOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: deletePlan, FromCursor: 2, ThroughCursor: 3, Steps: []clientsync.Change{{Cursor: 3, OperationID: deleteOp, ObjectID: object, Mutation: clientsync.Delete, ObjectType: clientsync.Note, Revision: 3, Name: "Moved.md", BlobHash: hash[:], Deleted: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Moved.md")); !os.IsNotExist(err) {
+		t.Fatalf("deleted source=%v", err)
+	}
+	trash := filepath.Join(root, ".remember", "trash", object.String()+"-"+deleteOp.String()+".md")
+	if got, err := os.ReadFile(trash); err != nil || string(got) != string(content.Markdown) {
+		t.Fatalf("trash=%q err=%v", got, err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 3 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if ready, err := store.ListReady(ctx, 10); err != nil || len(ready) != 0 {
+		t.Fatalf("outbox=%#v err=%v", ready, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanResumesDeleteAfterReconcileBeforeJournal(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	content, _ := frontmatter.EnsureIdentity([]byte("remote\n"), object)
+	hash := sha256.Sum256(content.Markdown)
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return content.Markdown, nil })
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "N.md", BlobHash: hash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	planID, deleteOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	change := clientsync.Change{Cursor: 2, OperationID: deleteOp, ObjectID: object, Mutation: clientsync.Delete, ObjectType: clientsync.Note, Revision: 2, Name: "N.md", BlobHash: hash[:], Deleted: true}
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{change}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.EnsureRootedDirectory(root, ".remember/trash", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trash := ".remember/trash/" + object.String() + "-" + deleteOp.String() + ".md"
+	if err := repository.MoveRootedExpected(root, "N.md", trash, content.Markdown); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, root, core.index, reconcile.Options{AppliedRemoteDeletes: map[uuid.UUID]bool{object: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	reopenedStore, _ := clientsync.NewStore(reopened.index)
+	if cursor, err := reopenedStore.ConfirmedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(trash))); err != nil || string(got) != string(content.Markdown) {
+		t.Fatalf("trash=%q err=%v", got, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanRecoversStagedMoveAndDelete(t *testing.T) {
+	ctx := context.Background()
+	for _, mutation := range []clientsync.MutationKind{clientsync.Move, clientsync.Delete} {
+		t.Run(string(mutation), func(t *testing.T) {
+			root := t.TempDir()
+			core, _, err := Initialize(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer core.Close()
+			store, _ := clientsync.NewStore(core.index)
+			object := uuid.New()
+			content, _ := frontmatter.EnsureIdentity([]byte("remote\n"), object)
+			hash := sha256.Sum256(content.Markdown)
+			resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return content.Markdown, nil })
+			createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+			if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "N.md", BlobHash: hash[:]}}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+				t.Fatal(err)
+			}
+			planID, op := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+			name, deleted := "Moved.md", false
+			if mutation == clientsync.Delete {
+				name, deleted = "N.md", true
+			}
+			change := clientsync.Change{Cursor: 2, OperationID: op, ObjectID: object, Mutation: mutation, ObjectType: clientsync.Note, Revision: 2, Name: name, BlobHash: hash[:], Deleted: deleted}
+			if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{change}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.BeginApplyPlan(ctx, planID); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(root, "N.md"), filepath.Join(root, ".remember-move-recovery-crash")); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+				t.Fatal(err)
+			}
+			if mutation == clientsync.Move {
+				if got, err := os.ReadFile(filepath.Join(root, "Moved.md")); err != nil || string(got) != string(content.Markdown) {
+					t.Fatalf("moved=%q err=%v", got, err)
+				}
+			} else {
+				trash := filepath.Join(root, ".remember", "trash", object.String()+"-"+op.String()+".md")
+				if got, err := os.ReadFile(trash); err != nil || string(got) != string(content.Markdown) {
+					t.Fatalf("trash=%q err=%v", got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestExecuteActiveApplyPlanReusesPathVacatedEarlierInPlan(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	firstID, secondID := uuid.New(), uuid.New()
+	first, _ := frontmatter.EnsureIdentity([]byte("first\n"), firstID)
+	second, _ := frontmatter.EnsureIdentity([]byte("second\n"), secondID)
+	firstHash, secondHash := sha256.Sum256(first.Markdown), sha256.Sum256(second.Markdown)
+	resolver := clientsync.BlobResolverFunc(func(_ context.Context, hash [32]byte) ([]byte, error) {
+		if hash == firstHash {
+			return first.Markdown, nil
+		}
+		if hash == secondHash {
+			return second.Markdown, nil
+		}
+		return nil, errors.New("unknown blob")
+	})
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: firstID, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "Note.md", BlobHash: firstHash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	planID, deleteOp, secondOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	plan := clientsync.ApplyPlan{ID: planID, FromCursor: 1, ThroughCursor: 3, Steps: []clientsync.Change{
+		{Cursor: 2, OperationID: deleteOp, ObjectID: firstID, Mutation: clientsync.Delete, ObjectType: clientsync.Note, Revision: 2, Name: "Note.md", BlobHash: firstHash[:], Deleted: true},
+		{Cursor: 3, OperationID: secondOp, ObjectID: secondID, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "note.md", BlobHash: secondHash[:]},
+	}}
+	if err := store.CreateApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range entries {
+		found = found || entry.Name() == "note.md"
+	}
+	if !found {
+		t.Fatalf("vacated path was not reused: %#v", entries)
+	}
+}
+
+func TestExecuteActiveApplyPlanResumesPublishedLaterMove(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	object := uuid.New()
+	content, _ := frontmatter.EnsureIdentity([]byte("remote\n"), object)
+	hash := sha256.Sum256(content.Markdown)
+	planID, createOp, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	plan := clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 2, Steps: []clientsync.Change{
+		{Cursor: 1, OperationID: createOp, ObjectID: object, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, Name: "N.md", BlobHash: hash[:]},
+		{Cursor: 2, OperationID: moveOp, ObjectID: object, Mutation: clientsync.Move, ObjectType: clientsync.Note, Revision: 2, Name: "Moved.md", BlobHash: hash[:]},
+	}}
+	if err := store.CreateApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Moved.md"), content.Markdown, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, root, core.index, reconcile.Options{AppliedRemoteNotes: map[uuid.UUID][32]byte{object: hash}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, planID, 0); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return content.Markdown, nil })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
 	}
 }
 

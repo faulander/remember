@@ -46,8 +46,13 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		state = clientsync.Change{ObjectID: m.ObjectID, ObjectType: m.ObjectType, Revision: 1, ParentID: m.ParentID, Name: m.Name, BlobHash: append([]byte(nil), m.BlobHash...)}
 	} else {
 		state.Revision = m.BaseRevision + 1
-		if m.Kind == clientsync.Update {
+		switch m.Kind {
+		case clientsync.Update:
 			state.BlobHash = append([]byte(nil), m.BlobHash...)
+		case clientsync.Move:
+			state.ParentID, state.Name = m.ParentID, m.Name
+		case clientsync.Delete:
+			state.Deleted = true
 		}
 	}
 	cursor := uint64(len(r.server.changes) + 1)
@@ -162,6 +167,73 @@ func (r *cycleRemote) ResolveBlob(_ context.Context, h [32]byte) ([]byte, error)
 		return nil, errors.New("missing blob")
 	}
 	return b, nil
+}
+
+func TestSyncOnceConvergesRootNoteMoveAndDelete(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "first\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, err := b.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, _, err := b.MoveNote(ctx, "N.md", "Moved.md", bDoc.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if aDoc, err := a.ReadNote(ctx, "Moved.md"); err != nil || aDoc.ID != doc.ID || moved.ID != doc.ID {
+		t.Fatalf("moved=%#v a=%#v err=%v", moved, aDoc, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "N.md")); !os.IsNotExist(err) {
+		t.Fatalf("old path=%v", err)
+	}
+	aDoc, _ := a.ReadNote(ctx, "Moved.md")
+	if _, err := a.DeleteNote(ctx, "Moved.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Moved.md")); !os.IsNotExist(err) {
+		t.Fatalf("remote delete=%v", err)
+	}
+	storeA, _ := clientsync.NewStore(a.index)
+	storeB, _ := clientsync.NewStore(b.index)
+	cursorA, _ := storeA.ConfirmedCursor(ctx)
+	cursorB, _ := storeB.ConfirmedCursor(ctx)
+	if cursorA != 3 || cursorB != 3 {
+		t.Fatalf("cursors=%d/%d", cursorA, cursorB)
+	}
 }
 
 func TestSyncOnceRetriesAmbiguousAttemptWithSameOperationAndBlobFirst(t *testing.T) {

@@ -33,7 +33,8 @@ type Options struct {
 	NewOperationID func() (uuid.UUID, error)
 	// AppliedRemoteNotes suppresses Outbox derivation only for authenticated
 	// remote note bytes whose exact observed SHA-256 matches the supplied hash.
-	AppliedRemoteNotes map[uuid.UUID][32]byte
+	AppliedRemoteNotes   map[uuid.UUID][32]byte
+	AppliedRemoteDeletes map[uuid.UUID]bool
 }
 
 // Report summarizes one completed reconciliation.

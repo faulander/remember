@@ -227,6 +227,9 @@ func MoveRootedExpected(root, sourceRelative, destinationRelative string, expect
 	}
 	defer unix.Close(destinationParent)
 	staged, err := stageAt(sourceParent, sourceBase, ".remember-move-recovery-")
+	if errors.Is(err, unix.ENOENT) {
+		return recoverStagedMove(sourceParent, destinationParent, destinationBase, expected)
+	}
 	if err != nil {
 		return fmt.Errorf("stage move source: %w", err)
 	}
@@ -261,6 +264,75 @@ func MoveRootedExpected(root, sourceRelative, destinationRelative string, expect
 		}
 	}
 	return nil
+}
+
+func RootedStagedMoveExists(root, sourceRelative string, expected []byte) (bool, error) {
+	parent, _, err := openRootedParent(root, sourceRelative)
+	if err != nil {
+		return false, err
+	}
+	defer unix.Close(parent)
+	candidate, err := findStagedMove(parent, expected)
+	return candidate != "", err
+}
+
+func findStagedMove(sourceParent int, expected []byte) (string, error) {
+	dup, err := unix.Dup(sourceParent)
+	if err != nil {
+		return "", err
+	}
+	directory := os.NewFile(uintptr(dup), "move-recovery")
+	entries, err := directory.ReadDir(-1)
+	directory.Close()
+	if err != nil {
+		return "", err
+	}
+	var candidate string
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".remember-move-recovery-") {
+			continue
+		}
+		content, readErr := readAt(sourceParent, entry.Name(), int64(len(expected))+1)
+		if readErr == nil && bytes.Equal(content, expected) {
+			if candidate != "" {
+				return "", errors.New("ambiguous staged move recovery")
+			}
+			candidate = entry.Name()
+		}
+	}
+	return candidate, nil
+}
+
+func recoverStagedMove(sourceParent, destinationParent int, destinationBase string, expected []byte) error {
+	candidate, err := findStagedMove(sourceParent, expected)
+	if err != nil {
+		return err
+	}
+	if candidate == "" {
+		return unix.ENOENT
+	}
+	if err := unix.Linkat(sourceParent, candidate, destinationParent, destinationBase, 0); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			current, readErr := readAt(destinationParent, destinationBase, int64(len(expected))+1)
+			if readErr == nil && bytes.Equal(current, expected) {
+				if err := unix.Fsync(destinationParent); err != nil {
+					return err
+				}
+				if err := unix.Unlinkat(sourceParent, candidate, 0); err != nil {
+					return err
+				}
+				return unix.Fsync(sourceParent)
+			}
+		}
+		return err
+	}
+	if err := unix.Fsync(destinationParent); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(sourceParent, candidate, 0); err != nil {
+		return err
+	}
+	return unix.Fsync(sourceParent)
 }
 
 func openRootedParent(root, relative string) (int, string, error) {

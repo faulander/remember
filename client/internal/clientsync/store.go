@@ -516,6 +516,17 @@ func (s *Store) HasUnresolvedLocalIntent(ctx context.Context, objectID uuid.UUID
 	return exists != 0, err
 }
 
+func (s *Store) BaselineMatchesOperation(ctx context.Context, objectID uuid.UUID, revision uint64, operationID uuid.UUID) (bool, error) {
+	if !validObjectID(objectID) || !validOperationID(operationID) || revision == 0 {
+		return false, errors.New("invalid baseline operation")
+	}
+	var exists int
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_baselines WHERE object_id=? AND revision=? AND operation_id=?)`, objectID.String(), revision, operationID.String()).Scan(&exists)
+	})
+	return exists != 0, err
+}
+
 func (s *Store) Baseline(ctx context.Context, objectID uuid.UUID) (uint64, bool, error) {
 	if !validObjectID(objectID) {
 		return 0, false, errors.New("invalid object id")

@@ -14,9 +14,9 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - interner Identity-, Sync-, Sessions- und Devices-Core
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
 - lokaler Index v2 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage und resumierbarem Notiz-Apply
-- strikter Client-HTTP-Transport und manueller Vordergrund-Sync für Root-Notiz-Create/-Update
+- strikter Client-HTTP-Transport und manueller Vordergrund-Sync für Notiz-Create/-Update/-Move/-Delete
 
-Öffentliche Registrierung, Reminder, weitere Apply-Mutationen und sichere Client-Tokenablage folgen in späteren Schnitten.
+Öffentliche Registrierung, Reminder, Ordner-Apply und sichere Client-Tokenablage folgen in späteren Schnitten.
 
 ## Repository
 
