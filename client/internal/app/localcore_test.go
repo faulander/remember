@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/localindex"
 )
@@ -237,6 +238,17 @@ func TestOpenReconstructsNotesAndReportsFoldersAfterIndexLoss(t *testing.T) {
 	}
 	if folder := findObject(snapshot, "Folder"); folder != nil {
 		t.Errorf("folder identity was guessed during recovery: %#v", *folder)
+	}
+	store, err := clientsync.NewStore(recovered.index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListPending(ctx, 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("recovery enqueued guessed sync intents: %#v err=%v", pending, err)
+	}
+	if err := recovered.PrepareSyncBootstrap(ctx); err == nil {
+		t.Fatal("recovery mode allowed sync bootstrap")
 	}
 	if err := recovered.Close(); err != nil {
 		t.Fatal(err)

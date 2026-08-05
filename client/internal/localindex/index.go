@@ -10,12 +10,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -89,11 +90,25 @@ func Open(ctx context.Context, path string) (*Index, error) {
 // Close releases the index database.
 func (i *Index) Close() error { return i.db.Close() }
 
+// WithTransaction serializes one durable local coordinator transition.
+func (i *Index) WithTransaction(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := i.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (i *Index) initialize(ctx context.Context) error {
 	for _, pragma := range []string{
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
 		"PRAGMA journal_mode = WAL",
+		"PRAGMA synchronous = FULL",
 	} {
 		if _, err := i.db.ExecContext(ctx, pragma); err != nil {
 			return fmt.Errorf("configure local index: %w", err)
@@ -107,30 +122,51 @@ func (i *Index) initialize(ctx context.Context) error {
 	if version > schemaVersion {
 		return fmt.Errorf("local index schema %d is newer than supported %d", version, schemaVersion)
 	}
-	if version == schemaVersion {
-		return nil
-	}
-	if version != 0 {
-		return fmt.Errorf("no migration path from local index schema %d", version)
-	}
-
-	script, err := migrations.ReadFile("migrations/001_initial.sql")
-	if err != nil {
-		return fmt.Errorf("read initial index migration: %w", err)
-	}
-	tx, err := i.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin index migration: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, string(script)); err != nil {
-		return fmt.Errorf("apply initial index migration: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-		return fmt.Errorf("record index schema version: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit index migration: %w", err)
+	openedVersion := version
+	for next := version + 1; next <= schemaVersion; next++ {
+		name := fmt.Sprintf("migrations/%03d_", next)
+		entries, err := migrations.ReadDir("migrations")
+		if err != nil {
+			return fmt.Errorf("list index migrations: %w", err)
+		}
+		var filename string
+		for _, entry := range entries {
+			candidate := "migrations/" + entry.Name()
+			if strings.HasPrefix(candidate, name) && strings.HasSuffix(candidate, ".sql") {
+				if filename != "" {
+					return fmt.Errorf("duplicate local index migration %d", next)
+				}
+				filename = candidate
+			}
+		}
+		if filename == "" {
+			return fmt.Errorf("missing local index migration %d", next)
+		}
+		script, err := migrations.ReadFile(filename)
+		if err != nil {
+			return fmt.Errorf("read index migration %d: %w", next, err)
+		}
+		tx, err := i.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin index migration %d: %w", next, err)
+		}
+		if _, err := tx.ExecContext(ctx, string(script)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("apply index migration %d: %w", next, err)
+		}
+		if openedVersion == 1 && next == 2 {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO sync_state(key,value) VALUES('bootstrap_required','1')`); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("mark sync bootstrap required: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", next)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("record index schema version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit index migration %d: %w", next, err)
+		}
 	}
 	return nil
 }
@@ -138,15 +174,15 @@ func (i *Index) initialize(ctx context.Context) error {
 // ReplaceSnapshot atomically replaces reconstructable objects and current
 // local issues. Any failed insert rolls back the complete replacement.
 func (i *Index) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) error {
+	return i.WithTransaction(ctx, func(tx *sql.Tx) error { return ReplaceSnapshotTx(ctx, tx, snapshot) })
+}
+
+// ReplaceSnapshotTx replaces reconstructable state inside a caller-owned
+// transaction so observation and Outbox capture can commit atomically.
+func ReplaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot Snapshot) error {
 	if err := validateSnapshot(snapshot); err != nil {
 		return err
 	}
-	tx, err := i.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin index replacement: %w", err)
-	}
-	defer tx.Rollback()
-
 	if _, err := tx.ExecContext(ctx, "DELETE FROM local_issues; DELETE FROM objects"); err != nil {
 		return fmt.Errorf("clear index snapshot: %w", err)
 	}
@@ -178,9 +214,6 @@ func (i *Index) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) error {
 		); err != nil {
 			return fmt.Errorf("insert local issue: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit index replacement: %w", err)
 	}
 	return nil
 }

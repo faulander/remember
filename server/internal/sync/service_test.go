@@ -19,7 +19,9 @@ func TestMutationLifecycleIdempotencyAndPull(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t, 1)
 	actor := fixture.actors[0]
-	folderID := newID(t)
+	// Existing local frontmatter may contain canonical legacy UUIDv4 object IDs;
+	// actor and operation identities remain UUIDv7.
+	folderID := uuid.New()
 	createFolder := mutation(MutationCreate, folderID, ObjectFolder, 0)
 	createFolder.Name = "Projekte"
 	first, err := actor.Submit(context.Background(), createFolder)
@@ -36,7 +38,7 @@ func TestMutationLifecycleIdempotencyAndPull(t *testing.T) {
 		t.Fatalf("replay mismatch = %v", err)
 	}
 
-	noteID := newID(t)
+	noteID := uuid.New()
 	createNote := mutation(MutationCreate, noteID, ObjectNote, 0)
 	createNote.ParentID = &folderID
 	createNote.Name = "Plan.md"

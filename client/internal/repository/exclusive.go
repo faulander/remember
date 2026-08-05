@@ -14,7 +14,15 @@ var ErrContentTooLarge = errors.New("content exceeds configured limit")
 // CreateExclusive publishes complete staged bytes without replacing an
 // existing destination. A crash can leave the staged file, but never a partial
 // destination.
-func CreateExclusive(path string, content []byte, validate Validator) (err error) {
+func CreateExclusive(path string, content []byte, validate Validator) error {
+	return createExclusiveMode(path, content, validate, 0o644)
+}
+
+func CreateExclusivePrivate(path string, content []byte) error {
+	return createExclusiveMode(path, content, nil, 0o600)
+}
+
+func createExclusiveMode(path string, content []byte, validate Validator, mode os.FileMode) (err error) {
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, ".remember-create-*")
 	if err != nil {
@@ -22,7 +30,7 @@ func CreateExclusive(path string, content []byte, validate Validator) (err error
 	}
 	temporaryPath := temporary.Name()
 	defer func() { temporary.Close(); _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o644); err != nil {
+	if err := temporary.Chmod(mode); err != nil {
 		return fmt.Errorf("set staged note mode: %w", err)
 	}
 	if _, err := temporary.Write(content); err != nil {

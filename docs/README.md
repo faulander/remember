@@ -21,5 +21,6 @@
 | [0008](adr/0008-m2-auth-http-transport.md) | Begrenzter Auth-HTTP-Transport |
 | [0009](adr/0009-m2-blob-http-transport.md) | Authentifizierter Blob-HTTP-Transport und Benutzerquota |
 | [0010](adr/0010-m2-sync-http-transport.md) | Authentifizierter Sync-HTTP-Transport |
+| [0011](adr/0011-m2-client-sync-durability.md) | Client-Outbox, Blob-Staging und Apply-Plan-Persistenz |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

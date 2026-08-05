@@ -475,7 +475,7 @@ func mapSyncMutation(request syncMutationRequest) (synccore.Mutation, error) {
 	if err != nil {
 		return synccore.Mutation{}, err
 	}
-	objectID, err := parseUUIDv7(request.ObjectID)
+	objectID, err := parseSyncObjectID(request.ObjectID)
 	if err != nil {
 		return synccore.Mutation{}, err
 	}
@@ -495,7 +495,7 @@ func mapSyncMutation(request syncMutationRequest) (synccore.Mutation, error) {
 		BaseRevision: request.BaseRevision, Name: request.Name,
 	}
 	if request.ParentID != nil {
-		parent, err := parseUUIDv7(*request.ParentID)
+		parent, err := parseSyncObjectID(*request.ParentID)
 		if err != nil {
 			return synccore.Mutation{}, err
 		}
@@ -902,6 +902,17 @@ func onePathSegment(path, prefix string) bool {
 	}
 	remainder := strings.TrimPrefix(path, prefix)
 	return remainder != "" && !strings.Contains(remainder, "/")
+}
+
+func parseSyncObjectID(raw string) (uuid.UUID, error) {
+	if len(raw) != 36 {
+		return uuid.Nil, synccore.ErrInvalidInput
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil || id == uuid.Nil || id.String() != raw || id.Variant() != uuid.RFC4122 {
+		return uuid.Nil, synccore.ErrInvalidInput
+	}
+	return id, nil
 }
 
 func parseUUIDv7(raw string) (uuid.UUID, error) {

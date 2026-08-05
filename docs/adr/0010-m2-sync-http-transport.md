@@ -18,7 +18,7 @@ Der HTTP-Layer authentifiziert ein Access-Token und bindet den Sync-Core ausschl
 - `POST /v1/sync/operations` übermittelt genau eine idempotente Mutation.
 - `GET /v1/sync/changes?after=<cursor>&limit=<n>` liest Änderungen nach einem benutzerspezifischen Cursor.
 
-Das Operations-JSON ist auf 16 KiB begrenzt, lehnt unbekannte Felder, weitere JSON-Werte und Content-Type-Parameter ab und verwendet kanonische UUIDv7 sowie kleingeschriebene SHA-256-Hexwerte. Es bildet `operation_id`, `mutation`, `object_id`, `object_type`, `base_revision`, nullable `parent_id`, `name` und nullable `blob_hash` direkt auf die interne Mutation ab. Der Core bleibt für semantische Kombinationen, portable Namen, Parent-Regeln, Kollisionen und Idempotenz zuständig.
+Das Operations-JSON ist auf 16 KiB begrenzt, lehnt unbekannte oder doppelte Felder, weitere JSON-Werte und Content-Type-Parameter ab. `operation_id` ist kanonische UUIDv7; `object_id` und `parent_id` sind kanonische, von Nil verschiedene RFC-4122-UUIDs (einschließlich UUIDv4). Blob-Hashes sind kleingeschriebenes SHA-256-Hex. Es bildet `operation_id`, `mutation`, `object_id`, `object_type`, `base_revision`, nullable `parent_id`, `name` und nullable `blob_hash` direkt auf die interne Mutation ab. Der Core bleibt für semantische Kombinationen, portable Namen, Parent-Regeln, Kollisionen und Idempotenz zuständig.
 
 Erfolgreiche und identisch wiederholte Operationen liefern `accepted`, `revision` und `cursor`. Fachliche Konflikte bleiben erfolgreiche HTTP-Antworten und liefern einen stabilen Konfliktcode; sie sind keine Transportfehler.
 

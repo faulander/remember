@@ -22,6 +22,8 @@ var (
 	testHookAfterRootedMoveStage func()
 )
 
+func EnsurePrivateStagingSupported() error { return nil }
+
 func ReadRooted(root, relative string, maxBytes int64) ([]byte, error) {
 	parent, base, err := openRootedParent(root, relative)
 	if err != nil {
@@ -29,6 +31,15 @@ func ReadRooted(root, relative string, maxBytes int64) ([]byte, error) {
 	}
 	defer unix.Close(parent)
 	return readAt(parent, base, maxBytes)
+}
+
+func ReadRootedPrivate(root, relative string, maxBytes int64) ([]byte, error) {
+	parent, base, err := openRootedParent(root, relative)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(parent)
+	return readAtMode(parent, base, maxBytes, 0o600)
 }
 
 func CreateRootedDirectory(root, relative string, mode uint32) error {
@@ -59,7 +70,50 @@ func EnsureRootedDirectory(root, relative string, mode uint32) error {
 	if err != nil {
 		return fmt.Errorf("verify rooted directory: %w", err)
 	}
-	return unix.Close(fd)
+	defer unix.Close(fd)
+	if err := unix.Fchmod(fd, mode); err != nil {
+		return fmt.Errorf("restrict rooted directory: %w", err)
+	}
+	if err := unix.Fsync(fd); err != nil {
+		return fmt.Errorf("sync rooted directory: %w", err)
+	}
+	return unix.Fsync(parent)
+}
+
+// CreateRootedPrivate publishes immutable technical bytes with mode 0600.
+func CreateRootedPrivate(root, relative string, content []byte) error {
+	parent, base, err := openRootedParent(root, relative)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	temp, file, err := createTempAt(parent, ".remember-private-", 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		file.Close()
+		if temp != "" {
+			_ = unix.Unlinkat(parent, temp, 0)
+		}
+	}()
+	if err := writeAndSync(file, content); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close private staged file: %w", err)
+	}
+	if err := unix.Linkat(parent, temp, parent, base, 0); err != nil {
+		return fmt.Errorf("publish private file exclusively: %w", err)
+	}
+	if err := unix.Fsync(parent); err != nil {
+		return fmt.Errorf("sync private publication: %w", err)
+	}
+	if err := unix.Unlinkat(parent, temp, 0); err != nil {
+		return fmt.Errorf("remove private staging link: %w", err)
+	}
+	temp = ""
+	return unix.Fsync(parent)
 }
 
 func CreateRooted(root, relative string, content []byte, validate Validator) error {
@@ -234,6 +288,10 @@ func openRootedParent(root, relative string) (int, string, error) {
 }
 
 func readAt(parent int, name string, maxBytes int64) ([]byte, error) {
+	return readAtMode(parent, name, maxBytes, 0)
+}
+
+func readAtMode(parent int, name string, maxBytes int64, requiredMode uint32) ([]byte, error) {
 	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -246,6 +304,9 @@ func readAt(parent int, name string, maxBytes int64) ([]byte, error) {
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, errors.New("rooted object is not a regular file")
+	}
+	if requiredMode != 0 && uint32(stat.Mode)&0o777 != requiredMode {
+		return nil, errors.New("rooted private file has unsafe permissions")
 	}
 	if maxBytes >= 0 && stat.Size > maxBytes {
 		return nil, ErrContentTooLarge

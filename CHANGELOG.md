@@ -21,6 +21,9 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen und paginierten Cursor-Pull.
+- Lokaler Index v2 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor und persistenten Apply-Plänen.
+- Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
+- Expliziter Bootstrap für bestehende v1-Roots und UUIDv4-kompatible Sync-Objektidentitäten.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
 - PRD, technisches Design, Architekturentscheidungen und manuelle Testpläne.
 
@@ -34,7 +37,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Known limitations
 
-- Noch keine öffentliche Registrierung, Recovery, Kontolöschung, Client-Outbox oder Apply-Journal.
+- Noch keine öffentliche Registrierung, Recovery oder Kontolöschung.
+- Apply-Pläne werden bereits persistiert, aber noch nicht auf das Dateisystem ausgeführt; der HTTP-Scheduler fehlt.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
 - Windows- und Linux-Desktop-Builds wurden noch nicht real auf Zielgeräten geprüft.

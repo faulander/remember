@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/localindex"
 	"github.com/faulander/remember/client/internal/reconcile"
 	"github.com/faulander/remember/client/internal/watcher"
@@ -173,6 +174,23 @@ func (c *LocalCore) Snapshot(ctx context.Context) (localindex.Snapshot, error) {
 		return localindex.Snapshot{}, ErrCoreClosed
 	}
 	return c.index.ReadSnapshot(ctx)
+}
+
+// PrepareSyncBootstrap explicitly adopts an upgraded pre-sync tree. Recovery
+// mode cannot bootstrap folder identities because they may be ambiguous.
+func (c *LocalCore) PrepareSyncBootstrap(ctx context.Context) error {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+	c.lifecycleMu.Lock()
+	closed, recovery := c.closed, c.recoveryMode
+	c.lifecycleMu.Unlock()
+	if closed {
+		return ErrCoreClosed
+	}
+	if recovery {
+		return errors.New("sync bootstrap is disabled in index recovery mode")
+	}
+	return clientsync.PrepareBootstrap(ctx, c.root, c.index, nil)
 }
 
 // StartWatching starts one event loop. Every hint causes a complete,

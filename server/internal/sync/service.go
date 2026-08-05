@@ -239,11 +239,11 @@ type canonicalJSON struct {
 }
 
 func canonicalize(in Mutation) (canonicalIntent, [32]byte, error) {
-	if !validV7(in.OperationID) || !validV7(in.ObjectID) ||
+	if !validV7(in.OperationID) || !validObjectID(in.ObjectID) ||
 		(in.ObjectType != ObjectNote && in.ObjectType != ObjectFolder) {
 		return canonicalIntent{}, [32]byte{}, fmt.Errorf("%w: IDs/type", ErrInvalidInput)
 	}
-	if in.ParentID != nil && !validV7(*in.ParentID) {
+	if in.ParentID != nil && !validObjectID(*in.ParentID) {
 		return canonicalIntent{}, [32]byte{}, fmt.Errorf("%w: parent ID", ErrInvalidInput)
 	}
 	out := canonicalIntent{Mutation: in}
@@ -546,7 +546,10 @@ func allocateCursor(ctx context.Context, tx *sql.Tx, user uuid.UUID) (uint64, er
 	return cursor, err
 }
 func validV7(id uuid.UUID) bool {
-	return id != uuid.Nil && id.Variant() == uuid.RFC4122 && id.Version() == 7
+	return validObjectID(id) && id.Version() == 7
+}
+func validObjectID(id uuid.UUID) bool {
+	return id != uuid.Nil && id.Variant() == uuid.RFC4122
 }
 func nullableUUID(id *uuid.UUID) any {
 	if id == nil {

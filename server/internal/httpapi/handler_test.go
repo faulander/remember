@@ -618,7 +618,6 @@ func TestSyncStrictInputAuthOrderingMethodsAndQuery(t *testing.T) {
 	invalidBodies := []string{
 		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `","user_id":"` + testUserID.String() + `"}`,
 		`{"operation_id":"` + strings.ToUpper(testSessionID.String()) + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
-		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + uuid.New().String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
 		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + strings.ToUpper(hex.EncodeToString(hash[:])) + `"}`,
 		`{"operation_id":"` + testSessionID.String() + `","mutation":"unknown","object_id":"` + targetID.String() + `","object_type":"note","base_revision":0,"parent_id":null,"name":"Note.md","blob_hash":"` + hex.EncodeToString(hash[:]) + `"}`,
 		`{"operation_id":"` + testSessionID.String() + `","mutation":"create","object_id":"` + targetID.String() + `","object_type":"folder","name":"Folder"}`,
@@ -633,6 +632,9 @@ func TestSyncStrictInputAuthOrderingMethodsAndQuery(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		assertError(t, response, http.StatusBadRequest, "invalid_request")
 	}
+	legacy := validSyncMutationBody(hash)
+	legacy["object_id"] = uuid.New().String()
+	jsonRequest(t, handler, http.MethodPost, "/v1/sync/operations", legacy, testAccess, http.StatusOK)
 	request := httptest.NewRequest(http.MethodPost, "/v1/sync/operations", strings.NewReader(`{`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

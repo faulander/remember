@@ -14,7 +14,7 @@ Dieser Schnitt implementiert ausschließlich den mandantengebundenen serverseiti
 
 ## Persistenz
 
-- UUIDv7 werden als 16-Byte-BLOB gespeichert.
+- Actor- und Operations-IDs sind UUIDv7. Objekt- und Parent-IDs akzeptieren jede kanonische, von Nil verschiedene RFC-4122-UUID (einschließlich bestehender UUIDv4-Frontmatter-IDs); alle IDs werden als 16-Byte-BLOB gespeichert.
 - `devices` bindet Geräte an Benutzer.
 - `content_blobs` ist ein global deduplizierbares Verfügbarkeitsregister für bereits dauerhaft gespeicherte SHA-256-Inhalte; `user_content_blobs` erteilt die nicht beobachtbare mandantenspezifische Referenzberechtigung.
 - `sync_objects` enthält den aktuellen Zustand mit zusammengesetztem Mandanten-Primärschlüssel und partieller Eindeutigkeit aktiver `(parent, name_key)`-Pfade.

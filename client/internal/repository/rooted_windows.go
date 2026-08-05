@@ -3,14 +3,22 @@
 package repository
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
-// Windows uses the same source-staging algorithms as the generic repository
-// operations. Reparse-point parents are rejected by the app resolver. The
-// Darwin/Linux implementation additionally anchors every component by handle.
+// Sync staging remains disabled on Windows until every path component can be
+// retained by handle and checked for reparse-point replacement.
+func EnsurePrivateStagingSupported() error {
+	return errors.New("private sync staging is not yet supported on Windows")
+}
+
+func ReadRootedPrivate(string, string, int64) ([]byte, error) {
+	return nil, errors.New("private sync staging is not yet supported on Windows")
+}
+
 func ReadRooted(root, relative string, maxBytes int64) ([]byte, error) {
 	return readBoundedFile(filepath.Join(root, filepath.FromSlash(relative)), maxBytes)
 }
@@ -33,6 +41,10 @@ func EnsureRootedDirectory(root, relative string, mode uint32) error {
 		return fmt.Errorf("rooted directory is not a real directory")
 	}
 	return nil
+}
+
+func CreateRootedPrivate(root, relative string, content []byte) error {
+	return CreateExclusivePrivate(filepath.Join(root, filepath.FromSlash(relative)), content)
 }
 
 func CreateRooted(root, relative string, content []byte, validate Validator) error {

@@ -29,6 +29,8 @@ type Options struct {
 	// reconciliation and may receive a new identity even in recovery mode.
 	TrustedNewFolders []string
 	NewID             func() (uuid.UUID, error)
+	// NewOperationID creates durable UUIDv7 Outbox operation identities.
+	NewOperationID func() (uuid.UUID, error)
 }
 
 // Report summarizes one completed reconciliation.
@@ -83,8 +85,12 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 	if err != nil {
 		return Report{}, err
 	}
-	if err := index.ReplaceSnapshot(ctx, snapshot); err != nil {
+	if err := captureSync(ctx, root, index, previous, &snapshot, options); err != nil {
 		return Report{}, err
+	}
+	issues = make([]Issue, len(snapshot.Issues))
+	for index, issue := range snapshot.Issues {
+		issues[index] = Issue{Code: IssueCode(issue.Code), RelativePath: issue.RelativePath, Detail: issue.Detail}
 	}
 	return Report{AssignedNoteIDs: assigned, Objects: len(snapshot.Objects), Issues: issues}, nil
 }

@@ -173,6 +173,83 @@ func TestIndexSchemaContainsNoNoteContentColumn(t *testing.T) {
 	}
 }
 
+func TestIndexDurabilityPragmas(t *testing.T) {
+	index, err := Open(context.Background(), filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	for name, want := range map[string]string{"foreign_keys": "1", "journal_mode": "wal", "synchronous": "2"} {
+		var got string
+		if err := index.db.QueryRow(`PRAGMA ` + name).Scan(&got); err != nil || got != want {
+			t.Errorf("pragma %s=%q err=%v want=%q", name, got, err, want)
+		}
+	}
+}
+
+func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := migrations.ReadFile("migrations/001_initial.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(string(script) + `; PRAGMA user_version=1;`); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	if _, err = db.Exec(`INSERT INTO objects(object_id,object_type,relative_path,collision_path,identity_state) VALUES(?, 'folder','Legacy','legacy','known')`, id.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO watcher_state(key,value) VALUES('kept','yes')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	index, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	snapshot, err := index.ReadSnapshot(ctx)
+	if err != nil || len(snapshot.Objects) != 1 || snapshot.Objects[0].ID != id {
+		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
+	}
+	value, ok, err := index.State(ctx, "kept")
+	if err != nil || !ok || value != "yes" {
+		t.Fatalf("state=%q/%t %v", value, ok, err)
+	}
+	var bootstrap string
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT value FROM sync_state WHERE key='bootstrap_required'`).Scan(&bootstrap)
+	}); err != nil || bootstrap != "1" {
+		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
+	}
+	var version int
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 2 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestOpenRejectsNewerLocalSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "newer.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA user_version=3`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if _, err := Open(context.Background(), path); err == nil {
+		t.Fatal("newer schema accepted")
+	}
+}
+
 func TestReplaceSnapshotRejectsInvalidHashBeforeMutation(t *testing.T) {
 	t.Parallel()
 
