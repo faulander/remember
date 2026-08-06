@@ -83,6 +83,18 @@ type ApplyPlan struct {
 	Steps                     []Change
 }
 
+type FolderPublication struct {
+	PlanID            uuid.UUID
+	StepIndex         int
+	FolderID          uuid.UUID
+	TargetRelative    string
+	StageRelative     string
+	Nonce             [32]byte
+	Device, Inode     uint64
+	CleanupAuthorized bool
+	Cleaned           bool
+}
+
 type Store struct {
 	index *localindex.Index
 	clock func() time.Time
@@ -750,11 +762,154 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 	})
 }
 
+func (s *Store) PutFolderPublication(ctx context.Context, publication FolderPublication) error {
+	zeroNonce := true
+	for _, value := range publication.Nonce {
+		zeroNonce = zeroNonce && value == 0
+	}
+	expectedStage := fmt.Sprintf(".remember/apply/folders/%s/%d", publication.PlanID.String(), publication.StepIndex)
+	if !validOperationID(publication.PlanID) || publication.StepIndex < 0 || !validObjectID(publication.FolderID) || naming.ValidateUserRelativePath(publication.TargetRelative) != nil || publication.StageRelative != expectedStage || zeroNonce || publication.Device > math.MaxInt64 || publication.Inode > math.MaxInt64 {
+		return errors.New("invalid folder publication")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var objectID, mutation, objectType, state string
+		if err := tx.QueryRowContext(ctx, `SELECT object_id,mutation,object_type,state FROM apply_steps WHERE plan_id=? AND step_index=?`, publication.PlanID.String(), publication.StepIndex).Scan(&objectID, &mutation, &objectType, &state); err != nil {
+			return err
+		}
+		if objectID != publication.FolderID.String() || mutation != string(Create) || objectType != string(Folder) || state != "pending" {
+			return errors.New("folder publication does not match pending create")
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_publications(plan_id,step_index,folder_id,target_relative,stage_relative,nonce,device,inode,cleanup_authorized) VALUES(?,?,?,?,?,?,?,?,0)`, publication.PlanID.String(), publication.StepIndex, publication.FolderID.String(), publication.TargetRelative, publication.StageRelative, publication.Nonce[:], publication.Device, publication.Inode)
+		return err
+	})
+}
+
+func (s *Store) FolderPublication(ctx context.Context, planID uuid.UUID, stepIndex int) (*FolderPublication, error) {
+	if !validOperationID(planID) || stepIndex < 0 {
+		return nil, errors.New("invalid folder publication key")
+	}
+	var result *FolderPublication
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var folderID string
+		var nonce []byte
+		var device, inode uint64
+		var cleanup int
+		p := FolderPublication{PlanID: planID, StepIndex: stepIndex}
+		err := tx.QueryRowContext(ctx, `SELECT folder_id,target_relative,stage_relative,nonce,device,inode,cleanup_authorized FROM apply_folder_publications WHERE plan_id=? AND step_index=?`, planID.String(), stepIndex).Scan(&folderID, &p.TargetRelative, &p.StageRelative, &nonce, &device, &inode, &cleanup)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		id, err := uuid.Parse(folderID)
+		if err != nil || !validObjectID(id) || len(nonce) != 32 {
+			return errors.New("corrupt folder publication")
+		}
+		p.FolderID, p.Device, p.Inode, p.CleanupAuthorized = id, device, inode, cleanup == 1
+		copy(p.Nonce[:], nonce)
+		result = &p
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) CompletedFolderPublications(ctx context.Context) ([]FolderPublication, error) {
+	var result []FolderPublication
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT f.plan_id,f.step_index,f.folder_id,f.target_relative,f.stage_relative,f.nonce,f.device,f.inode,f.cleanup_authorized
+			FROM apply_folder_publications f JOIN apply_plans p ON p.plan_id=f.plan_id
+			WHERE p.status='completed' AND f.cleanup_authorized=1 AND f.cleaned_at_ms IS NULL ORDER BY p.completed_at_ms,f.step_index`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p FolderPublication
+			var planID, folderID string
+			var nonce []byte
+			var cleanup int
+			if err := rows.Scan(&planID, &p.StepIndex, &folderID, &p.TargetRelative, &p.StageRelative, &nonce, &p.Device, &p.Inode, &cleanup); err != nil {
+				return err
+			}
+			p.PlanID, err = uuid.Parse(planID)
+			if err != nil {
+				return errors.New("corrupt folder publication plan")
+			}
+			p.FolderID, err = uuid.Parse(folderID)
+			if err != nil || len(nonce) != 32 || cleanup != 1 {
+				return errors.New("corrupt completed folder publication")
+			}
+			copy(p.Nonce[:], nonce)
+			p.CleanupAuthorized = true
+			result = append(result, p)
+		}
+		return rows.Err()
+	})
+	return result, err
+}
+
+func (s *Store) MarkFolderPublicationCleaned(ctx context.Context, planID uuid.UUID, stepIndex int) error {
+	if !validOperationID(planID) || stepIndex < 0 {
+		return errors.New("invalid folder publication key")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE apply_folder_publications SET cleaned_at_ms=COALESCE(cleaned_at_ms,?)
+			WHERE plan_id=? AND step_index=? AND cleanup_authorized=1
+			AND EXISTS(SELECT 1 FROM apply_plans WHERE plan_id=? AND status='completed')`, s.clock().UTC().UnixMilli(), planID.String(), stepIndex, planID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("folder publication is not cleanable")
+		}
+		return nil
+	})
+}
+
+func (s *Store) MarkFolderStepAppliedAndAuthorizeCleanup(ctx context.Context, planID uuid.UUID, stepIndex int) error {
+	if !validOperationID(planID) || stepIndex < 0 {
+		return errors.New("invalid apply step")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM apply_steps WHERE plan_id=? AND step_index=?`, planID.String(), stepIndex).Scan(&state); err != nil {
+			return err
+		}
+		if state == "pending" {
+			res, err := tx.ExecContext(ctx, `UPDATE apply_steps SET state='applied' WHERE plan_id=? AND step_index=? AND EXISTS(SELECT 1 FROM apply_plans WHERE plan_id=? AND status='applying')`, planID.String(), stepIndex, planID.String())
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errors.New("folder apply plan is not active")
+			}
+		} else if state != "applied" {
+			return errors.New("apply step is not active")
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE apply_folder_publications SET cleanup_authorized=1 WHERE plan_id=? AND step_index=?`, planID.String(), stepIndex)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("folder publication missing")
+		}
+		return nil
+	})
+}
+
 func (s *Store) MarkApplyStepApplied(ctx context.Context, planID uuid.UUID, stepIndex int) error {
 	if !validOperationID(planID) || stepIndex < 0 {
 		return errors.New("invalid apply step")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var folderPublication int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM apply_folder_publications WHERE plan_id=? AND step_index=?)`, planID.String(), stepIndex).Scan(&folderPublication); err != nil {
+			return err
+		}
+		if folderPublication != 0 {
+			return errors.New("folder step requires atomic cleanup authorization")
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE apply_steps SET state='applied' WHERE plan_id=? AND step_index=? AND state='pending'
 			AND EXISTS(SELECT 1 FROM apply_plans WHERE plan_id=? AND status='applying')`, planID.String(), stepIndex, planID.String())
 		if err != nil {

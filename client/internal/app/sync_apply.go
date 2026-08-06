@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -24,6 +25,8 @@ var ErrUnsupportedApplyPlan = errors.New("apply plan contains unsupported remote
 
 // Test-only race hook after durable publication and before reconciliation.
 var testHookAfterApplyPublication func()
+var testHookBeforeFolderPublication func()
+var testHookAfterFolderReconcile func()
 
 type preparedNoteStep struct {
 	index             int
@@ -33,6 +36,7 @@ type preparedNoteStep struct {
 	expected, content []byte
 	exists, deleted   bool
 	locallyApplied    bool
+	folderPublication *clientsync.FolderPublication
 }
 
 // ExecuteActiveApplyPlan resumes the one durable remote ApplyPlan. This slice
@@ -61,6 +65,9 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 	if err != nil {
 		return err
 	}
+	if err := c.cleanupCompletedFolderPublications(ctx, store); err != nil {
+		return err
+	}
 	plan, err := store.ActiveApplyPlan(ctx)
 	if err != nil || plan == nil {
 		return err
@@ -73,6 +80,12 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 		return err
 	}
 	for _, step := range steps {
+		if step.folderPublication != nil {
+			if err := c.applyFolderCreateStep(ctx, store, plan.ID, step); err != nil {
+				return err
+			}
+			continue
+		}
 		if step.change.State == "applied" {
 			continue
 		}
@@ -103,7 +116,10 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 			return err
 		}
 	}
-	return store.CompleteApplyPlan(ctx, plan.ID)
+	if err := store.CompleteApplyPlan(ctx, plan.ID); err != nil {
+		return err
+	}
+	return c.cleanupCompletedFolderPublications(ctx, store)
 }
 
 func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.ApplyPlan, resolver clientsync.BlobResolver) ([]preparedNoteStep, error) {
@@ -123,11 +139,19 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 	// touching the filesystem. This also protects already-journaled steps when
 	// an offline edit happened before resume.
 	checkedIntent := make(map[uuid.UUID]bool)
+	plannedFolders := make(map[uuid.UUID]bool)
 	for _, step := range plan.Steps {
-		if step.ObjectType != clientsync.Note || (step.Mutation != clientsync.Create && step.Mutation != clientsync.Update && step.Mutation != clientsync.Move && step.Mutation != clientsync.Delete) || step.Deleted != (step.Mutation == clientsync.Delete) || len(step.BlobHash) != sha256.Size {
+		if step.ObjectType == clientsync.Folder && step.Mutation == clientsync.Create {
+			plannedFolders[step.ObjectID] = true
+		}
+		if step.ObjectType == clientsync.Folder {
+			if step.Mutation != clientsync.Create || step.Deleted || len(step.BlobHash) != 0 || step.Revision != 1 || step.Name == "" || naming.ValidateComponent(step.Name) != nil {
+				return nil, ErrUnsupportedApplyPlan
+			}
+		} else if step.ObjectType != clientsync.Note || (step.Mutation != clientsync.Create && step.Mutation != clientsync.Update && step.Mutation != clientsync.Move && step.Mutation != clientsync.Delete) || step.Deleted != (step.Mutation == clientsync.Delete) || len(step.BlobHash) != sha256.Size {
 			return nil, ErrUnsupportedApplyPlan
 		}
-		if !strings.EqualFold(path.Ext(step.Name), ".md") {
+		if step.ObjectType == clientsync.Note && !strings.EqualFold(path.Ext(step.Name), ".md") {
 			return nil, errors.New("remote note name must use .md extension")
 		}
 		if step.Mutation == clientsync.Create {
@@ -160,6 +184,44 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 	}
 	prepared := make([]preparedNoteStep, 0, len(plan.Steps))
 	for index, change := range plan.Steps {
+		if change.ObjectType == clientsync.Folder {
+			target, err := remoteNotePath(objects, change.ParentID, change.Name)
+			if err != nil {
+				return nil, err
+			}
+			key := portablePathKey(target)
+			if owner, used := pathOwners[key]; used && owner != change.ObjectID {
+				return nil, errors.New("remote folder path collision")
+			}
+			step := preparedNoteStep{index: index, change: change, relative: target}
+			publication, err := store.FolderPublication(ctx, plan.ID, index)
+			if err != nil {
+				return nil, err
+			}
+			if publication != nil {
+				if publication.FolderID != change.ObjectID || publication.TargetRelative != target {
+					return nil, errors.New("folder publication target mismatch")
+				}
+				step.folderPublication = publication
+			} else if existing, ok := objects[change.ObjectID]; ok && existing.Type == localindex.ObjectFolder && existing.RelativePath == target && change.State == "applied" {
+				step.locallyApplied = true
+				step.folderPublication = &clientsync.FolderPublication{PlanID: plan.ID, StepIndex: index, FolderID: change.ObjectID, TargetRelative: target, CleanupAuthorized: true}
+			} else {
+				publication, err = c.prepareFolderPublication(ctx, store, plan.ID, index, change.ObjectID, target)
+				if err != nil {
+					return nil, err
+				}
+				step.folderPublication = publication
+			}
+			object := localindex.Object{ID: change.ObjectID, Type: localindex.ObjectFolder, RelativePath: target, CollisionPath: portablePathKey(target), IdentityState: localindex.IdentityKnown}
+			if change.ParentID != nil {
+				object.ParentID = *change.ParentID
+			}
+			objects[change.ObjectID] = object
+			pathOwners[key] = change.ObjectID
+			prepared = append(prepared, step)
+			continue
+		}
 		var hash [sha256.Size]byte
 		copy(hash[:], change.BlobHash)
 		blob, err := resolver.ResolveBlob(ctx, hash)
@@ -345,7 +407,9 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 		}
 		if (step.change.Mutation == clientsync.Create || step.change.Mutation == clientsync.Move) && change.State != "applied" && !vacatedPaths[pathKey] {
 			if err := rejectPortableSiblingCollisionExcept(c.root, step.relative, step.source); err != nil {
-				return nil, err
+				if change.ParentID == nil || !plannedFolders[*change.ParentID] || !errors.Is(err, os.ErrNotExist) {
+					return nil, err
+				}
 			}
 		}
 		if step.change.Mutation == clientsync.Create && step.exists && !bytes.Equal(step.expected, step.content) {
@@ -363,6 +427,109 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 		}
 	}
 	return prepared, nil
+}
+
+func (c *LocalCore) prepareFolderPublication(ctx context.Context, store *clientsync.Store, planID uuid.UUID, stepIndex int, folderID uuid.UUID, target string) (*clientsync.FolderPublication, error) {
+	publication, err := store.FolderPublication(ctx, planID, stepIndex)
+	if err != nil {
+		return nil, err
+	}
+	if publication != nil {
+		if publication.FolderID != folderID || publication.TargetRelative != target {
+			return nil, errors.New("folder publication target mismatch")
+		}
+		if publication.CleanupAuthorized {
+			return publication, nil
+		}
+		if repository.VerifyRootedFolderPublication(c.root, target, publication.Nonce, publication.Device, publication.Inode) == nil {
+			return publication, nil
+		}
+		if err := repository.VerifyRootedFolderPublication(c.root, publication.StageRelative, publication.Nonce, publication.Device, publication.Inode); err != nil {
+			return nil, errors.New("folder publication identity unavailable")
+		}
+		return publication, nil
+	}
+	if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(target))); err == nil {
+		return nil, errors.New("unbound folder target already exists")
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	stage := fmt.Sprintf(".remember/apply/folders/%s/%d", planID.String(), stepIndex)
+	if err := repository.RemoveRootedFolderPublicationStage(c.root, stage); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	device, inode, err := repository.CreateRootedFolderPublication(c.root, stage, nonce)
+	if err != nil {
+		return nil, err
+	}
+	publication = &clientsync.FolderPublication{PlanID: planID, StepIndex: stepIndex, FolderID: folderID, TargetRelative: target, StageRelative: stage, Nonce: nonce, Device: device, Inode: inode}
+	if err := store.PutFolderPublication(ctx, *publication); err != nil {
+		return nil, err
+	}
+	return publication, nil
+}
+
+func (c *LocalCore) applyFolderCreateStep(ctx context.Context, store *clientsync.Store, planID uuid.UUID, step preparedNoteStep) error {
+	publication := step.folderPublication
+	if step.locallyApplied {
+		return nil
+	}
+	if publication.CleanupAuthorized {
+		return repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode)
+	}
+	if err := repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode); err != nil {
+		if testHookBeforeFolderPublication != nil {
+			testHookBeforeFolderPublication()
+		}
+		if err := repository.PublishRootedFolderPublication(c.root, publication.StageRelative, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode); err != nil {
+			return err
+		}
+	}
+	if err := repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode); err != nil {
+		return err
+	}
+	before, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	verify := func() error {
+		return repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode)
+	}
+	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{
+		RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{publication.TargetRelative: publication.FolderID}, VerifyTrustedRemoteFolders: verify,
+	}); err != nil {
+		return err
+	}
+	if testHookAfterFolderReconcile != nil {
+		testHookAfterFolderReconcile()
+	}
+	if err := verify(); err != nil {
+		if restoreErr := c.index.ReplaceSnapshot(ctx, before); restoreErr != nil {
+			return fmt.Errorf("folder publication changed and snapshot restore failed: %v / %w", err, restoreErr)
+		}
+		return err
+	}
+	return store.MarkFolderStepAppliedAndAuthorizeCleanup(ctx, planID, step.index)
+}
+
+func (c *LocalCore) cleanupCompletedFolderPublications(ctx context.Context, store *clientsync.Store) error {
+	publications, err := store.CompletedFolderPublications(ctx)
+	if err != nil {
+		return err
+	}
+	for _, publication := range publications {
+		if err := repository.CleanupRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode); err != nil {
+			return err
+		}
+		if err := store.MarkFolderPublicationCleaned(ctx, publication.PlanID, publication.StepIndex); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {

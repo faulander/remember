@@ -169,6 +169,43 @@ func (r *cycleRemote) ResolveBlob(_ context.Context, h [32]byte) ([]byte, error)
 	return b, nil
 }
 
+func TestSyncOnceConvergesNestedFolderAndNote(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Folder"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := a.CreateNote(ctx, "Folder/N.md", "nested\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReadNote(ctx, "Folder/N.md")
+	if err != nil || got.ID != doc.ID {
+		t.Fatalf("note=%#v err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Folder", ".remember-apply-nonce")); !os.IsNotExist(err) {
+		t.Fatalf("marker remains: %v", err)
+	}
+}
+
 func TestSyncOnceConvergesRootNoteMoveAndDelete(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
@@ -267,6 +304,24 @@ func TestSyncOnceRetriesAmbiguousAttemptWithSameOperationAndBlobFirst(t *testing
 	store, _ := clientsync.NewStore(core.index)
 	if ready, err := store.ListReady(ctx, 10); err != nil || len(ready) != 0 {
 		t.Fatalf("ready=%#v err=%v", ready, err)
+	}
+}
+
+func TestSyncOnceRejectsFolderMoveBeforePersistingPlan(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	remote := &cycleRemote{pull: remotehttp.PullPage{Changes: []clientsync.Change{{Cursor: 1, Mutation: clientsync.Move, OperationID: uuid.Must(uuid.NewV7()), ObjectID: uuid.New(), ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}, NextCursor: 1}}
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnsupportedPullPage) {
+		t.Fatalf("error=%v", err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	if active, err := store.ActiveApplyPlan(ctx); err != nil || active != nil {
+		t.Fatalf("active=%#v err=%v", active, err)
 	}
 }
 

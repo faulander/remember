@@ -44,6 +44,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err != nil {
 		return err
 	}
+	if err := c.cleanupCompletedFolderPublications(ctx, store); err != nil {
+		return err
+	}
 	if active, err := store.ActiveApplyPlan(ctx); err != nil {
 		return err
 	} else if active != nil {
@@ -115,7 +118,11 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			if change.Cursor != expected {
 				return remotehttp.ErrInvalidResponse
 			}
-			if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update && change.Mutation != clientsync.Move && change.Mutation != clientsync.Delete) {
+			if change.ObjectType == clientsync.Folder {
+				if change.Mutation != clientsync.Create || change.Deleted || len(change.BlobHash) != 0 || change.Revision != 1 {
+					return ErrUnsupportedPullPage
+				}
+			} else if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update && change.Mutation != clientsync.Move && change.Mutation != clientsync.Delete) {
 				return ErrUnsupportedPullPage
 			}
 		}

@@ -23,5 +23,6 @@
 | [0010](adr/0010-m2-sync-http-transport.md) | Authentifizierter Sync-HTTP-Transport |
 | [0011](adr/0011-m2-client-sync-durability.md) | Client-Outbox, Blob-Staging und Apply-Plan-Persistenz |
 | [0012](adr/0012-m2-client-foreground-sync.md) | Begrenzter Client-HTTP-Transport und Vordergrund-Sync |
+| [0013](adr/0013-m2-folder-create-apply.md) | Identitätsgebundener Folder-Create-Apply |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -591,6 +591,18 @@ func TestRunKeepsOversizedSyncIssueUntilContentChanges(t *testing.T) {
 	}
 }
 
+func TestRunRejectsUnverifiedTrustedRemoteFolder(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "Remote"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	index := openTestIndex(t, ctx, root)
+	if _, err := Run(ctx, root, index, Options{TrustedRemoteFolders: map[string]uuid.UUID{"Remote": uuid.New()}}); err == nil {
+		t.Fatal("path-only remote folder trust accepted")
+	}
+}
+
 func TestRunKeepsAmbiguousEmptyFolderIdentityPending(t *testing.T) {
 	t.Parallel()
 

@@ -52,6 +52,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 		}
 		var creates, changes, deletes []localindex.Object
 		for id, o := range current {
+			if trustedID, ok := options.TrustedRemoteFolders[o.RelativePath]; ok && trustedID == id && o.Type == localindex.ObjectFolder {
+				continue
+			}
 			if expected, ok := options.AppliedRemoteNotes[id]; ok && bytes.Equal(o.ContentHash, expected[:]) {
 				continue
 			}

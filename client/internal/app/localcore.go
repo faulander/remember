@@ -135,11 +135,18 @@ func Open(ctx context.Context, root string) (*LocalCore, reconcile.Report, error
 		recoveryMode = exists && value == "1"
 	}
 	core := &LocalCore{root: absolute, index: index, rootLock: rootLock, recoveryMode: recoveryMode}
-	if store, storeErr := clientsync.NewStore(index); storeErr != nil {
+	store, storeErr := clientsync.NewStore(index)
+	if storeErr != nil {
 		index.Close()
 		rootLock.Unlock()
 		return nil, reconcile.Report{}, storeErr
-	} else if active, activeErr := store.ActiveApplyPlan(ctx); activeErr != nil {
+	}
+	if err := core.cleanupCompletedFolderPublications(ctx, store); err != nil {
+		index.Close()
+		rootLock.Unlock()
+		return nil, reconcile.Report{}, err
+	}
+	if active, activeErr := store.ActiveApplyPlan(ctx); activeErr != nil {
 		index.Close()
 		rootLock.Unlock()
 		return nil, reconcile.Report{}, activeErr

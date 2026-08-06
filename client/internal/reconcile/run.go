@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -35,6 +36,10 @@ type Options struct {
 	// remote note bytes whose exact observed SHA-256 matches the supplied hash.
 	AppliedRemoteNotes   map[uuid.UUID][32]byte
 	AppliedRemoteDeletes map[uuid.UUID]bool
+	// TrustedRemoteFolders is accepted only with a verifier bound to the
+	// persisted publication nonce and filesystem identity.
+	TrustedRemoteFolders       map[string]uuid.UUID
+	VerifyTrustedRemoteFolders func() error
 }
 
 // Report summarizes one completed reconciliation.
@@ -52,6 +57,14 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 		generator = frontmatter.NewNoteID
 	}
 
+	if len(options.TrustedRemoteFolders) != 0 {
+		if options.VerifyTrustedRemoteFolders == nil {
+			return Report{}, errors.New("trusted remote folders require identity verifier")
+		}
+		if err := options.VerifyTrustedRemoteFolders(); err != nil {
+			return Report{}, err
+		}
+	}
 	inventory, err := Scan(root)
 	if err != nil {
 		return Report{}, err
@@ -59,7 +72,7 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 	blocked := blockedNotePaths(inventory.Issues)
 	assigned := 0
 	for _, entry := range inventory.Entries {
-		if entry.Type != EntryNote || entry.NoteID != uuid.Nil || blocked[entry.RelativePath] {
+		if len(options.TrustedRemoteFolders) != 0 || entry.Type != EntryNote || entry.NoteID != uuid.Nil || blocked[entry.RelativePath] {
 			continue
 		}
 		id, err := generator()
@@ -82,12 +95,25 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 	if err != nil {
 		return Report{}, err
 	}
+	if len(options.TrustedRemoteFolders) != 0 {
+		if options.VerifyTrustedRemoteFolders == nil {
+			return Report{}, errors.New("trusted remote folders require identity verifier")
+		}
+		if err := options.VerifyTrustedRemoteFolders(); err != nil {
+			return Report{}, err
+		}
+	}
 	snapshot, issues, err := buildSnapshot(
 		inventory, previous, options.AllowInitialFolderIDs, options.RecoveryMode,
-		options.MoveCandidates, options.TrustedNewFolders, generator,
+		options.MoveCandidates, options.TrustedNewFolders, options.TrustedRemoteFolders, generator,
 	)
 	if err != nil {
 		return Report{}, err
+	}
+	if len(options.TrustedRemoteFolders) != 0 {
+		if err := options.VerifyTrustedRemoteFolders(); err != nil {
+			return Report{}, err
+		}
 	}
 	if err := captureSync(ctx, root, index, previous, &snapshot, options); err != nil {
 		return Report{}, err
@@ -106,6 +132,7 @@ func buildSnapshot(
 	recoveryMode bool,
 	moveCandidates []string,
 	trustedNewFolders []string,
+	trustedRemoteFolders map[string]uuid.UUID,
 	generator func() (uuid.UUID, error),
 ) (localindex.Snapshot, []Issue, error) {
 	issues := append([]Issue(nil), inventory.Issues...)
@@ -130,7 +157,7 @@ func buildSnapshot(
 	}
 	folderObjects, folderIssues, err := reconcileFolders(
 		folderEntries, previousFolders, inventory, previous,
-		allowInitialFolders, recoveryMode, moveCandidates, trustedNewFolders, generator,
+		allowInitialFolders, recoveryMode, moveCandidates, trustedNewFolders, trustedRemoteFolders, generator,
 	)
 	if err != nil {
 		return localindex.Snapshot{}, nil, err
@@ -199,6 +226,7 @@ func reconcileFolders(
 	recoveryMode bool,
 	moveCandidates []string,
 	trustedNewFolders []string,
+	trustedRemoteFolders map[string]uuid.UUID,
 	generator func() (uuid.UUID, error),
 ) (map[string]localindex.Object, []Issue, error) {
 	_ = allowInitial // The caller-level initialize/open split proves index provenance.
@@ -209,8 +237,14 @@ func reconcileFolders(
 	currentSignatures := currentFolderSignatures(inventory)
 	previousSignatures := indexedFolderSignatures(previousSnapshot)
 	forcedMoves := inferWatcherMoves(previous, current, previousSignatures, currentSignatures, moveCandidates)
-	forcedTargets := make(map[string]struct{}, len(forcedMoves))
+	forcedTargets := make(map[string]struct{}, len(forcedMoves)+len(trustedRemoteFolders))
 	for _, target := range forcedMoves {
+		forcedTargets[target] = struct{}{}
+	}
+	for target, id := range trustedRemoteFolders {
+		if _, exists := current[target]; !exists || id == uuid.Nil || id.Variant() != uuid.RFC4122 {
+			return nil, nil, errors.New("invalid verified remote folder")
+		}
 		forcedTargets[target] = struct{}{}
 	}
 
@@ -285,6 +319,10 @@ func reconcileFolders(
 
 	var issues []Issue
 	for _, currentPath := range unresolvedCurrent {
+		if id, trusted := trustedRemoteFolders[currentPath]; trusted {
+			objects[currentPath] = localindex.Object{ID: id, Type: localindex.ObjectFolder, RelativePath: currentPath, CollisionPath: collisionPath(currentPath), IdentityState: localindex.IdentityKnown}
+			continue
+		}
 		if _, trusted := trustedNew[currentPath]; trusted {
 			id, err := generator()
 			if err != nil {

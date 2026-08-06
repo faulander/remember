@@ -394,6 +394,68 @@ func TestApplyPlanTransitionsCompleteAtomically(t *testing.T) {
 	}
 }
 
+func TestFolderPublicationTransitionIsAtomicAndImmutable(t *testing.T) {
+	ctx := context.Background()
+	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	defer index.Close()
+	store, _ := NewStore(index)
+	planID, op, folderID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.New()
+	plan := ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 1, Steps: []Change{{Cursor: 1, OperationID: op, ObjectID: folderID, Mutation: Create, ObjectType: Folder, Revision: 1, Name: "Folder"}}}
+	if err := store.CreateApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [32]byte
+	nonce[0] = 7
+	publication := FolderPublication{PlanID: planID, StepIndex: 0, FolderID: folderID, TargetRelative: "Folder", StageRelative: ".remember/apply/folders/" + planID.String() + "/0", Nonce: nonce, Device: 11, Inode: 12}
+	if err := store.PutFolderPublication(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutFolderPublication(ctx, publication); err == nil {
+		t.Fatal("duplicate publication accepted")
+	}
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, planID, 0); err == nil {
+		t.Fatal("folder step used non-atomic generic transition")
+	}
+	if err := store.MarkFolderStepAppliedAndAuthorizeCleanup(ctx, planID, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.FolderPublication(ctx, planID, 0)
+	if err != nil || got == nil || !got.CleanupAuthorized || got.Nonce != nonce || got.Device != 11 || got.Inode != 12 {
+		t.Fatalf("publication=%#v err=%v", got, err)
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || active.Steps[0].State != "applied" {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE apply_folder_publications SET inode=99 WHERE plan_id=?`, planID.String())
+		return err
+	}); err == nil {
+		t.Fatal("publication identity mutated")
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE apply_folder_publications SET cleanup_authorized=0 WHERE plan_id=?`, planID.String())
+		return err
+	}); err == nil {
+		t.Fatal("cleanup authorization moved backwards")
+	}
+	if err := store.CompleteApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.CompletedFolderPublications(ctx); err != nil || len(pending) != 1 {
+		t.Fatalf("completed publications=%#v err=%v", pending, err)
+	}
+	if err := store.MarkFolderPublicationCleaned(ctx, planID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.CompletedFolderPublications(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("cleaned publication remains=%#v err=%v", pending, err)
+	}
+}
+
 func TestApplyPlanRejectsCursorGaps(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

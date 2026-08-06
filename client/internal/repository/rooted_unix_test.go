@@ -12,6 +12,43 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestFolderPublicationBindsNonceInodeAndCleansMarker(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".remember"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [32]byte
+	copy(nonce[:], []byte("01234567890123456789012345678901"))
+	stage := ".remember/apply/folders/plan/0"
+	device, inode, err := CreateRootedFolderPublication(root, stage, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRootedFolderPublication(root, stage, nonce, device, inode); err != nil {
+		t.Fatal(err)
+	}
+	wrong := nonce
+	wrong[0] ^= 1
+	if err := VerifyRootedFolderPublication(root, stage, wrong, device, inode); err == nil {
+		t.Fatal("wrong nonce accepted")
+	}
+	if err := PublishRootedFolderPublication(root, stage, "Folder", nonce, device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRootedFolderPublication(root, "Folder", nonce, device, inode+1); err == nil {
+		t.Fatal("wrong inode accepted")
+	}
+	if err := CleanupRootedFolderPublication(root, "Folder", nonce, device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupRootedFolderPublication(root, "Folder", nonce, device, inode); err != nil {
+		t.Fatal("cleanup replay:", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Folder", folderNonceMarker)); !os.IsNotExist(err) {
+		t.Fatalf("marker remains: %v", err)
+	}
+}
+
 func TestMoveRootedExpectedRecoversUniqueStagedSource(t *testing.T) {
 	root := t.TempDir()
 	content := []byte("staged exact")

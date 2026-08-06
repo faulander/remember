@@ -1,0 +1,21 @@
+//go:build windows
+
+package repository
+
+import "errors"
+
+var errFolderPublicationUnsupported = errors.New("handle-safe folder publication is not supported on Windows")
+
+func CreateRootedFolderPublication(string, string, [32]byte) (uint64, uint64, error) {
+	return 0, 0, errFolderPublicationUnsupported
+}
+func VerifyRootedFolderPublication(string, string, [32]byte, uint64, uint64) error {
+	return errFolderPublicationUnsupported
+}
+func PublishRootedFolderPublication(string, string, string, [32]byte, uint64, uint64) error {
+	return errFolderPublicationUnsupported
+}
+func CleanupRootedFolderPublication(string, string, [32]byte, uint64, uint64) error {
+	return errFolderPublicationUnsupported
+}
+func RemoveRootedFolderPublicationStage(string, string) error { return errFolderPublicationUnsupported }
