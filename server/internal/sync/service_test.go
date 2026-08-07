@@ -83,12 +83,64 @@ func TestMutationLifecycleIdempotencyAndPull(t *testing.T) {
 	if err != nil || len(page.Changes) != 3 || !page.HasMore || page.NextCursor != 3 {
 		t.Fatalf("first pull = %#v, %v", page, err)
 	}
-	last, err := actor.Pull(context.Background(), page.NextCursor, 3)
-	if err != nil || len(last.Changes) != 2 || last.HasMore || !last.Changes[1].Deleted {
+	middle, err := actor.Pull(context.Background(), page.NextCursor, 3)
+	if err != nil || len(middle.Changes) != 3 || !middle.HasMore || middle.Changes[0].ObjectID != ConflictRootID || middle.Changes[1].ObjectID != ConflictRecoveredID {
+		t.Fatalf("middle pull = %#v, %v", middle, err)
+	}
+	last, err := actor.Pull(context.Background(), middle.NextCursor, 3)
+	if err != nil || len(last.Changes) != 1 || last.HasMore || !last.Changes[0].Deleted {
 		t.Fatalf("last pull = %#v, %v", last, err)
 	}
 	if len(last.Changes[0].BlobHash) != 32 || !bytes.Equal(last.Changes[0].BlobHash, fixture.blob2) {
 		t.Error("pull did not return immutable moved version state")
+	}
+}
+
+func TestConflictLazilyProvisionsReservedNamespace(t *testing.T) {
+	fixture := newFixture(t, 1)
+	actor := fixture.actors[0]
+	missing := mutation(MutationUpdate, uuid.New(), ObjectNote, 1)
+	missing.BlobHash = fixture.blob
+	result, err := actor.Submit(context.Background(), missing)
+	if err != nil || result.Conflict != ConflictObjectMissing {
+		t.Fatalf("conflict=%#v err=%v", result, err)
+	}
+	page, err := actor.Pull(context.Background(), 0, 10)
+	if err != nil || len(page.Changes) != 2 || page.Changes[0].ObjectID != ConflictRootID || page.Changes[1].ObjectID != ConflictRecoveredID {
+		t.Fatalf("reserved changes=%#v err=%v", page, err)
+	}
+	copyID := uuid.New()
+	copyMutation := mutation(MutationCreate, copyID, ObjectNote, 0)
+	copyMutation.ParentID, copyMutation.Name, copyMutation.BlobHash = ptrID(ConflictRecoveredID), "Copy.md", fixture.blob
+	if accepted, err := actor.Submit(context.Background(), copyMutation); err != nil || !accepted.Accepted || accepted.Cursor != 3 {
+		t.Fatalf("conflict copy=%#v err=%v", accepted, err)
+	}
+	for _, id := range []uuid.UUID{ConflictRootID, ConflictRecoveredID} {
+		remove := mutation(MutationDelete, id, ObjectFolder, 1)
+		if _, err := actor.Submit(context.Background(), remove); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("reserved folder mutation %s err=%v", id, err)
+		}
+	}
+}
+
+func TestReservedNamespaceFailsClosedOnMissingHistory(t *testing.T) {
+	fixture := newFixture(t, 1)
+	actor := fixture.actors[0]
+	first := mutation(MutationUpdate, uuid.New(), ObjectNote, 1)
+	first.BlobHash = fixture.blob
+	if _, err := actor.Submit(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`DROP TRIGGER sync_change_log_no_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`DELETE FROM sync_change_log WHERE user_id=? AND object_id=?`, fixture.users[0][:], ConflictRootID[:]); err != nil {
+		t.Fatal(err)
+	}
+	second := mutation(MutationUpdate, uuid.New(), ObjectNote, 1)
+	second.BlobHash = fixture.blob
+	if _, err := actor.Submit(context.Background(), second); err == nil || !strings.Contains(err.Error(), "history is corrupt") {
+		t.Fatalf("corrupt reserved history accepted: %v", err)
 	}
 }
 
@@ -140,7 +192,7 @@ func TestAllPersistedConflictPaths(t *testing.T) {
 	if err := f.db.QueryRow("SELECT COUNT(*) FROM sync_change_log").Scan(&changes); err != nil {
 		t.Fatal(err)
 	}
-	if conflicts != 9 || changes != 5 {
+	if conflicts != 9 || changes != 7 {
 		t.Errorf("conflicts=%d changes=%d", conflicts, changes)
 	}
 	var proposed string

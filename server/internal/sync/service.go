@@ -95,6 +95,9 @@ func (a *ActorService) Submit(ctx context.Context, request Mutation) (SubmitResu
 	if code, err := a.evaluate(ctx, tx, intent, current, exists); err != nil {
 		return SubmitResult{}, err
 	} else if code != "" {
+		if err := a.ensureConflictNamespace(ctx, tx); err != nil {
+			return SubmitResult{}, err
+		}
 		result := SubmitResult{Conflict: code}
 		if exists {
 			result.Canonical = canonicalState(current)
@@ -243,7 +246,7 @@ type canonicalJSON struct {
 }
 
 func canonicalize(in Mutation) (canonicalIntent, [32]byte, error) {
-	if !validV7(in.OperationID) || !validObjectID(in.ObjectID) ||
+	if !validV7(in.OperationID) || !validObjectID(in.ObjectID) || isReservedConflictFolder(in.ObjectID) ||
 		(in.ObjectType != ObjectNote && in.ObjectType != ObjectFolder) {
 		return canonicalIntent{}, [32]byte{}, fmt.Errorf("%w: IDs/type", ErrInvalidInput)
 	}
@@ -291,6 +294,95 @@ func canonicalize(in Mutation) (canonicalIntent, [32]byte, error) {
 	}
 	body, _ := json.Marshal(canonicalJSON{"remember-sync-intent-v1", out.OperationID.String(), string(out.Kind), out.ObjectID.String(), string(out.ObjectType), out.BaseRevision, parent, out.Name, hex.EncodeToString(out.BlobHash)})
 	return out, sha256.Sum256(body), nil
+}
+
+func (a *ActorService) ensureConflictNamespace(ctx context.Context, tx *sql.Tx) error {
+	type reservedFolder struct {
+		id         uuid.UUID
+		parent     *uuid.UUID
+		name, seed string
+	}
+	rootID := ConflictRootID
+	folders := []reservedFolder{
+		{id: ConflictRootID, name: ConflictRootName, seed: "remember-conflict-root-v1"},
+		{id: ConflictRecoveredID, parent: &rootID, name: ConflictRecoveredName, seed: "remember-conflict-recovered-v1"},
+	}
+	for _, folder := range folders {
+		current, exists, err := loadObject(ctx, tx, a.userID, folder.id)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if current.Type != ObjectFolder || current.Revision != 1 || current.Deleted || current.Name != folder.name || !sameUUID(current.ParentID, folder.parent) {
+				return errors.New("reserved conflict namespace is corrupt")
+			}
+			if err := a.verifyReservedFolderHistory(ctx, tx, folder.id, folder.parent, folder.name, folder.seed); err != nil {
+				return err
+			}
+			continue
+		}
+		name, key, err := normalizeName(folder.name)
+		if err != nil {
+			return err
+		}
+		op, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		cursor, err := allocateCursor(ctx, tx, a.userID)
+		if err != nil {
+			return err
+		}
+		now := a.service.clock.Now().UTC().UnixMilli()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sync_objects(user_id,object_id,object_type,revision,parent_id,parent_key,name,name_key,blob_hash,deleted,created_at_ms,updated_at_ms) VALUES(?,?,?,1,?,?,?,?,NULL,0,?,?)`, a.userID[:], folder.id[:], ObjectFolder, nullableUUID(folder.parent), parentKey(folder.parent), name, key, now, now); err != nil {
+			return fmt.Errorf("provision conflict folder: %w", err)
+		}
+		intent := canonicalIntent{Mutation: Mutation{OperationID: op, Kind: MutationCreate, ObjectID: folder.id, ObjectType: ObjectFolder, ParentID: cloneUUID(folder.parent), Name: name}, nameKey: key}
+		hash := sha256.Sum256([]byte(folder.seed))
+		result := SubmitResult{Accepted: true, Revision: 1, Cursor: cursor}
+		if err := a.insertOperation(ctx, tx, intent, hash, now, result); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sync_object_versions(user_id,object_id,revision,operation_id,object_type,parent_id,name,name_key,blob_hash,deleted,created_at_ms) VALUES(?,?,1,?,?,?,?,?,NULL,0,?)`, a.userID[:], folder.id[:], op[:], ObjectFolder, nullableUUID(folder.parent), name, key, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sync_change_log(user_id,cursor,object_id,revision,operation_id,mutation,created_at_ms) VALUES(?,?,?,?,?,?,?)`, a.userID[:], cursor, folder.id[:], 1, op[:], MutationCreate, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *ActorService) verifyReservedFolderHistory(ctx context.Context, tx *sql.Tx, id uuid.UUID, parent *uuid.UUID, name, seed string) error {
+	_, key, err := normalizeName(name)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256([]byte(seed))
+	var count int
+	parentValue := nullableUUID(parent)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_object_versions v
+		JOIN sync_change_log c ON c.user_id=v.user_id AND c.object_id=v.object_id AND c.revision=v.revision AND c.operation_id=v.operation_id
+		JOIN sync_operations o ON o.user_id=v.user_id AND o.operation_id=v.operation_id AND o.object_id=v.object_id AND o.result_revision=v.revision AND o.result_cursor=c.cursor
+		WHERE v.user_id=? AND v.object_id=? AND v.revision=1 AND v.object_type='folder' AND v.name=? AND v.name_key=? AND v.blob_hash IS NULL AND v.deleted=0
+		AND ((v.parent_id IS NULL AND ? IS NULL) OR v.parent_id=?)
+		AND c.mutation='create' AND o.request_hash=? AND o.mutation='create' AND o.proposed_type='folder' AND o.proposed_base_revision=0
+		AND ((o.proposed_parent_id IS NULL AND ? IS NULL) OR o.proposed_parent_id=?) AND o.proposed_name=? AND o.proposed_name_key=?
+		AND o.proposed_blob_hash IS NULL AND o.result='accepted' AND o.conflict_code IS NULL`, a.userID[:], id[:], name, key, parentValue, parentValue, hash[:], parentValue, parentValue, name, key).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return errors.New("reserved conflict namespace history is corrupt")
+	}
+	return nil
+}
+
+func sameUUID(a, b *uuid.UUID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func (a *ActorService) requireActiveActor(ctx context.Context, tx *sql.Tx) error {
@@ -433,7 +525,12 @@ func (a *ActorService) validateTargetPath(ctx context.Context, tx *sql.Tx, in ca
 		parentID = parent.ParentID
 	}
 	target := strings.Join(parts, "/")
-	if err := validateLogicalPath(target); err != nil {
+	reservedConflictPath := len(parts) >= 3 && parts[0] == ConflictRootName && parts[1] == ConflictRecoveredName
+	if reservedConflictPath {
+		if len(target) > maxPathBytes {
+			return fmt.Errorf("%w: portable path length", ErrInvalidInput)
+		}
+	} else if err := validateLogicalPath(target); err != nil {
 		return err
 	}
 	if in.Kind != MutationMove || current.Type != ObjectFolder {

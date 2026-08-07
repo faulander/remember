@@ -15,7 +15,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Eingebaute Remember-, Nord-, Dracula-, Solarized- und Catppuccin-Themes.
 - Modularer Go-Server mit SQLite/WAL, checksum-geprüften Migrationen, Health-/Readiness-Probes und sicherem Docker-Image.
 - Interner Identity-Core mit E-Mail-Kanonisierung, Argon2id, Verifikationstokens und Enumeration-Schutz.
-- Interner mandantengebundener Sync-Core mit idempotenten Operationen, Versionen, Konflikten, Tombstones und Cursor-Pull.
+- Interner mandantengebundener Sync-Core mit idempotenten Operationen, Versionen, Konflikten, Tombstones, Cursor-Pull und server-provisioniertem Konfliktbereich.
 - Internes unveränderliches SHA-256-Blob-Repository mit 8-MiB-Grenze, Staging-Recovery und Startup-Audit.
 - Sessions-/Devices-Core mit opaken Access-Tokens, rotierenden Refresh-Tokens, Replay-Erkennung und sofortigem Widerruf.
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
