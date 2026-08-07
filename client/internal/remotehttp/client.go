@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/faulander/remember/client/internal/clientsync"
+	"github.com/faulander/remember/client/internal/naming"
 	"github.com/google/uuid"
 )
 
@@ -208,17 +209,26 @@ func (c *Client) Submit(ctx context.Context, m clientsync.Mutation) (clientsync.
 	if resp.StatusCode != http.StatusOK {
 		return clientsync.Result{}, classify(resp)
 	}
-	var out struct {
-		Accepted *bool   `json:"accepted"`
-		Conflict *string `json:"conflict"`
-		Revision *uint64 `json:"revision"`
-		Cursor   *uint64 `json:"cursor"`
+	type canonicalResponse struct {
+		ObjectType *string         `json:"object_type"`
+		Revision   *uint64         `json:"revision"`
+		ParentID   json.RawMessage `json:"parent_id"`
+		Name       *string         `json:"name"`
+		BlobHash   json.RawMessage `json:"blob_hash"`
+		Deleted    *bool           `json:"deleted"`
 	}
-	if err := decodeJSONNullable(resp, &out, []string{"accepted", "conflict", "revision", "cursor"}, []string{"accepted"}); err != nil || out.Accepted == nil {
+	var out struct {
+		Accepted  *bool              `json:"accepted"`
+		Conflict  *string            `json:"conflict"`
+		Revision  *uint64            `json:"revision"`
+		Cursor    *uint64            `json:"cursor"`
+		Canonical *canonicalResponse `json:"canonical"`
+	}
+	if err := decodeJSONNullable(resp, &out, []string{"accepted", "conflict", "revision", "cursor", "canonical"}, []string{"accepted"}); err != nil || out.Accepted == nil {
 		return clientsync.Result{}, ErrInvalidResponse
 	}
 	if *out.Accepted {
-		if out.Conflict != nil || out.Revision == nil || out.Cursor == nil || *out.Revision == 0 || *out.Cursor == 0 || *out.Revision > math.MaxInt64 || *out.Cursor > math.MaxInt64 {
+		if out.Conflict != nil || out.Canonical != nil || out.Revision == nil || out.Cursor == nil || *out.Revision == 0 || *out.Cursor == 0 || *out.Revision > math.MaxInt64 || *out.Cursor > math.MaxInt64 {
 			return clientsync.Result{}, ErrInvalidResponse
 		}
 		return clientsync.Result{Accepted: true, Revision: *out.Revision, Cursor: *out.Cursor}, nil
@@ -226,7 +236,25 @@ func (c *Client) Submit(ctx context.Context, m clientsync.Mutation) (clientsync.
 	if out.Conflict == nil || !validConflict(*out.Conflict) || out.Revision != nil || out.Cursor != nil {
 		return clientsync.Result{}, ErrInvalidResponse
 	}
-	return clientsync.Result{Conflict: *out.Conflict}, nil
+	result := clientsync.Result{Conflict: *out.Conflict}
+	if out.Canonical != nil {
+		if out.Canonical.ObjectType == nil || out.Canonical.Revision == nil || out.Canonical.Name == nil || out.Canonical.Deleted == nil || out.Canonical.ParentID == nil || out.Canonical.BlobHash == nil {
+			return clientsync.Result{}, ErrInvalidResponse
+		}
+		var parentID, blobHash *string
+		if !bytes.Equal(bytes.TrimSpace(out.Canonical.ParentID), []byte("null")) && json.Unmarshal(out.Canonical.ParentID, &parentID) != nil {
+			return clientsync.Result{}, ErrInvalidResponse
+		}
+		if !bytes.Equal(bytes.TrimSpace(out.Canonical.BlobHash), []byte("null")) && json.Unmarshal(out.Canonical.BlobHash, &blobHash) != nil {
+			return clientsync.Result{}, ErrInvalidResponse
+		}
+		canonical, err := validateCanonicalConflict(*out.Canonical.ObjectType, *out.Canonical.Revision, parentID, *out.Canonical.Name, blobHash, *out.Canonical.Deleted)
+		if err != nil {
+			return clientsync.Result{}, ErrInvalidResponse
+		}
+		result.Canonical = canonical
+	}
+	return result, nil
 }
 
 func (c *Client) Pull(ctx context.Context, after uint64, limit int) (PullPage, error) {
@@ -395,6 +423,34 @@ func scan(d *json.Decoder) error {
 		return e
 	}
 	return ErrInvalidResponse
+}
+
+func validateCanonicalConflict(objectType string, revision uint64, parentRaw *string, name string, hashRaw *string, deleted bool) (*clientsync.CanonicalState, error) {
+	if revision == 0 || revision > math.MaxInt64 || naming.ValidateComponent(name) != nil {
+		return nil, ErrInvalidResponse
+	}
+	state := &clientsync.CanonicalState{ObjectType: clientsync.ObjectType(objectType), Revision: revision, Name: name, Deleted: deleted}
+	if state.ObjectType != clientsync.Note && state.ObjectType != clientsync.Folder {
+		return nil, ErrInvalidResponse
+	}
+	if parentRaw != nil {
+		id, err := uuid.Parse(*parentRaw)
+		if err != nil || id == uuid.Nil || id.Variant() != uuid.RFC4122 || id.String() != *parentRaw {
+			return nil, ErrInvalidResponse
+		}
+		state.ParentID = &id
+	}
+	if hashRaw != nil {
+		hash, err := hex.DecodeString(*hashRaw)
+		if err != nil || len(hash) != sha256.Size || hex.EncodeToString(hash) != *hashRaw {
+			return nil, ErrInvalidResponse
+		}
+		state.BlobHash = hash
+	}
+	if state.ObjectType == clientsync.Note && len(state.BlobHash) != sha256.Size || state.ObjectType == clientsync.Folder && len(state.BlobHash) != 0 {
+		return nil, ErrInvalidResponse
+	}
+	return state, nil
 }
 
 func validConflict(code string) bool {

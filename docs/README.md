@@ -25,5 +25,6 @@
 | [0012](adr/0012-m2-client-foreground-sync.md) | Begrenzter Client-HTTP-Transport und Vordergrund-Sync |
 | [0013](adr/0013-m2-folder-create-apply.md) | Identitätsgebundener Folder-Create-Apply |
 | [0014](adr/0014-m2-folder-move-delete-apply.md) | Inode-gebundener Folder-Move/-Delete-Apply |
+| [0015](adr/0015-m2-conflict-canonical-state.md) | Authentifizierter kanonischer Zustand bei Sync-Konflikten |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

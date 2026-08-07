@@ -227,8 +227,8 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 4 {
-		t.Errorf("migration count after restart = %d, want 4", count)
+	if count != 5 {
+		t.Errorf("migration count after restart = %d, want 5", count)
 	}
 }
 

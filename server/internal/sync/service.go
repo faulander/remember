@@ -95,13 +95,17 @@ func (a *ActorService) Submit(ctx context.Context, request Mutation) (SubmitResu
 	if code, err := a.evaluate(ctx, tx, intent, current, exists); err != nil {
 		return SubmitResult{}, err
 	} else if code != "" {
-		if err := a.insertOperation(ctx, tx, intent, hash, now, SubmitResult{Conflict: code}); err != nil {
+		result := SubmitResult{Conflict: code}
+		if exists {
+			result.Canonical = canonicalState(current)
+		}
+		if err := a.insertOperation(ctx, tx, intent, hash, now, result); err != nil {
 			return SubmitResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return SubmitResult{}, fmt.Errorf("commit sync conflict: %w", err)
 		}
-		return SubmitResult{Conflict: code}, nil
+		return result, nil
 	}
 
 	next := current
@@ -302,13 +306,27 @@ func (a *ActorService) requireActiveActor(ctx context.Context, tx *sql.Tx) error
 	return nil
 }
 
+func canonicalState(state objectState) *CanonicalState {
+	return &CanonicalState{ObjectType: state.Type, Revision: state.Revision, ParentID: cloneUUID(state.ParentID), Name: state.Name, BlobHash: clone(state.BlobHash), Deleted: state.Deleted}
+}
+
+func cloneUUID(id *uuid.UUID) *uuid.UUID {
+	if id == nil {
+		return nil
+	}
+	copyID := *id
+	return &copyID
+}
+
 func (a *ActorService) replay(ctx context.Context, tx *sql.Tx, operationID uuid.UUID, hash [32]byte) (SubmitResult, bool, error) {
 	var stored []byte
 	var result string
-	var conflict sql.NullString
-	var revision, cursor sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT request_hash,result,conflict_code,result_revision,result_cursor
-		FROM sync_operations WHERE user_id=? AND operation_id=?`, a.userID[:], operationID[:]).Scan(&stored, &result, &conflict, &revision, &cursor)
+	var conflict, conflictType, conflictName sql.NullString
+	var revision, cursor, conflictRevision, conflictDeleted sql.NullInt64
+	var conflictParent, conflictBlob []byte
+	err := tx.QueryRowContext(ctx, `SELECT request_hash,result,conflict_code,result_revision,result_cursor,
+		conflict_object_type,conflict_revision,conflict_parent_id,conflict_name,conflict_blob_hash,conflict_deleted
+		FROM sync_operations WHERE user_id=? AND operation_id=?`, a.userID[:], operationID[:]).Scan(&stored, &result, &conflict, &revision, &cursor, &conflictType, &conflictRevision, &conflictParent, &conflictName, &conflictBlob, &conflictDeleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SubmitResult{}, false, nil
 	}
@@ -321,7 +339,16 @@ func (a *ActorService) replay(ctx context.Context, tx *sql.Tx, operationID uuid.
 	if result == "accepted" {
 		return SubmitResult{Accepted: true, Revision: uint64(revision.Int64), Cursor: uint64(cursor.Int64)}, true, nil
 	}
-	return SubmitResult{Conflict: ConflictCode(conflict.String)}, true, nil
+	conflictResult := SubmitResult{Conflict: ConflictCode(conflict.String)}
+	if conflictRevision.Valid {
+		state := &CanonicalState{ObjectType: ObjectType(conflictType.String), Revision: uint64(conflictRevision.Int64), Name: conflictName.String, BlobHash: clone(conflictBlob), Deleted: conflictDeleted.Int64 == 1}
+		if len(conflictParent) == 16 {
+			id, _ := uuid.FromBytes(conflictParent)
+			state.ParentID = &id
+		}
+		conflictResult.Canonical = state
+	}
+	return conflictResult, true, nil
 }
 
 func (a *ActorService) evaluate(ctx context.Context, tx *sql.Tx, in canonicalIntent, current objectState, exists bool) (ConflictCode, error) {
@@ -491,6 +518,11 @@ func (a *ActorService) insertOperation(ctx context.Context, tx *sql.Tx, in canon
 	status := "conflict"
 	var conflict any = string(result.Conflict)
 	var revision, cursor any
+	var conflictType, conflictRevision, conflictParent, conflictName, conflictBlob, conflictDeleted any
+	if result.Canonical != nil {
+		conflictType, conflictRevision, conflictParent, conflictName = result.Canonical.ObjectType, result.Canonical.Revision, nullableUUID(result.Canonical.ParentID), result.Canonical.Name
+		conflictBlob, conflictDeleted = nullableBytes(result.Canonical.BlobHash), result.Canonical.Deleted
+	}
 	if result.Accepted {
 		status = "accepted"
 		conflict = nil
@@ -499,10 +531,11 @@ func (a *ActorService) insertOperation(ctx context.Context, tx *sql.Tx, in canon
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO sync_operations(user_id,device_id,operation_id,request_hash,mutation,
 		object_id,proposed_type,proposed_base_revision,proposed_parent_id,proposed_name,proposed_name_key,
-		proposed_blob_hash,result,conflict_code,result_revision,result_cursor,created_at_ms)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, a.userID[:], a.deviceID[:], in.OperationID[:], hash[:], in.Kind,
+		proposed_blob_hash,result,conflict_code,result_revision,result_cursor,created_at_ms,
+		conflict_object_type,conflict_revision,conflict_parent_id,conflict_name,conflict_blob_hash,conflict_deleted)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, a.userID[:], a.deviceID[:], in.OperationID[:], hash[:], in.Kind,
 		in.ObjectID[:], in.ObjectType, in.BaseRevision, nullableUUID(in.ParentID), nullableString(in.Name), nullableString(in.nameKey),
-		nullableBytes(in.BlobHash), status, conflict, revision, cursor, now)
+		nullableBytes(in.BlobHash), status, conflict, revision, cursor, now, conflictType, conflictRevision, conflictParent, conflictName, conflictBlob, conflictDeleted)
 	if err != nil {
 		return fmt.Errorf("persist sync operation: %w", err)
 	}

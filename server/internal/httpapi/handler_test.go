@@ -562,14 +562,14 @@ func TestSyncConflictReplayAndErrorMapping(t *testing.T) {
 	api.syncForActor = func(uuid.UUID, uuid.UUID) (SyncActorService, error) { return actor, nil }
 	hash := sha256.Sum256([]byte("blob"))
 	body := validSyncMutationBody(hash)
-	actor.submitResult = synccore.SubmitResult{Conflict: synccore.ConflictPathCollision}
+	actor.submitResult = synccore.SubmitResult{Conflict: synccore.ConflictPathCollision, Canonical: &synccore.CanonicalState{ObjectType: synccore.ObjectNote, Revision: 3, Name: "Canonical.md", BlobHash: hash[:]}}
 	for range 2 {
 		response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/operations", body, testAccess, http.StatusOK)
 		var result syncSubmitResponse
 		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 			t.Fatal(err)
 		}
-		if result.Accepted || result.Conflict == nil || *result.Conflict != string(synccore.ConflictPathCollision) || result.Revision != nil || result.Cursor != nil {
+		if result.Accepted || result.Conflict == nil || *result.Conflict != string(synccore.ConflictPathCollision) || result.Revision != nil || result.Cursor != nil || result.Canonical == nil || result.Canonical.Revision != 3 || result.Canonical.BlobHash == nil || *result.Canonical.BlobHash != hex.EncodeToString(hash[:]) {
 			t.Fatalf("conflict response=%#v", result)
 		}
 	}

@@ -57,10 +57,20 @@ type OutboxItem struct {
 	Mutation Mutation
 	Status   string
 }
+type CanonicalState struct {
+	ObjectType ObjectType
+	Revision   uint64
+	ParentID   *uuid.UUID
+	Name       string
+	BlobHash   []byte
+	Deleted    bool
+}
+
 type Result struct {
 	Accepted         bool
 	Conflict         string
 	Revision, Cursor uint64
+	Canonical        *CanonicalState
 }
 
 type Change struct {
@@ -397,10 +407,16 @@ func (s *Store) RecordResult(ctx context.Context, operationID uuid.UUID, result 
 	if !validOperationID(operationID) {
 		return errors.New("invalid operation id")
 	}
-	if (result.Accepted && (result.Revision == 0 || result.Cursor == 0 || result.Conflict != "")) ||
+	if (result.Accepted && (result.Revision == 0 || result.Cursor == 0 || result.Conflict != "" || result.Canonical != nil)) ||
 		(!result.Accepted && (result.Conflict == "" || result.Revision != 0 || result.Cursor != 0)) ||
 		result.Revision > math.MaxInt64 || result.Cursor > math.MaxInt64 {
 		return errors.New("invalid operation result")
+	}
+	if result.Canonical != nil {
+		state := result.Canonical
+		if (state.ObjectType != Note && state.ObjectType != Folder) || state.Revision == 0 || state.Revision > math.MaxInt64 || naming.ValidateComponent(state.Name) != nil || state.ParentID != nil && !validObjectID(*state.ParentID) || state.ObjectType == Note && len(state.BlobHash) != sha256.Size || state.ObjectType == Folder && len(state.BlobHash) != 0 {
+			return errors.New("invalid canonical conflict state")
+		}
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		if result.Accepted {
@@ -426,6 +442,18 @@ func (s *Store) RecordResult(ctx context.Context, operationID uuid.UUID, result 
 		if n != 1 {
 			return errors.New("operation result already final or missing")
 		}
+		if result.Canonical != nil {
+			var parent, blob any
+			if result.Canonical.ParentID != nil {
+				parent = result.Canonical.ParentID.String()
+			}
+			if len(result.Canonical.BlobHash) != 0 {
+				blob = result.Canonical.BlobHash
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO sync_conflict_states(operation_id,object_type,revision,parent_id,name,blob_hash,deleted) VALUES(?,?,?,?,?,?,?)`, operationID.String(), result.Canonical.ObjectType, result.Canonical.Revision, parent, result.Canonical.Name, blob, result.Canonical.Deleted); err != nil {
+				return err
+			}
+		}
 		if result.Accepted {
 			var object string
 			var base uint64
@@ -445,6 +473,36 @@ func (s *Store) RecordResult(ctx context.Context, operationID uuid.UUID, result 
 		return nil
 	})
 }
+func (s *Store) CanonicalConflictState(ctx context.Context, operationID uuid.UUID) (*CanonicalState, error) {
+	if !validOperationID(operationID) {
+		return nil, errors.New("invalid operation id")
+	}
+	var result *CanonicalState
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var state CanonicalState
+		var parent sql.NullString
+		var deleted int
+		err := tx.QueryRowContext(ctx, `SELECT object_type,revision,parent_id,name,blob_hash,deleted FROM sync_conflict_states WHERE operation_id=?`, operationID.String()).Scan(&state.ObjectType, &state.Revision, &parent, &state.Name, &state.BlobHash, &deleted)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		state.Deleted = deleted == 1
+		if parent.Valid {
+			id, err := uuid.Parse(parent.String)
+			if err != nil {
+				return errors.New("corrupt canonical conflict parent")
+			}
+			state.ParentID = &id
+		}
+		result = &state
+		return nil
+	})
+	return result, err
+}
+
 func (s *Store) RecordReplayMismatch(ctx context.Context, operationID uuid.UUID) error {
 	if !validOperationID(operationID) {
 		return errors.New("invalid operation id")

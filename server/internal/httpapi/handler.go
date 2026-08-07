@@ -351,11 +351,21 @@ type syncMutationRequest struct {
 	BlobHash     *string `json:"blob_hash"`
 }
 
+type syncCanonicalResponse struct {
+	ObjectType string  `json:"object_type"`
+	Revision   uint64  `json:"revision"`
+	ParentID   *string `json:"parent_id"`
+	Name       string  `json:"name"`
+	BlobHash   *string `json:"blob_hash"`
+	Deleted    bool    `json:"deleted"`
+}
+
 type syncSubmitResponse struct {
-	Accepted bool    `json:"accepted"`
-	Conflict *string `json:"conflict"`
-	Revision *uint64 `json:"revision"`
-	Cursor   *uint64 `json:"cursor"`
+	Accepted  bool                   `json:"accepted"`
+	Conflict  *string                `json:"conflict"`
+	Revision  *uint64                `json:"revision"`
+	Cursor    *uint64                `json:"cursor"`
+	Canonical *syncCanonicalResponse `json:"canonical"`
 }
 
 type syncChangeResponse struct {
@@ -412,6 +422,18 @@ func (h *handler) submitSync(w http.ResponseWriter, r *http.Request) {
 	} else {
 		conflict := string(result.Conflict)
 		response.Conflict = &conflict
+		if result.Canonical != nil {
+			canonical := &syncCanonicalResponse{ObjectType: string(result.Canonical.ObjectType), Revision: result.Canonical.Revision, Name: result.Canonical.Name, Deleted: result.Canonical.Deleted}
+			if result.Canonical.ParentID != nil {
+				parent := result.Canonical.ParentID.String()
+				canonical.ParentID = &parent
+			}
+			if len(result.Canonical.BlobHash) != 0 {
+				hash := hex.EncodeToString(result.Canonical.BlobHash)
+				canonical.BlobHash = &hash
+			}
+			response.Canonical = canonical
+		}
 	}
 	writeJSON(w, r, http.StatusOK, response)
 }

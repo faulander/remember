@@ -133,8 +133,12 @@ func TestConflictAndReplayMismatchPersistence(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.RecordResult(ctx, conflictOp, Result{Conflict: "path_collision"}); err != nil {
+	canonical := &CanonicalState{ObjectType: Folder, Revision: 3, Name: "Canonical"}
+	if err := store.RecordResult(ctx, conflictOp, Result{Conflict: "path_collision", Canonical: canonical}); err != nil {
 		t.Fatal(err)
+	}
+	if got, err := store.CanonicalConflictState(ctx, conflictOp); err != nil || got == nil || got.ObjectType != Folder || got.Revision != 3 || got.Name != "Canonical" {
+		t.Fatalf("canonical=%#v err=%v", got, err)
 	}
 	if err := store.RecordReplayMismatch(ctx, replayOp); err != nil {
 		t.Fatal(err)

@@ -53,11 +53,25 @@ func TestMutationLifecycleIdempotencyAndPull(t *testing.T) {
 	if err != nil || updated.Revision != 2 || updated.Cursor != 3 {
 		t.Fatalf("update = %#v, %v", updated, err)
 	}
+	conflicting := mutation(MutationUpdate, noteID, ObjectNote, 99)
+	conflicting.BlobHash = fixture.blob
+	conflict, err := actor.Submit(context.Background(), conflicting)
+	if err != nil || conflict.Conflict != ConflictBaseRevisionMismatch || conflict.Canonical == nil || conflict.Canonical.Revision != 2 || !bytes.Equal(conflict.Canonical.BlobHash, fixture.blob2) {
+		t.Fatalf("canonical conflict=%#v err=%v", conflict, err)
+	}
+	replayedConflict, err := actor.Submit(context.Background(), conflicting)
+	if err != nil || replayedConflict.Canonical == nil || replayedConflict.Canonical.Revision != 2 || !bytes.Equal(replayedConflict.Canonical.BlobHash, fixture.blob2) {
+		t.Fatalf("replayed canonical conflict=%#v err=%v", replayedConflict, err)
+	}
 	move := mutation(MutationMove, noteID, ObjectNote, 2)
 	move.Name = "Moved.md"
 	moved, err := actor.Submit(context.Background(), move)
 	if err != nil || moved.Revision != 3 {
 		t.Fatalf("move = %#v, %v", moved, err)
+	}
+	replayedAfterMove, err := actor.Submit(context.Background(), conflicting)
+	if err != nil || replayedAfterMove.Canonical == nil || replayedAfterMove.Canonical.Revision != 2 || replayedAfterMove.Canonical.Name != "Plan.md" {
+		t.Fatalf("conflict replay drifted=%#v err=%v", replayedAfterMove, err)
 	}
 	remove := mutation(MutationDelete, noteID, ObjectNote, 3)
 	deleted, err := actor.Submit(context.Background(), remove)

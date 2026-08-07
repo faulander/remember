@@ -49,11 +49,21 @@ type Mutation struct {
 	BlobHash     []byte
 }
 
+type CanonicalState struct {
+	ObjectType ObjectType
+	Revision   uint64
+	ParentID   *uuid.UUID
+	Name       string
+	BlobHash   []byte
+	Deleted    bool
+}
+
 type SubmitResult struct {
-	Accepted bool
-	Conflict ConflictCode
-	Revision uint64
-	Cursor   uint64
+	Accepted  bool
+	Conflict  ConflictCode
+	Revision  uint64
+	Cursor    uint64
+	Canonical *CanonicalState
 }
 
 type VersionState struct {

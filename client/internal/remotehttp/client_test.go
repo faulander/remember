@@ -1,6 +1,7 @@
 package remotehttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -50,7 +51,7 @@ func TestClientSubmitPullAndBlobContracts(t *testing.T) {
 			if body["operation_id"] != op.String() {
 				t.Error("operation changed")
 			}
-			jsonResponse(w, map[string]any{"accepted": true, "conflict": nil, "revision": 1, "cursor": 1})
+			jsonResponse(w, map[string]any{"accepted": true, "conflict": nil, "revision": 1, "cursor": 1, "canonical": nil})
 		case "/v1/sync/changes":
 			if r.URL.RawQuery != "after=0&limit=100" {
 				t.Errorf("query=%s", r.URL.RawQuery)
@@ -110,6 +111,35 @@ func TestClientRefusesRedirectDuplicateJSONAndNonTLSRemote(t *testing.T) {
 	client, _ = New(duplicate.URL, nil, tokenSource())
 	if _, err := client.Submit(context.Background(), clientsync.Mutation{OperationID: op, Kind: clientsync.Create, ObjectID: uuid.New(), ObjectType: clientsync.Folder, Name: "F"}); !errors.Is(err, ErrInvalidResponse) {
 		t.Fatalf("duplicate err=%v", err)
+	}
+}
+
+func TestClientValidatesCanonicalConflictState(t *testing.T) {
+	op := uuid.Must(uuid.NewV7())
+	object := uuid.New()
+	hash := sha256.Sum256([]byte("canonical"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jsonResponse(w, map[string]any{"accepted": false, "conflict": "base_revision_mismatch", "revision": nil, "cursor": nil, "canonical": map[string]any{"object_type": "note", "revision": 2, "parent_id": nil, "name": "N.md", "blob_hash": fmtHash(hash), "deleted": false}})
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, nil, tokenSource())
+	result, err := client.Submit(context.Background(), clientsync.Mutation{OperationID: op, Kind: clientsync.Update, ObjectID: object, ObjectType: clientsync.Note, BaseRevision: 1, BlobHash: hash[:]})
+	if err != nil || result.Canonical == nil || result.Canonical.Revision != 2 || !bytes.Equal(result.Canonical.BlobHash, hash[:]) {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	for _, omitted := range []string{"object_type", "revision", "parent_id", "name", "blob_hash", "deleted"} {
+		t.Run("missing "+omitted, func(t *testing.T) {
+			canonical := map[string]any{"object_type": "note", "revision": 2, "parent_id": nil, "name": "N.md", "blob_hash": fmtHash(hash), "deleted": false}
+			delete(canonical, omitted)
+			invalid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				jsonResponse(w, map[string]any{"accepted": false, "conflict": "base_revision_mismatch", "revision": nil, "cursor": nil, "canonical": canonical})
+			}))
+			defer invalid.Close()
+			client, _ := New(invalid.URL, nil, tokenSource())
+			if _, err := client.Submit(context.Background(), clientsync.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: clientsync.Update, ObjectID: object, ObjectType: clientsync.Note, BaseRevision: 1, BlobHash: hash[:]}); !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("missing %s accepted: %v", omitted, err)
+			}
+		})
 	}
 }
 
