@@ -25,13 +25,16 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 	return store.CaptureSnapshot(ctx, snapshot, options.RecoveryMode, func(tx *sql.Tx) ([]clientsync.Mutation, []uuid.UUID, error) {
 		old := make(map[uuid.UUID]localindex.Object)
 		current := make(map[uuid.UUID]localindex.Object)
+		pending := make(map[uuid.UUID]bool)
 		for _, o := range previous.Objects {
 			if o.IdentityState != localindex.IdentityPending {
 				old[o.ID] = o
 			}
 		}
 		for _, o := range snapshot.Objects {
-			if o.IdentityState != localindex.IdentityPending {
+			if o.IdentityState == localindex.IdentityPending {
+				pending[o.ID] = true
+			} else {
 				current[o.ID] = o
 			}
 		}
@@ -52,6 +55,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 		}
 		var creates, changes, deletes []localindex.Object
 		for id, o := range current {
+			if options.AppliedRemoteFolders[id] && o.Type == localindex.ObjectFolder {
+				continue
+			}
 			if trustedID, ok := options.TrustedRemoteFolders[o.RelativePath]; ok && trustedID == id && o.Type == localindex.ObjectFolder {
 				continue
 			}
@@ -90,6 +96,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 		var cancel []uuid.UUID
 		for id, o := range old {
 			if _, ok := current[id]; ok {
+				continue
+			}
+			if pending[id] {
 				continue
 			}
 			if options.AppliedRemoteDeletes[id] {

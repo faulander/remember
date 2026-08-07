@@ -83,6 +83,16 @@ type ApplyPlan struct {
 	Steps                     []Change
 }
 
+type FolderMutation struct {
+	PlanID         uuid.UUID
+	StepIndex      int
+	FolderID       uuid.UUID
+	Mutation       MutationKind
+	SourceRelative string
+	TargetRelative string
+	Device, Inode  uint64
+}
+
 type FolderPublication struct {
 	PlanID            uuid.UUID
 	StepIndex         int
@@ -760,6 +770,65 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 		}
 		return nil
 	})
+}
+
+func (s *Store) PutFolderMutation(ctx context.Context, mutation FolderMutation) error {
+	validTarget := mutation.Mutation == Move && naming.ValidateUserRelativePath(mutation.TargetRelative) == nil || mutation.Mutation == Delete && len(mutation.TargetRelative) > 0
+	if !validOperationID(mutation.PlanID) || mutation.StepIndex < 0 || !validObjectID(mutation.FolderID) || (mutation.Mutation != Move && mutation.Mutation != Delete) || naming.ValidateUserRelativePath(mutation.SourceRelative) != nil || !validTarget || mutation.Device == 0 || mutation.Inode == 0 || mutation.Device > math.MaxInt64 || mutation.Inode > math.MaxInt64 {
+		return errors.New("invalid folder mutation binding")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_mutations(plan_id,step_index,folder_id,mutation_kind,source_relative,target_relative,device,inode)
+			SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM apply_steps WHERE plan_id=? AND step_index=? AND object_id=? AND mutation=? AND object_type='folder')`, mutation.PlanID.String(), mutation.StepIndex, mutation.FolderID.String(), mutation.Mutation, mutation.SourceRelative, mutation.TargetRelative, mutation.Device, mutation.Inode, mutation.PlanID.String(), mutation.StepIndex, mutation.FolderID.String(), mutation.Mutation)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("folder mutation does not match apply step")
+		}
+		return nil
+	})
+}
+
+func (s *Store) FolderMutation(ctx context.Context, planID uuid.UUID, stepIndex int) (*FolderMutation, error) {
+	if !validOperationID(planID) || stepIndex < 0 {
+		return nil, errors.New("invalid folder mutation key")
+	}
+	var result *FolderMutation
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var m FolderMutation
+		var folderID string
+		err := tx.QueryRowContext(ctx, `SELECT folder_id,mutation_kind,source_relative,target_relative,device,inode FROM apply_folder_mutations WHERE plan_id=? AND step_index=?`, planID.String(), stepIndex).Scan(&folderID, &m.Mutation, &m.SourceRelative, &m.TargetRelative, &m.Device, &m.Inode)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		m.PlanID, m.StepIndex = planID, stepIndex
+		m.FolderID, err = uuid.Parse(folderID)
+		if err != nil {
+			return errors.New("corrupt folder mutation binding")
+		}
+		result = &m
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) LatestFolderMutationTarget(ctx context.Context, planID, folderID uuid.UUID) (string, bool, error) {
+	if !validOperationID(planID) || !validObjectID(folderID) {
+		return "", false, errors.New("invalid folder mutation lookup")
+	}
+	var target string
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `SELECT target_relative FROM apply_folder_mutations WHERE plan_id=? AND folder_id=? ORDER BY step_index DESC LIMIT 1`, planID.String(), folderID.String()).Scan(&target)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	return target, target != "", err
 }
 
 func (s *Store) PutFolderPublication(ctx context.Context, publication FolderPublication) error {

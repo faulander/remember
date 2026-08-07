@@ -30,6 +30,8 @@ type Entry struct {
 	RelativePath string
 	NoteID       uuid.UUID
 	ContentHash  [sha256.Size]byte
+	FolderDevice uint64
+	FolderInode  uint64
 }
 
 // IssueCode identifies a local problem that must be shown rather than fixed

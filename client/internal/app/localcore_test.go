@@ -17,7 +17,7 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestExecuteActiveApplyPlanCreateUpdateAndRejectUnsupported(t *testing.T) {
+func TestExecuteActiveApplyPlanCreateUpdateAndFolderMove(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	core, _, err := Initialize(ctx, root)
@@ -79,13 +79,243 @@ func TestExecuteActiveApplyPlanCreateUpdateAndRejectUnsupported(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadFile(filepath.Join(root, "Remote.md"))
-	if err := core.ExecuteActiveApplyPlan(ctx, resolver); !errors.Is(err, ErrUnsupportedApplyPlan) {
-		t.Fatalf("unsupported error=%v", err)
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
 	}
-	after, _ := os.ReadFile(filepath.Join(root, "Remote.md"))
-	if string(before) != string(after) {
-		t.Fatal("unsupported plan mutated filesystem")
+	if _, err := os.Stat(filepath.Join(root, "Moved")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Folder")); !os.IsNotExist(err) {
+		t.Fatalf("old folder remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Moved", ".remember-apply-nonce")); !os.IsNotExist(err) {
+		t.Fatalf("marker remains: %v", err)
+	}
+	deletePlan, deleteOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: deletePlan, FromCursor: 4, ThroughCursor: 5, Steps: []clientsync.Change{{Cursor: 5, OperationID: deleteOp, ObjectID: folderID, Mutation: clientsync.Delete, ObjectType: clientsync.Folder, Revision: 3, Name: "Moved", Deleted: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Moved")); !os.IsNotExist(err) {
+		t.Fatalf("deleted folder remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".remember", "trash", "folders", folderID.String()+"-"+deleteOp.String())); !os.IsNotExist(err) {
+		t.Fatalf("empty folder delete unexpectedly left trash: %v", err)
+	}
+}
+
+func TestExecuteActiveApplyPlanResumesFolderMoveAfterPublicationCrash(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	folderID := uuid.New()
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: folderID, Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "Folder"}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return nil, errors.New("unexpected blob") })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	movePlan, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: movePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: moveOp, ObjectID: folderID, Mutation: clientsync.Move, ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}}); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterFolderMutationPublication = func() error { testHookAfterFolderMutationPublication = nil; return errors.New("simulated crash") }
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("simulated crash did not interrupt apply")
+	}
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Moved")); err != nil {
+		t.Fatal(err)
+	}
+	resumedStore, _ := clientsync.NewStore(reopened.index)
+	if cursor, err := resumedStore.ConfirmedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	deletePlan, deleteOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := resumedStore.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: deletePlan, FromCursor: 2, ThroughCursor: 3, Steps: []clientsync.Change{{Cursor: 3, OperationID: deleteOp, ObjectID: folderID, Mutation: clientsync.Delete, ObjectType: clientsync.Folder, Revision: 3, Name: "Moved", Deleted: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterFolderMutationPublication = func() error {
+		testHookAfterFolderMutationPublication = nil
+		return errors.New("simulated delete crash")
+	}
+	if err := reopened.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("simulated delete crash did not interrupt apply")
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	finalCore, _, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer finalCore.Close()
+	if err := finalCore.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	finalStore, _ := clientsync.NewStore(finalCore.index)
+	if cursor, err := finalStore.ConfirmedCursor(ctx); err != nil || cursor != 3 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Moved")); !os.IsNotExist(err) {
+		t.Fatalf("deleted folder remains: %v", err)
+	}
+}
+
+func TestExecuteActiveApplyPlanRejectsNonEmptyFolderDelete(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	folderID := uuid.New()
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: folderID, Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "Folder"}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return nil, errors.New("unexpected blob") })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Folder", "local.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deletePlan, deleteOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: deletePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: deleteOp, ObjectID: folderID, Mutation: clientsync.Delete, ObjectType: clientsync.Folder, Revision: 2, Name: "Folder", Deleted: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("non-empty folder delete accepted")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Folder", "local.txt")); err != nil || string(got) != "keep" {
+		t.Fatalf("local content=%q err=%v", got, err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 1 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanRejectsAmbiguousReplacementAfterReconcile(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	folderID := uuid.New()
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: folderID, Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "Folder"}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return nil, errors.New("unexpected blob") })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "Folder"), filepath.Join(root, "Original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "Folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Folder", "replacement.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := core.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range snapshot.Objects {
+		if object.ID == folderID && object.RelativePath == "Folder" && object.IdentityState == localindex.IdentityKnown {
+			t.Fatalf("replacement was blessed during ordinary reconcile: %#v", object)
+		}
+	}
+	movePlan, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: movePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: moveOp, ObjectID: folderID, Mutation: clientsync.Move, ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("ambiguous replacement was moved as remote identity")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Folder", "replacement.txt")); err != nil || string(got) != "keep" {
+		t.Fatalf("replacement=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Original")); err != nil {
+		t.Fatalf("original folder lost: %v", err)
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 1 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+}
+
+func TestExecuteActiveApplyPlanDoesNotBlessReplacementAfterFolderMove(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	folderID := uuid.New()
+	createPlan, createOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: createPlan, FromCursor: 0, ThroughCursor: 1, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: folderID, Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "Folder"}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return nil, errors.New("unexpected blob") })
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	movePlan, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: movePlan, FromCursor: 1, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 2, OperationID: moveOp, ObjectID: folderID, Mutation: clientsync.Move, ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}}); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterFolderMutationPublication = func() error {
+		testHookAfterFolderMutationPublication = nil
+		if err := os.Rename(filepath.Join(root, "Moved"), filepath.Join(root, "Published")); err != nil {
+			return err
+		}
+		return os.Mkdir(filepath.Join(root, "Moved"), 0o755)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil {
+		t.Fatal("replacement after folder move was accepted")
+	}
+	snapshot, err := core.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range snapshot.Objects {
+		if object.ID == folderID && object.RelativePath == "Moved" {
+			t.Fatalf("replacement retained remote identity: %#v", object)
+		}
+	}
+	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 1 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
 	}
 }
 

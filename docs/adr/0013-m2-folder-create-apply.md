@@ -15,8 +15,8 @@ Darwin/Linux erstellen den noch leeren Ordner zunächst descriptor-verankert unt
 
 Das Markieren des Apply-Schritts und die Cleanup-Autorisierung erfolgen in einer SQLite-Transaktion. Der temporäre Marker bleibt bis zum atomaren Abschluss des gesamten Apply-Plans erhalten und wird erst danach entfernt; ein persistierter Cleanup-Zeitpunkt macht diese Bereinigung nach einem Neustart wiederholbar. Ein Absturz vor der DB-Bindung hinterlässt nur einen technischen Orphan-Stage, der kontrolliert entfernt und neu erstellt werden darf; ein Absturz nach Veröffentlichung erkennt ausschließlich die persistierte Inode-/Nonce-Kombination. Ein bereits vorhandener, ungebundener Zielordner schlägt geschlossen fehl. Windows bleibt bis zu einer handle-sicheren Reparse-Point-Implementierung geschlossen.
 
-Geordnete, verschachtelte Folder-Creates und nachfolgende Notizoperationen dürfen in einem Apply-Plan stehen. Folder-Move und Folder-Delete bleiben nicht unterstützt und werden im Vordergrund-Sync vor Persistenz eines Apply-Plans abgelehnt.
+Geordnete, verschachtelte Folder-Creates und nachfolgende Notizoperationen dürfen in einem Apply-Plan stehen. Folder-Move und Folder-Delete werden durch die spätere ADR 0014 ergänzt.
 
 ## Folgen
 
-Zwei Geräte können neue Ordnerbäume und darin liegende Notizen konvergieren, ohne permanente Folder-Marker zu hinterlassen. Cursor und Baselines werden weiterhin erst nach vollständig angewendetem Plan fortgeschrieben. Folder-Move/-Delete, Konfliktmaterialisierung, Hintergrund-Scheduler und sichere Tokenpersistenz bleiben spätere Schnitte.
+Zwei Geräte können neue Ordnerbäume und darin liegende Notizen konvergieren, ohne permanente Folder-Marker zu hinterlassen. Cursor und Baselines werden weiterhin erst nach vollständig angewendetem Plan fortgeschrieben. ADR 0014 ergänzt Folder-Move/-Delete; Konfliktmaterialisierung, Hintergrund-Scheduler und sichere Tokenpersistenz bleiben spätere Schnitte.

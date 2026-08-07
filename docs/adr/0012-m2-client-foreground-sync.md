@@ -19,9 +19,8 @@ Outbox, Apply-Journal sowie die authentifizierten Blob- und Sync-Routen existier
 
 - Refresh, Login-UI oder Persistenz von Access-/Refresh-Tokens,
 - Hintergrund-Scheduler, Retry-Timer, Backoff oder Betriebssystem-Schlüsselspeicher,
-- Pull-Apply für Folder-Move/-Delete,
 - automatische Konfliktmaterialisierung und allgemeine Zwei-Geräte-Konvergenz.
 
 ## Folgen
 
-Ein Vordergrundaufruf kann bestehende ausgehende Mutationen crash-sicher übertragen und Notiz-Create/-Update/-Move/-Delete sowie identitätsgebundene Folder-Creates anwenden. Netzwerkambiguität strandet keine Operation mehr. Die Produktintegration bleibt bewusst auf flüchtige Access-Tokens und den nachweisbar unterstützten Apply-Teil beschränkt.
+Ein Vordergrundaufruf kann bestehende ausgehende Mutationen crash-sicher übertragen und Notiz-Create/-Update/-Move/-Delete sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen anwenden. Netzwerkambiguität strandet keine Operation mehr. Die Produktintegration bleibt bewusst auf flüchtige Access-Tokens und den nachweisbar unterstützten Apply-Teil beschränkt.

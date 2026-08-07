@@ -35,10 +35,13 @@ type Options struct {
 	// AppliedRemoteNotes suppresses Outbox derivation only for authenticated
 	// remote note bytes whose exact observed SHA-256 matches the supplied hash.
 	AppliedRemoteNotes   map[uuid.UUID][32]byte
+	AppliedRemoteFolders map[uuid.UUID]bool
 	AppliedRemoteDeletes map[uuid.UUID]bool
-	// TrustedRemoteFolders is accepted only with a verifier bound to the
-	// persisted publication nonce and filesystem identity.
+	// Trusted remote folder changes are accepted only with a verifier bound
+	// to a persisted filesystem identity.
 	TrustedRemoteFolders       map[string]uuid.UUID
+	TrustedRemoteFolderMoves   map[string]string
+	TrustedRemoteFolderDeletes map[string]uuid.UUID
 	VerifyTrustedRemoteFolders func() error
 }
 
@@ -57,7 +60,8 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 		generator = frontmatter.NewNoteID
 	}
 
-	if len(options.TrustedRemoteFolders) != 0 {
+	trustedFolderApply := len(options.TrustedRemoteFolders) != 0 || len(options.TrustedRemoteFolderMoves) != 0 || len(options.TrustedRemoteFolderDeletes) != 0
+	if trustedFolderApply {
 		if options.VerifyTrustedRemoteFolders == nil {
 			return Report{}, errors.New("trusted remote folders require identity verifier")
 		}
@@ -69,10 +73,13 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 	if err != nil {
 		return Report{}, err
 	}
+	if err := observeInventoryFolders(root, &inventory); err != nil {
+		return Report{}, err
+	}
 	blocked := blockedNotePaths(inventory.Issues)
 	assigned := 0
 	for _, entry := range inventory.Entries {
-		if len(options.TrustedRemoteFolders) != 0 || entry.Type != EntryNote || entry.NoteID != uuid.Nil || blocked[entry.RelativePath] {
+		if trustedFolderApply || entry.Type != EntryNote || entry.NoteID != uuid.Nil || blocked[entry.RelativePath] {
 			continue
 		}
 		id, err := generator()
@@ -89,28 +96,40 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 		if err != nil {
 			return Report{}, err
 		}
+		if err := observeInventoryFolders(root, &inventory); err != nil {
+			return Report{}, err
+		}
 	}
 
 	previous, err := index.ReadSnapshot(ctx)
 	if err != nil {
 		return Report{}, err
 	}
-	if len(options.TrustedRemoteFolders) != 0 {
-		if options.VerifyTrustedRemoteFolders == nil {
-			return Report{}, errors.New("trusted remote folders require identity verifier")
-		}
+	if trustedFolderApply {
 		if err := options.VerifyTrustedRemoteFolders(); err != nil {
 			return Report{}, err
 		}
 	}
 	snapshot, issues, err := buildSnapshot(
 		inventory, previous, options.AllowInitialFolderIDs, options.RecoveryMode,
-		options.MoveCandidates, options.TrustedNewFolders, options.TrustedRemoteFolders, generator,
+		options.MoveCandidates, options.TrustedNewFolders, options.TrustedRemoteFolders, options.TrustedRemoteFolderMoves, options.TrustedRemoteFolderDeletes, generator,
 	)
 	if err != nil {
 		return Report{}, err
 	}
-	if len(options.TrustedRemoteFolders) != 0 {
+	observations := make(map[string]Entry)
+	for _, entry := range inventory.Entries {
+		if entry.Type == EntryFolder {
+			observations[entry.RelativePath] = entry
+		}
+	}
+	for i := range snapshot.Objects {
+		object := &snapshot.Objects[i]
+		if observed, ok := observations[object.RelativePath]; object.Type == localindex.ObjectFolder && object.IdentityState != localindex.IdentityPending && ok {
+			object.FolderDevice, object.FolderInode = observed.FolderDevice, observed.FolderInode
+		}
+	}
+	if trustedFolderApply {
 		if err := options.VerifyTrustedRemoteFolders(); err != nil {
 			return Report{}, err
 		}
@@ -125,6 +144,21 @@ func Run(ctx context.Context, root string, index *localindex.Index, options Opti
 	return Report{AssignedNoteIDs: assigned, Objects: len(snapshot.Objects), Issues: issues}, nil
 }
 
+func observeInventoryFolders(root string, inventory *Inventory) error {
+	for i := range inventory.Entries {
+		entry := &inventory.Entries[i]
+		if entry.Type != EntryFolder {
+			continue
+		}
+		device, inode, err := repository.RootedFolderIdentity(root, entry.RelativePath)
+		if err != nil {
+			return fmt.Errorf("observe folder identity %q: %w", entry.RelativePath, err)
+		}
+		entry.FolderDevice, entry.FolderInode = device, inode
+	}
+	return nil
+}
+
 func buildSnapshot(
 	inventory Inventory,
 	previous localindex.Snapshot,
@@ -133,6 +167,8 @@ func buildSnapshot(
 	moveCandidates []string,
 	trustedNewFolders []string,
 	trustedRemoteFolders map[string]uuid.UUID,
+	trustedRemoteFolderMoves map[string]string,
+	trustedRemoteFolderDeletes map[string]uuid.UUID,
 	generator func() (uuid.UUID, error),
 ) (localindex.Snapshot, []Issue, error) {
 	issues := append([]Issue(nil), inventory.Issues...)
@@ -157,7 +193,7 @@ func buildSnapshot(
 	}
 	folderObjects, folderIssues, err := reconcileFolders(
 		folderEntries, previousFolders, inventory, previous,
-		allowInitialFolders, recoveryMode, moveCandidates, trustedNewFolders, trustedRemoteFolders, generator,
+		allowInitialFolders, recoveryMode, moveCandidates, trustedNewFolders, trustedRemoteFolders, trustedRemoteFolderMoves, trustedRemoteFolderDeletes, generator,
 	)
 	if err != nil {
 		return localindex.Snapshot{}, nil, err
@@ -227,6 +263,8 @@ func reconcileFolders(
 	moveCandidates []string,
 	trustedNewFolders []string,
 	trustedRemoteFolders map[string]uuid.UUID,
+	trustedRemoteFolderMoves map[string]string,
+	trustedRemoteFolderDeletes map[string]uuid.UUID,
 	generator func() (uuid.UUID, error),
 ) (map[string]localindex.Object, []Issue, error) {
 	_ = allowInitial // The caller-level initialize/open split proves index provenance.
@@ -237,6 +275,20 @@ func reconcileFolders(
 	currentSignatures := currentFolderSignatures(inventory)
 	previousSignatures := indexedFolderSignatures(previousSnapshot)
 	forcedMoves := inferWatcherMoves(previous, current, previousSignatures, currentSignatures, moveCandidates)
+	for source, target := range trustedRemoteFolderMoves {
+		if source == target || previous[source].ID == uuid.Nil || current[target].RelativePath == "" {
+			return nil, nil, errors.New("invalid verified remote folder move")
+		}
+		for oldPath := range previous {
+			if oldPath != source && !strings.HasPrefix(oldPath, source+"/") {
+				continue
+			}
+			movedPath := target + strings.TrimPrefix(oldPath, source)
+			if _, exists := current[movedPath]; exists {
+				forcedMoves[oldPath] = movedPath
+			}
+		}
+	}
 	forcedTargets := make(map[string]struct{}, len(forcedMoves)+len(trustedRemoteFolders))
 	for _, target := range forcedMoves {
 		forcedTargets[target] = struct{}{}
@@ -261,19 +313,34 @@ func reconcileFolders(
 		currentEdges[currentPath][oldPath] = struct{}{}
 	}
 
+	for source, id := range trustedRemoteFolderDeletes {
+		if previous[source].ID != id || id == uuid.Nil {
+			return nil, nil, errors.New("invalid verified remote folder delete")
+		}
+	}
 	for oldPath, old := range previous {
+		trustedDelete := false
+		for source := range trustedRemoteFolderDeletes {
+			if oldPath == source || strings.HasPrefix(oldPath, source+"/") {
+				trustedDelete = true
+				break
+			}
+		}
+		if trustedDelete {
+			continue
+		}
 		if forcedTarget, forced := forcedMoves[oldPath]; forced {
 			addEdge(oldPath, forcedTarget)
 			continue
 		}
-		for currentPath := range current {
+		for currentPath, observed := range current {
 			if _, forcedTarget := forcedTargets[currentPath]; forcedTarget {
 				continue
 			}
+			observationMatches := old.FolderDevice == observed.FolderDevice && old.FolderInode == observed.FolderInode
 			exactReliablePath := oldPath == currentPath && old.IdentityState != localindex.IdentityPending
-			structureMatches := previousSignatures[oldPath] != "" &&
-				previousSignatures[oldPath] == currentSignatures[currentPath]
-			if exactReliablePath || structureMatches {
+			structureMatches := previousSignatures[oldPath] != "" && previousSignatures[oldPath] == currentSignatures[currentPath]
+			if observationMatches && (exactReliablePath || structureMatches) {
 				addEdge(oldPath, currentPath)
 			}
 		}
@@ -362,6 +429,9 @@ func reconcileFolders(
 	// exist. A plain deletion with no replacement candidate remains a deletion.
 	if len(unresolvedCurrent) > 0 {
 		for _, oldPath := range unresolvedOld {
+			if _, deleted := trustedRemoteFolderDeletes[oldPath]; deleted {
+				continue
+			}
 			old := previous[oldPath]
 			old.IdentityState = localindex.IdentityPending
 			objects[oldPath] = old

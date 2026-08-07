@@ -80,6 +80,38 @@ func CreateRootedFolderPublication(root, stageRelative string, nonce [32]byte) (
 	return uint64(stat.Dev), stat.Ino, nil
 }
 
+func RootedFolderIdentity(root, relative string) (uint64, uint64, error) {
+	parent, base, err := openRootedParent(root, relative)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer unix.Close(parent)
+	fd, err := unix.Openat(parent, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return 0, 0, err
+	}
+	if uint64(stat.Dev) > math.MaxInt64 || stat.Ino > math.MaxInt64 {
+		return 0, 0, errors.New("folder identity exceeds SQLite range")
+	}
+	return uint64(stat.Dev), stat.Ino, nil
+}
+
+func VerifyRootedFolderIdentity(root, relative string, device, inode uint64) error {
+	currentDevice, currentInode, err := RootedFolderIdentity(root, relative)
+	if err != nil {
+		return err
+	}
+	if currentDevice != device || currentInode != inode {
+		return errors.New("folder inode mismatch")
+	}
+	return nil
+}
+
 func VerifyRootedFolderPublication(root, relative string, nonce [32]byte, device, inode uint64) error {
 	parent, base, err := openRootedParent(root, relative)
 	if err != nil {

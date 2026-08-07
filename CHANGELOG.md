@@ -21,9 +21,9 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen und paginierten Cursor-Pull.
-- Lokaler Index v3 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor und persistenten Apply-/Folder-Publikationsjournalen.
+- Lokaler Index v4 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor und persistenten Folder-Publikations-/Mutationsjournalen.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
-- Crash-resumierbarer Remote-Apply für Notiz-CRUD und identitätsgebundene, verschachtelte Folder-Creates ohne permanente Marker.
+- Crash-resumierbarer Remote-Apply für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen ohne permanente Marker.
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
 - Expliziter Bootstrap für bestehende v1-Roots und UUIDv4-kompatible Sync-Objektidentitäten.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
@@ -40,7 +40,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 ### Known limitations
 
 - Noch keine öffentliche Registrierung, Recovery oder Kontolöschung.
-- Folder-Move/-Delete fehlen weiterhin; Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen.
+- Konfliktmaterialisierung, Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
 - Windows- und Linux-Desktop-Builds wurden noch nicht real auf Zielgeräten geprüft.

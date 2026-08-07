@@ -6,6 +6,12 @@ import "errors"
 
 var errFolderPublicationUnsupported = errors.New("handle-safe folder publication is not supported on Windows")
 
+func RootedFolderIdentity(string, string) (uint64, uint64, error) {
+	return 0, 0, errFolderPublicationUnsupported
+}
+func VerifyRootedFolderIdentity(string, string, uint64, uint64) error {
+	return errFolderPublicationUnsupported
+}
 func CreateRootedFolderPublication(string, string, [32]byte) (uint64, uint64, error) {
 	return 0, 0, errFolderPublicationUnsupported
 }
@@ -19,3 +25,9 @@ func CleanupRootedFolderPublication(string, string, [32]byte, uint64, uint64) er
 	return errFolderPublicationUnsupported
 }
 func RemoveRootedFolderPublicationStage(string, string) error { return errFolderPublicationUnsupported }
+func MoveRootedFolderExpected(string, string, string, uint64, uint64) error {
+	return errFolderPublicationUnsupported
+}
+func DeleteRootedFolderExpected(string, string, uint64, uint64) error {
+	return errFolderPublicationUnsupported
+}

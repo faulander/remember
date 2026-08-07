@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -46,6 +46,8 @@ type Object struct {
 	CollisionPath string
 	ParentID      uuid.UUID
 	ContentHash   []byte
+	FolderDevice  uint64
+	FolderInode   uint64
 	IdentityState IdentityState
 }
 
@@ -195,13 +197,17 @@ func ReplaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot Snapshot) error
 		if len(object.ContentHash) != 0 {
 			hash = object.ContentHash
 		}
+		var device, inode any
+		if object.FolderDevice != 0 || object.FolderInode != 0 {
+			device, inode = object.FolderDevice, object.FolderInode
+		}
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO objects (
 				object_id, object_type, relative_path, collision_path,
-				parent_id, content_hash, identity_state
-			) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				parent_id, content_hash, folder_device, folder_inode, identity_state
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			object.ID.String(), object.Type, object.RelativePath, object.CollisionPath,
-			parent, hash, object.IdentityState,
+			parent, hash, device, inode, object.IdentityState,
 		)
 		if err != nil {
 			return fmt.Errorf("insert indexed object %q: %w", object.RelativePath, err)
@@ -256,7 +262,7 @@ func (i *Index) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 	var snapshot Snapshot
 	rows, err := tx.QueryContext(ctx, `
 		SELECT object_id, object_type, relative_path, collision_path,
-		       parent_id, content_hash, identity_state
+		       parent_id, content_hash, folder_device, folder_inode, identity_state
 		FROM objects ORDER BY relative_path`)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("query indexed objects: %w", err)
@@ -265,8 +271,9 @@ func (i *Index) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		var object Object
 		var id string
 		var parent sql.NullString
+		var device, inode sql.NullInt64
 		if err := rows.Scan(&id, &object.Type, &object.RelativePath, &object.CollisionPath,
-			&parent, &object.ContentHash, &object.IdentityState); err != nil {
+			&parent, &object.ContentHash, &device, &inode, &object.IdentityState); err != nil {
 			rows.Close()
 			return Snapshot{}, fmt.Errorf("scan indexed object: %w", err)
 		}
@@ -274,6 +281,9 @@ func (i *Index) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		if err != nil {
 			rows.Close()
 			return Snapshot{}, fmt.Errorf("parse indexed object id: %w", err)
+		}
+		if device.Valid && inode.Valid {
+			object.FolderDevice, object.FolderInode = uint64(device.Int64), uint64(inode.Int64)
 		}
 		if parent.Valid {
 			object.ParentID, err = uuid.Parse(parent.String)

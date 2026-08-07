@@ -144,24 +144,21 @@ func TestRunDoesNotReuseExactPathAfterRenameAndRecreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ambiguous int
-	for _, issue := range report.Issues {
-		if issue.Code == IssueAmbiguousFolderIdentity {
-			ambiguous++
-		}
-	}
-	if ambiguous != 2 {
-		t.Fatalf("ambiguous issues = %#v, want Old and New", report.Issues)
+	if len(report.Issues) != 0 {
+		t.Fatalf("issues=%#v", report.Issues)
 	}
 	snapshot, err := index.ReadSnapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending := objectAt(t, snapshot, "Old")
-	if pending.ID != folderID || pending.IdentityState != localindex.IdentityPending {
-		t.Errorf("old identity was attached to recreated folder: %#v", pending)
+	moved := objectAt(t, snapshot, "New")
+	if moved.ID != folderID || moved.IdentityState != localindex.IdentityKnown {
+		t.Fatalf("moved identity=%#v", moved)
 	}
-	assertNoObjectAt(t, snapshot, "New")
+	replacement := objectAt(t, snapshot, "Old")
+	if replacement.ID == folderID || replacement.IdentityState != localindex.IdentityNew {
+		t.Fatalf("replacement inherited old identity: %#v", replacement)
+	}
 }
 
 func TestRunDoesNotChooseBetweenCopiedFolderCandidates(t *testing.T) {
@@ -600,6 +597,35 @@ func TestRunRejectsUnverifiedTrustedRemoteFolder(t *testing.T) {
 	index := openTestIndex(t, ctx, root)
 	if _, err := Run(ctx, root, index, Options{TrustedRemoteFolders: map[string]uuid.UUID{"Remote": uuid.New()}}); err == nil {
 		t.Fatal("path-only remote folder trust accepted")
+	}
+}
+
+func TestRunDoesNotTrustLegacyFolderWithoutInodeObservation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "Legacy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	index := openTestIndex(t, ctx, root)
+	legacyID := uuid.New()
+	if err := index.ReplaceSnapshot(ctx, localindex.Snapshot{Objects: []localindex.Object{{ID: legacyID, Type: localindex.ObjectFolder, RelativePath: "Legacy", CollisionPath: "legacy", IdentityState: localindex.IdentityKnown}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, root, index, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range snapshot.Objects {
+		if object.ID == legacyID && object.IdentityState == localindex.IdentityKnown {
+			t.Fatalf("legacy path-only identity was trusted: %#v", object)
+		}
+	}
+	store, _ := clientsync.NewStore(index)
+	if pending, err := store.ListPending(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("ambiguous legacy identity emitted sync intent: %#v err=%v", pending, err)
 	}
 }
 

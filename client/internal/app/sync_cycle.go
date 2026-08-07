@@ -119,7 +119,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 				return remotehttp.ErrInvalidResponse
 			}
 			if change.ObjectType == clientsync.Folder {
-				if change.Mutation != clientsync.Create || change.Deleted || len(change.BlobHash) != 0 || change.Revision != 1 {
+				validMutation := change.Mutation == clientsync.Create || change.Mutation == clientsync.Move || change.Mutation == clientsync.Delete
+				validRevision := change.Mutation == clientsync.Create && change.Revision == 1 || change.Mutation != clientsync.Create && change.Revision >= 2
+				if !validMutation || !validRevision || change.Deleted != (change.Mutation == clientsync.Delete) || len(change.BlobHash) != 0 {
 					return ErrUnsupportedPullPage
 				}
 			} else if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update && change.Mutation != clientsync.Move && change.Mutation != clientsync.Delete) {

@@ -456,6 +456,37 @@ func TestFolderPublicationTransitionIsAtomicAndImmutable(t *testing.T) {
 	}
 }
 
+func TestFolderMutationBindingIsImmutable(t *testing.T) {
+	ctx := context.Background()
+	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	defer index.Close()
+	store, _ := NewStore(index)
+	planID, createOp, moveOp, folderID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.New()
+	if err := store.CreateApplyPlan(ctx, ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 2, Steps: []Change{
+		{Cursor: 1, OperationID: createOp, ObjectID: folderID, Mutation: Create, ObjectType: Folder, Revision: 1, Name: "Folder"},
+		{Cursor: 2, OperationID: moveOp, ObjectID: folderID, Mutation: Move, ObjectType: Folder, Revision: 2, Name: "Moved"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	binding := FolderMutation{PlanID: planID, StepIndex: 1, FolderID: folderID, Mutation: Move, SourceRelative: "Folder", TargetRelative: "Moved", Device: 11, Inode: 12}
+	if err := store.PutFolderMutation(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutFolderMutation(ctx, binding); err == nil {
+		t.Fatal("duplicate folder mutation accepted")
+	}
+	got, err := store.FolderMutation(ctx, planID, 1)
+	if err != nil || got == nil || *got != binding {
+		t.Fatalf("binding=%#v err=%v", got, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE apply_folder_mutations SET inode=99 WHERE plan_id=?`, planID.String())
+		return err
+	}); err == nil {
+		t.Fatal("folder mutation binding mutated")
+	}
+}
+
 func TestApplyPlanRejectsCursorGaps(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

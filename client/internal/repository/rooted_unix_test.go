@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -46,6 +47,85 @@ func TestFolderPublicationBindsNonceInodeAndCleansMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "Folder", folderNonceMarker)); !os.IsNotExist(err) {
 		t.Fatalf("marker remains: %v", err)
+	}
+}
+
+func TestMoveRootedFolderExpectedBindsInodeAndResumes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "A", "Folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "A", "Folder", "N.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "B"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "A/Folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveRootedFolderExpected(root, "A/Folder", "B/Moved", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRootedFolderIdentity(root, "B/Moved", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveRootedFolderExpected(root, "A/Folder", "B/Moved", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "A", "Folder")); !os.IsNotExist(err) {
+		t.Fatalf("source remains: %v", err)
+	}
+}
+
+func TestMoveRootedFolderExpectedEmptyDeleteRejectsContent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "Folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Folder", "local.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".remember", "trash", "folders"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "Folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteRootedFolderExpected(root, "Folder", device, inode); err == nil {
+		t.Fatal("non-empty folder deleted")
+	}
+	if err := VerifyRootedFolderIdentity(root, "Folder", device, inode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteRootedFolderExpectedRejectsConcurrentContent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "Folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "Folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookBeforeRootedFolderDelete = func() {
+		testHookBeforeRootedFolderDelete = nil
+		entries, _ := os.ReadDir(root)
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), folderMoveRecoveryPrefix) {
+				_ = os.WriteFile(filepath.Join(root, entry.Name(), "late.txt"), []byte("keep"), 0o644)
+			}
+		}
+	}
+	defer func() { testHookBeforeRootedFolderDelete = nil }()
+	if err := DeleteRootedFolderExpected(root, "Folder", device, inode); err == nil {
+		t.Fatal("concurrent folder content was deleted")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Folder", "late.txt")); err != nil || string(got) != "keep" {
+		t.Fatalf("late content=%q err=%v", got, err)
 	}
 }
 

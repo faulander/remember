@@ -307,7 +307,7 @@ func TestSyncOnceRetriesAmbiguousAttemptWithSameOperationAndBlobFirst(t *testing
 	}
 }
 
-func TestSyncOnceRejectsFolderMoveBeforePersistingPlan(t *testing.T) {
+func TestSyncOnceRejectsFolderUpdateBeforePersistingPlan(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	core, _, err := Initialize(ctx, root)
@@ -315,7 +315,7 @@ func TestSyncOnceRejectsFolderMoveBeforePersistingPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer core.Close()
-	remote := &cycleRemote{pull: remotehttp.PullPage{Changes: []clientsync.Change{{Cursor: 1, Mutation: clientsync.Move, OperationID: uuid.Must(uuid.NewV7()), ObjectID: uuid.New(), ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}, NextCursor: 1}}
+	remote := &cycleRemote{pull: remotehttp.PullPage{Changes: []clientsync.Change{{Cursor: 1, Mutation: clientsync.Update, OperationID: uuid.Must(uuid.NewV7()), ObjectID: uuid.New(), ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}, NextCursor: 1}}
 	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnsupportedPullPage) {
 		t.Fatalf("error=%v", err)
 	}
