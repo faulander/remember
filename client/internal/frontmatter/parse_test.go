@@ -170,6 +170,24 @@ func TestEnsureIdentityLeavesExistingIdentityByteExact(t *testing.T) {
 	}
 }
 
+func TestMaterializeConflictCopyRekeysAndRecordsOrigin(t *testing.T) {
+	original, conflictID, operationID := uuid.New(), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	input := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + original.String() + "\"\n  custom: keep\n---\nbody\n")
+	output, err := MaterializeConflictCopy(input, original, conflictID, ConflictOrigin{OriginalNoteID: original, OperationID: operationID, Reason: "base_revision_mismatch", OriginalTarget: "N.md", BaseRevision: 1, CanonicalRevision: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := Inspect(output)
+	if err != nil || inspection.NoteID != conflictID {
+		t.Fatalf("inspection=%#v err=%v", inspection, err)
+	}
+	for _, expected := range []string{"custom: keep", "original_note_id: \"" + original.String() + "\"", "operation_id: \"" + operationID.String() + "\"", "reason: base_revision_mismatch", "body"} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Fatalf("missing %q in %s", expected, output)
+		}
+	}
+}
+
 func TestEnsureIdentityRefusesInvalidSource(t *testing.T) {
 	t.Parallel()
 

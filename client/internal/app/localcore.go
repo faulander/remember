@@ -141,6 +141,11 @@ func Open(ctx context.Context, root string) (*LocalCore, reconcile.Report, error
 		rootLock.Unlock()
 		return nil, reconcile.Report{}, storeErr
 	}
+	if err := core.stageSupportedConflicts(ctx, store); err != nil {
+		index.Close()
+		rootLock.Unlock()
+		return nil, reconcile.Report{}, err
+	}
 	if err := core.cleanupCompletedFolderPublications(ctx, store); err != nil {
 		index.Close()
 		rootLock.Unlock()

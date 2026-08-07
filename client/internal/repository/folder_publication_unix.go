@@ -17,7 +17,9 @@ const folderNonceMarker = ".remember-apply-nonce"
 
 func validFolderStage(relative string) bool {
 	parts := strings.Split(relative, "/")
-	if len(parts) != 5 || parts[0] != ".remember" || parts[1] != "apply" || parts[2] != "folders" {
+	applyStage := len(parts) == 5 && parts[0] == ".remember" && parts[1] == "apply" && parts[2] == "folders"
+	conflictStage := len(parts) == 4 && parts[0] == ".remember" && parts[1] == "conflicts" && parts[2] == "folders"
+	if !applyStage && !conflictStage {
 		return false
 	}
 	for _, part := range parts[3:] {

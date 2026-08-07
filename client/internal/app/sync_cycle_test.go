@@ -1,11 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/faulander/remember/client/internal/clientsync"
@@ -19,9 +21,13 @@ type memorySyncServer struct {
 	results map[uuid.UUID]clientsync.Result
 	states  map[uuid.UUID]clientsync.Change
 	changes []clientsync.Change
+	pullErr error
+	maxPull int
 }
 
 type memoryRemote struct{ server *memorySyncServer }
+
+func ptrUUID(id uuid.UUID) *uuid.UUID { return &id }
 
 func (r *memoryRemote) PutBlob(_ context.Context, h [32]byte, b []byte) error {
 	if sha256.Sum256(b) != h {
@@ -42,6 +48,24 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		return result, nil
 	}
 	state := r.server.states[m.ObjectID]
+	if m.Kind != clientsync.Create && state.Revision != m.BaseRevision {
+		if _, exists := r.server.states[clientsync.ConflictRootID]; !exists {
+			for _, reserved := range []clientsync.Change{
+				{ObjectID: clientsync.ConflictRootID, ObjectType: clientsync.Folder, Revision: 1, Name: clientsync.ConflictRootName},
+				{ObjectID: clientsync.ConflictRecoveredID, ObjectType: clientsync.Folder, Revision: 1, ParentID: ptrUUID(clientsync.ConflictRootID), Name: clientsync.ConflictRecoveredName},
+			} {
+				reserved.Cursor = uint64(len(r.server.changes) + 1)
+				reserved.OperationID = uuid.Must(uuid.NewV7())
+				reserved.Mutation = clientsync.Create
+				r.server.states[reserved.ObjectID] = reserved
+				r.server.changes = append(r.server.changes, reserved)
+			}
+		}
+		canonical := &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
+		result := clientsync.Result{Conflict: "base_revision_mismatch", Canonical: canonical}
+		r.server.results[m.OperationID] = result
+		return result, nil
+	}
 	if m.Kind == clientsync.Create {
 		state = clientsync.Change{ObjectID: m.ObjectID, ObjectType: m.ObjectType, Revision: 1, ParentID: m.ParentID, Name: m.Name, BlobHash: append([]byte(nil), m.BlobHash...)}
 	} else {
@@ -66,7 +90,15 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 	return result, nil
 }
 func (r *memoryRemote) Pull(_ context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
+	if r.server.pullErr != nil {
+		err := r.server.pullErr
+		r.server.pullErr = nil
+		return remotehttp.PullPage{}, err
+	}
 	page := remotehttp.PullPage{NextCursor: after}
+	if r.server.maxPull > 0 && limit > r.server.maxPull {
+		limit = r.server.maxPull
+	}
 	for _, change := range r.server.changes {
 		if change.Cursor > after && len(page.Changes) < limit {
 			page.Changes = append(page.Changes, change)
@@ -126,6 +158,85 @@ func TestSyncOnceConvergesTwoRootsForRootNoteCreateUpdate(t *testing.T) {
 	cursorB, _ := storeB.ConfirmedCursor(ctx)
 	if cursorA != 2 || cursorB != 2 {
 		t.Fatalf("cursors=%d/%d", cursorA, cursorB)
+	}
+}
+
+func TestSyncOnceMaterializesConcurrentNoteUpdate(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ := a.ReadNote(ctx, "N.md")
+	if _, _, err := a.SaveNote(ctx, "N.md", aDoc.Revision, "canonical\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, _ := b.ReadNote(ctx, "N.md")
+	if _, _, err := b.SaveNote(ctx, "N.md", bDoc.Revision, "local conflict\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	server.maxPull = 1
+	server.pullErr = remotehttp.ErrRetryable
+	if err := b.SyncOnce(ctx, remote); !errors.Is(err, remotehttp.ErrRetryable) {
+		t.Fatalf("interrupted conflict sync err=%v", err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md")); len(matches) != 0 {
+		t.Fatalf("copy published before canonical pull: %v", matches)
+	}
+	stagedDoc, _ := b.ReadNote(ctx, "N.md")
+	if _, _, err := b.SaveNote(ctx, "N.md", stagedDoc.Revision, "newer must not be lost\n", nil); !errors.Is(err, ErrConflictMaterializationActive) {
+		t.Fatalf("edit during materialization err=%v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := b.ReadNote(ctx, "N.md")
+	if err != nil || canonical.ID != doc.ID || !strings.Contains(canonical.Body, "canonical") {
+		t.Fatalf("canonical=%#v err=%v", canonical, err)
+	}
+	matches, err := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("conflict copies=%v err=%v", matches, err)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("local conflict")) || !bytes.Contains(copyBytes, []byte("base_revision_mismatch")) {
+		t.Fatalf("copy=%q err=%v", copyBytes, err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := server.states[clientsync.ConflictRecoveredID]; !exists {
+		t.Fatal("reserved conflict namespace not synchronized")
 	}
 }
 

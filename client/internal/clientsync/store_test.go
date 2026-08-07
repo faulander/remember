@@ -172,6 +172,62 @@ func TestConflictAndReplayMismatchPersistence(t *testing.T) {
 	}
 }
 
+func TestConflictMaterializationTransitionsUnblockIntent(t *testing.T) {
+	ctx := context.Background()
+	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	defer index.Close()
+	store, _ := NewStore(index)
+	op := uuid.Must(uuid.NewV7())
+	object := uuid.New()
+	hash := sha256.Sum256([]byte("x"))
+	mutation := Mutation{OperationID: op, Kind: Create, ObjectID: object, ObjectType: Note, Name: "N.md", BlobHash: hash[:]}
+	if err := store.Enqueue(ctx, []Mutation{mutation}); err != nil {
+		t.Fatal(err)
+	}
+	dependentOp := uuid.Must(uuid.NewV7())
+	dependency := op
+	if err := store.Enqueue(ctx, []Mutation{{OperationID: dependentOp, Kind: Create, ObjectID: uuid.New(), ObjectType: Folder, Name: "Dependent", DependencyOperationID: &dependency}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResult(ctx, op, Result{Conflict: "base_revision_mismatch", Canonical: &CanonicalState{ObjectType: Note, Revision: 2, Name: "N.md", BlobHash: hash[:]}}); err != nil {
+		t.Fatal(err)
+	}
+	copyID := uuid.Must(uuid.NewV7())
+	materialized := sha256.Sum256([]byte("copy"))
+	m := ConflictMaterialization{OperationID: op, SourceObjectID: object, ConflictNoteID: copyID, OriginalRelative: "N.md", TargetRelative: "_Konflikte/Wiederhergestellt/" + ConflictFileName("N.md", op), SourceHash: hash, MaterializedHash: materialized, StagedRelative: ".remember/conflicts/materializations/" + op.String() + ".md", State: "prepared"}
+	if err := store.PutConflictMaterialization(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || !unresolved {
+		t.Fatalf("prepared unresolved=%t err=%v", unresolved, err)
+	}
+	if err := store.MarkConflictCopyStaged(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("staged unresolved=%t err=%v", unresolved, err)
+	}
+	var dependentStatus string
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT status FROM sync_outbox WHERE operation_id=?`, dependentOp.String()).Scan(&dependentStatus)
+	}); err != nil || dependentStatus != "superseded" {
+		t.Fatalf("dependent status=%q err=%v", dependentStatus, err)
+	}
+	if staged, err := store.StagedConflictMaterializations(ctx); err != nil || len(staged) != 1 || staged[0].ConflictNoteID != copyID {
+		t.Fatalf("staged=%#v err=%v", staged, err)
+	}
+	if err := store.MarkConflictCopyPublished(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteConflictMaterialization(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ConflictMaterialization(ctx, op)
+	if err != nil || got == nil || got.State != "completed" {
+		t.Fatalf("materialization=%#v err=%v", got, err)
+	}
+}
+
 func TestMutationShapesDependenciesAndCursorAreFailClosed(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

@@ -44,6 +44,12 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err != nil {
 		return err
 	}
+	if err := c.stageSupportedConflicts(ctx, store); err != nil {
+		return err
+	}
+	if err := c.publishStagedConflicts(ctx, store); err != nil {
+		return err
+	}
 	if err := c.cleanupCompletedFolderPublications(ctx, store); err != nil {
 		return err
 	}
@@ -90,6 +96,11 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		}
 		if err := store.RecordResult(ctx, item.Mutation.OperationID, result); err != nil {
 			return err
+		}
+		if !result.Accepted {
+			if err := c.stageSupportedConflicts(ctx, store); err != nil {
+				return err
+			}
 		}
 	}
 	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil {
@@ -139,6 +150,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			return err
 		}
 		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
+			return err
+		}
+		if err := c.publishStagedConflicts(ctx, store); err != nil {
 			return err
 		}
 		if !page.HasMore {

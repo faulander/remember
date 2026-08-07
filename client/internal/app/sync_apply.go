@@ -440,7 +440,7 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 				return step, errors.New("folder publication target mismatch")
 			}
 			step.folderPublication = publication
-		} else if existing, ok := objects[change.ObjectID]; ok && existing.Type == localindex.ObjectFolder && existing.RelativePath == target && change.State == "applied" {
+		} else if existing, ok := objects[change.ObjectID]; ok && existing.Type == localindex.ObjectFolder && existing.RelativePath == target && (change.State == "applied" || clientsync.IsReservedConflictFolder(change.ObjectID)) {
 			step.locallyApplied = true
 			step.folderPublication = &clientsync.FolderPublication{PlanID: planID, StepIndex: index, FolderID: change.ObjectID, TargetRelative: target, CleanupAuthorized: true, Device: existing.FolderDevice, Inode: existing.FolderInode}
 		} else {
@@ -583,7 +583,10 @@ func (c *LocalCore) prepareFolderPublication(ctx context.Context, store *clients
 func (c *LocalCore) applyFolderCreateStep(ctx context.Context, store *clientsync.Store, planID uuid.UUID, step preparedNoteStep) error {
 	publication := step.folderPublication
 	if step.locallyApplied {
-		return nil
+		if step.change.State == "applied" {
+			return nil
+		}
+		return store.MarkApplyStepApplied(ctx, planID, step.index)
 	}
 	if publication.CleanupAuthorized {
 		return repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode)

@@ -142,6 +142,9 @@ func (c *LocalCore) SaveNote(ctx context.Context, relative, expectedRevision, bo
 	if err != nil {
 		return NoteDocument{}, reconcile.Report{}, err
 	}
+	if err := c.rejectActiveNoteConflict(ctx, editable.NoteID); err != nil {
+		return NoteDocument{}, reconcile.Report{}, err
+	}
 	content, err := frontmatter.UpdateEditable(original, editable.NoteID, []byte(body), tags)
 	if err != nil {
 		return NoteDocument{}, reconcile.Report{}, err
@@ -186,6 +189,9 @@ func (c *LocalCore) MoveNote(ctx context.Context, sourceRelative, destinationRel
 	}
 	if editable.NoteID == uuid.Nil {
 		return NoteDocument{}, reconcile.Report{}, errors.New("note has no stable identity")
+	}
+	if err := c.rejectActiveNoteConflict(ctx, editable.NoteID); err != nil {
+		return NoteDocument{}, reconcile.Report{}, err
 	}
 	destination, err := c.resolveNewNote(destinationRelative, filepath.ToSlash(sourceRelative))
 	if err != nil {
@@ -237,6 +243,9 @@ func (c *LocalCore) DeleteNote(ctx context.Context, relative, expectedRevision s
 	}
 	if document.NoteID == uuid.Nil {
 		return reconcile.Report{}, errors.New("note has no stable identity")
+	}
+	if err := c.rejectActiveNoteConflict(ctx, document.NoteID); err != nil {
+		return reconcile.Report{}, err
 	}
 	if err := repository.EnsureRootedDirectory(c.root, ".remember/trash", 0o700); err != nil {
 		return reconcile.Report{}, fmt.Errorf("%w: create secure note trash: %v", ErrInvalidNotePath, err)

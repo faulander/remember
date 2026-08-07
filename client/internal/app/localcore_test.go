@@ -319,6 +319,40 @@ func TestExecuteActiveApplyPlanDoesNotBlessReplacementAfterFolderMove(t *testing
 	}
 }
 
+func TestConflictNamespaceDoesNotTrustReplacedRoot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	testHookBeforeConflictRecoveredPublication = func() {
+		testHookBeforeConflictRecoveredPublication = nil
+		if err := os.Rename(filepath.Join(root, clientsync.ConflictRootName), filepath.Join(root, "PublishedConflictRoot")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Mkdir(filepath.Join(root, clientsync.ConflictRootName), 0o755); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { testHookBeforeConflictRecoveredPublication = nil }()
+	if err := core.ensureLocalConflictNamespace(ctx, store); err == nil {
+		t.Fatal("replaced conflict root was trusted")
+	}
+	snapshot, err := core.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range snapshot.Objects {
+		if object.ID == clientsync.ConflictRecoveredID {
+			t.Fatalf("recovered folder was bound below replacement: %#v", object)
+		}
+	}
+}
+
 func TestExecuteActiveApplyPlanCreatesNestedFoldersThenNote(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

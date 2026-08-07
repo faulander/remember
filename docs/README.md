@@ -27,5 +27,6 @@
 | [0014](adr/0014-m2-folder-move-delete-apply.md) | Inode-gebundener Folder-Move/-Delete-Apply |
 | [0015](adr/0015-m2-conflict-canonical-state.md) | Authentifizierter kanonischer Zustand bei Sync-Konflikten |
 | [0016](adr/0016-m2-reserved-conflict-namespace.md) | Server-provisionierter reservierter Konfliktbereich |
+| [0017](adr/0017-m2-note-update-conflict-materialization.md) | Crash-sichere Materialisierung konkurrierender Notiz-Updates |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
