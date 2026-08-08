@@ -505,7 +505,13 @@ func stagedConflictDeferredChange(ctx context.Context, store *clientsync.Store, 
 		if err != nil {
 			return nil, err
 		}
-		if kind == clientsync.Update && canonical.Deleted && canonical.Revision > change.Revision || kind == clientsync.Delete && !canonical.Deleted && canonical.Revision >= change.Revision {
+		if kind == clientsync.Move && !canonical.Deleted && canonical.Revision == change.Revision {
+			parentMatches := canonical.ParentID == nil && change.ParentID == nil || canonical.ParentID != nil && change.ParentID != nil && *canonical.ParentID == *change.ParentID
+			if !parentMatches || canonical.Name != change.Name || !bytes.Equal(canonical.BlobHash, change.BlobHash) || change.Deleted {
+				return nil, errors.New("move conflict canonical pull state mismatch")
+			}
+		}
+		if kind == clientsync.Update && canonical.Deleted && canonical.Revision > change.Revision || (kind == clientsync.Delete || kind == clientsync.Move) && !canonical.Deleted && canonical.Revision >= change.Revision {
 			copyItem := item
 			return &copyItem, nil
 		}

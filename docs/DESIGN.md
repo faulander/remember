@@ -652,6 +652,7 @@ Umsetzung von `SYNC-008`:
 - Der serverseitig zuerst akzeptierte Create bleibt am ursprünglichen Pfad.
 - Der verlierende Client evakuiert seine exakten Bytes in technischen Trash und materialisiert sie mit neuer UUID unter Wiederhergestellt.
 - Die Konfliktkopie wird erst sichtbar, wenn der Remote-Gewinner durch Baseline und abgeschlossenen Apply-Schritt authentifiziert ist.
+- Bei einer Note-Move-Kollision wird zusätzlich die Quell-UUID am authentifizierten kanonischen Pfad wiederhergestellt; lokal verschobene und abhängig bearbeitete Bytes werden mit neuer UUID gerettet.
 
 ## 14.3 Löschen gegen Verschieben
 

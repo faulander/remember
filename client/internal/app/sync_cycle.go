@@ -50,7 +50,7 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err := c.cleanupCompletedConflictStages(ctx, store); err != nil {
 		return err
 	}
-	if err := c.publishStagedConflicts(ctx, store); err != nil {
+	if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
 		return err
 	}
 	if err := c.cleanupCompletedFolderPublications(ctx, store); err != nil {
@@ -62,7 +62,7 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
 			return err
 		}
-		if err := c.publishStagedConflicts(ctx, store); err != nil {
+		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
 			return err
 		}
 	}
@@ -109,7 +109,7 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			}
 		}
 	}
-	if err := c.publishStagedConflicts(ctx, store); err != nil {
+	if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
 		return err
 	}
 	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil {
@@ -161,7 +161,7 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
 			return err
 		}
-		if err := c.publishStagedConflicts(ctx, store); err != nil {
+		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
 			return err
 		}
 		if !page.HasMore {

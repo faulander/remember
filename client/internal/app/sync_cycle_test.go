@@ -83,6 +83,17 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		r.server.results[m.OperationID] = result
 		return result, nil
 	}
+	if m.Kind == clientsync.Move {
+		for id, existing := range r.server.states {
+			if id != m.ObjectID && !existing.Deleted && existing.Name == m.Name && ((existing.ParentID == nil && m.ParentID == nil) || (existing.ParentID != nil && m.ParentID != nil && *existing.ParentID == *m.ParentID)) {
+				r.server.ensureConflictNamespace()
+				canonical := &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
+				result := clientsync.Result{Conflict: "path_collision", Canonical: canonical}
+				r.server.results[m.OperationID] = result
+				return result, nil
+			}
+		}
+	}
 	if m.Kind == clientsync.Create {
 		state = clientsync.Change{ObjectID: m.ObjectID, ObjectType: m.ObjectType, Revision: 1, ParentID: m.ParentID, Name: m.Name, BlobHash: append([]byte(nil), m.BlobHash...)}
 	} else {
@@ -538,6 +549,92 @@ func TestSyncOnceMaterializesNoteCreatePathCollision(t *testing.T) {
 	}
 	if rescued := server.states[inspection.NoteID]; rescued.ObjectType != clientsync.Note || rescued.Deleted {
 		t.Fatalf("rescued collision state=%#v", rescued)
+	}
+}
+
+func TestSyncOnceMaterializesNoteMovePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	source, _, err := a.CreateNote(ctx, "Original.md", "canonical source\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	winner, _, err := a.CreateNote(ctx, "Taken.md", "path winner\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, _ := b.ReadNote(ctx, "Original.md")
+	moved, _, err := b.MoveNote(ctx, "Original.md", "Taken.md", bDoc.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Taken.md", moved.Revision, "local moved edit\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	server.pullErr = remotehttp.ErrRetryable
+	if err := b.SyncOnce(ctx, remote); !errors.Is(err, remotehttp.ErrRetryable) {
+		store, _ := clientsync.NewStore(b.index)
+		pending, _ := store.ListPending(ctx, 10)
+		conflicts, _ := store.ListConflicts(ctx, 10)
+		t.Fatalf("interrupted move collision=%v pending=%#v conflicts=%#v", err, pending, conflicts)
+	}
+	canonical, err := b.ReadNote(ctx, "Original.md")
+	if err != nil || canonical.ID != source.ID || !strings.Contains(canonical.Body, "canonical source") {
+		t.Fatalf("restored canonical=%#v err=%v", canonical, err)
+	}
+	if _, err := b.ReadNote(ctx, "Taken.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("attempted target not evacuated: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := b.ReadNote(ctx, "Taken.md")
+	if err != nil || taken.ID != winner.ID {
+		t.Fatalf("path winner=%#v err=%v", taken, err)
+	}
+	copies, _ := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if len(copies) != 1 {
+		t.Fatalf("move collision copies=%v", copies)
+	}
+	copyBytes, _ := os.ReadFile(copies[0])
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil || inspection.NoteID == source.ID || !bytes.Contains(copyBytes, []byte("local moved edit")) {
+		t.Fatalf("move collision copy=%q inspection=%#v err=%v", copyBytes, inspection, err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.ObjectType != clientsync.Note || rescued.Deleted {
+		t.Fatalf("remote rescued move=%#v", rescued)
 	}
 }
 

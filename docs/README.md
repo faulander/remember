@@ -32,5 +32,6 @@
 | [0019](adr/0019-m2-edit-delete-conflict-materialization.md) | Edit-vs-Delete-Konflikte mit Tombstone-Vorrang |
 | [0020](adr/0020-m2-delete-edit-conflict-rebase.md) | Lokaler Delete gegen Remote-Edit mit abhängigem Tombstone-Rebase |
 | [0021](adr/0021-m2-note-create-path-collision.md) | Verlustfreie Note-Create-Pfadkollisionen |
+| [0022](adr/0022-m2-note-move-path-collision.md) | Note-Move-Pfadkollisionen mit kanonischer Wiederherstellung |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

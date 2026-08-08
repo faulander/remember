@@ -9,14 +9,14 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - lokaler macOS-Desktop-Client mit Wails, Go, Svelte 5 und TypeScript
 - echte Markdown-Dateien mit versioniertem YAML-Frontmatter
 - verschachtelte Ordner, Tags, Vorschau, Themes und recoverbares Löschen
-- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete- und Note-Create-Pfadkonfliktkopien
+- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete- und Note-Create/-Move-Pfadkonfliktkopien
 - modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
 - interner Identity-, Sync-, Sessions- und Devices-Core mit server-provisioniertem Konfliktbereich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
 - lokaler Index v8 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konflikt-/Rebase-Journalen und resumierbarem Notiz-/Folder-Apply
 - strikter Client-HTTP-Transport und manueller Vordergrund-Sync für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen
 
-Öffentliche Registrierung, Reminder, weitere Move-/Pfad-/Folder-Konflikte und sichere Client-Tokenablage folgen in späteren Schnitten.
+Öffentliche Registrierung, Reminder, weitere Update-/Folder-Pfadkonflikte und sichere Client-Tokenablage folgen in späteren Schnitten.
 
 ## Repository
 

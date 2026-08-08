@@ -44,11 +44,15 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		if m.ObjectType == clientsync.Note && m.Kind == clientsync.Create && conflict.Code == "path_collision" && conflict.Canonical == nil {
+		if m.ObjectType == clientsync.Note && conflict.Code == "path_collision" && ((m.Kind == clientsync.Create && conflict.Canonical == nil) || (m.Kind == clientsync.Move && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size)) {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
 			}
-			if err := c.stageNoteCreatePathCollision(ctx, store, conflict); err != nil {
+			if m.Kind == clientsync.Create {
+				if err := c.stageNoteCreatePathCollision(ctx, store, conflict); err != nil {
+					return err
+				}
+			} else if err := c.stageNoteMovePathCollision(ctx, store, conflict); err != nil {
 				return err
 			}
 			continue
@@ -259,6 +263,81 @@ func (c *LocalCore) stageNoteCreatePathCollision(ctx context.Context, store *cli
 	return store.MarkConflictCopyStaged(ctx, op)
 }
 
+func (c *LocalCore) stageNoteMovePathCollision(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+	op := conflict.Outbox.Mutation.OperationID
+	materialization, err := store.ConflictMaterialization(ctx, op)
+	if err != nil {
+		return err
+	}
+	if materialization == nil {
+		snapshot, err := c.index.ReadSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		var object localindex.Object
+		found := false
+		for _, candidate := range snapshot.Objects {
+			if candidate.ID == conflict.Outbox.Mutation.ObjectID && candidate.Type == localindex.ObjectNote && candidate.IdentityState == localindex.IdentityKnown {
+				object, found = candidate, true
+				break
+			}
+		}
+		if !found {
+			return errors.New("path-colliding moved note unavailable")
+		}
+		content, err := repository.ReadRooted(c.root, object.RelativePath, clientsync.MaxBlobBytes)
+		if err != nil {
+			return err
+		}
+		sourceHash := sha256.Sum256(content)
+		if err := clientsync.StageNote(c.root, object.RelativePath, sourceHash); err != nil {
+			return err
+		}
+		conflictID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		copyBytes, err := frontmatter.MaterializeConflictCopy(content, object.ID, conflictID, frontmatter.ConflictOrigin{OriginalNoteID: object.ID, OperationID: op, Reason: conflict.Code, OriginalTarget: object.RelativePath, BaseRevision: conflict.Outbox.Mutation.BaseRevision, CanonicalRevision: conflict.Canonical.Revision})
+		if err != nil {
+			return err
+		}
+		if int64(len(copyBytes)) > clientsync.MaxBlobBytes {
+			return errors.New("conflict copy exceeds sync blob limit")
+		}
+		materialization = &clientsync.ConflictMaterialization{OperationID: op, SourceObjectID: object.ID, ConflictNoteID: conflictID, OriginalRelative: object.RelativePath, TargetRelative: clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFileName(path.Base(object.RelativePath), op), SourceHash: sourceHash, MaterializedHash: sha256.Sum256(copyBytes), StagedRelative: ".remember/conflicts/materializations/" + op.String() + ".md", State: "prepared"}
+		if err := store.PutConflictMaterialization(ctx, *materialization); err != nil {
+			return err
+		}
+	}
+	if materialization.State != "prepared" {
+		return nil
+	}
+	source, err := clientsync.ReadStagedNote(c.root, materialization.SourceHash)
+	if err != nil {
+		return err
+	}
+	copyBytes, err := frontmatter.MaterializeConflictCopy(source, materialization.SourceObjectID, materialization.ConflictNoteID, frontmatter.ConflictOrigin{OriginalNoteID: materialization.SourceObjectID, OperationID: op, Reason: conflict.Code, OriginalTarget: materialization.OriginalRelative, BaseRevision: conflict.Outbox.Mutation.BaseRevision, CanonicalRevision: conflict.Canonical.Revision})
+	if err != nil {
+		return err
+	}
+	if sha256.Sum256(copyBytes) != materialization.MaterializedHash {
+		return errors.New("move path collision materialization changed")
+	}
+	if err := repository.EnsureRootedDirectory(c.root, ".remember/conflicts", 0o700); err != nil {
+		return err
+	}
+	if err := repository.EnsureRootedDirectory(c.root, ".remember/conflicts/materializations", 0o700); err != nil {
+		return err
+	}
+	if err := repository.CreateRootedPrivate(c.root, materialization.StagedRelative, copyBytes); err != nil {
+		existing, readErr := repository.ReadRootedPrivate(c.root, materialization.StagedRelative, clientsync.MaxBlobBytes)
+		if readErr != nil || !bytes.Equal(existing, copyBytes) {
+			return err
+		}
+	}
+	return store.MarkConflictCopyStaged(ctx, op)
+}
+
 func (c *LocalCore) stageNoteUpdateConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
 	op := conflict.Outbox.Mutation.OperationID
 	materialization, err := store.ConflictMaterialization(ctx, op)
@@ -441,7 +520,7 @@ func (c *LocalCore) ensurePathCollisionEvacuated(ctx context.Context, item clien
 	}
 	moveErr := repository.MoveRootedExpected(c.root, item.OriginalRelative, trash, expected)
 	if moveErr == nil {
-		_, err = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode})
+		_, err = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{item.SourceObjectID: true}})
 		return err
 	}
 	if !errors.Is(moveErr, os.ErrNotExist) && !errors.Is(moveErr, os.ErrExist) {
@@ -486,7 +565,64 @@ func (c *LocalCore) verifyPathCollisionApplied(ctx context.Context, store *clien
 	return errors.New("remote path-collision winner is absent")
 }
 
-func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsync.Store) error {
+func (c *LocalCore) ensureMoveCollisionCanonical(ctx context.Context, store *clientsync.Store, item clientsync.ConflictMaterialization, canonical clientsync.CanonicalState, resolver clientsync.BlobResolver) (bool, error) {
+	if resolver == nil {
+		return false, nil
+	}
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	directory := ""
+	if canonical.ParentID != nil {
+		found := false
+		for _, object := range snapshot.Objects {
+			if object.ID == *canonical.ParentID && object.Type == localindex.ObjectFolder && object.IdentityState == localindex.IdentityKnown {
+				directory = object.RelativePath
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	target := canonical.Name
+	if directory != "" {
+		target = path.Join(directory, canonical.Name)
+	}
+	if target == item.OriginalRelative {
+		return false, errors.New("move collision canonical path equals attempted path")
+	}
+	content, readErr := repository.ReadRooted(c.root, target, clientsync.MaxBlobBytes)
+	hash := itemHash(canonical.BlobHash)
+	if readErr == nil {
+		inspection, err := frontmatter.Inspect(content)
+		if err != nil || inspection.NoteID != item.SourceObjectID || sha256.Sum256(content) != hash {
+			return false, errors.New("move collision canonical target occupied")
+		}
+	} else {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			return false, readErr
+		}
+		content, err = resolver.ResolveBlob(ctx, hash)
+		if err != nil {
+			return false, err
+		}
+		if int64(len(content)) > clientsync.MaxBlobBytes || sha256.Sum256(content) != hash {
+			return false, errors.New("move collision canonical blob invalid")
+		}
+		if err := repository.CreateRooted(c.root, target, content, validateAppliedNote(item.SourceObjectID)); err != nil {
+			return false, err
+		}
+	}
+	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: map[uuid.UUID][32]byte{item.SourceObjectID: hash}}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsync.Store, resolver clientsync.BlobResolver) error {
 	items, err := store.StagedConflictMaterializations(ctx)
 	if err != nil {
 		return err
@@ -496,9 +632,25 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if err != nil {
 			return err
 		}
-		if kind == clientsync.Create {
+		if kind == clientsync.Create || kind == clientsync.Move {
 			if err := c.ensurePathCollisionEvacuated(ctx, item); err != nil {
 				return err
+			}
+		}
+		if kind == clientsync.Move {
+			canonical, err := store.CanonicalConflictState(ctx, item.OperationID)
+			if err != nil {
+				return err
+			}
+			if canonical == nil {
+				return errors.New("move collision canonical state unavailable")
+			}
+			ready, err := c.ensureMoveCollisionCanonical(ctx, store, item, *canonical, resolver)
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return nil
 			}
 		}
 	}

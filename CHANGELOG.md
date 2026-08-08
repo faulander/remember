@@ -43,7 +43,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Crash-sichere, sichtbare und synchronisierte Konfliktkopien für konkurrierende Notiz-Updates und lokale Edits gegen kanonische Remote-Deletes einschließlich descriptor-gebundener technischer Bereinigung.
 - Edit-vs-Delete-Apply überspringt authentifizierte kanonische Zwischen-Updates/-Moves, erhält die lokalen Bytes im recoverable Trash und nimmt Abstürze über Pull-Seitengrenzen wieder auf.
 - Lokale Deletes gegen Remote-Edits retten zuerst den authentifizierten kanonischen Blob als synchronisierte Konfliktkopie und enqueueen den Tombstone anschließend atomar auf der neuen Revision.
-- Konkurrierende Note-Creates am selben portablen Pfad evakuieren die verlierenden Bytes crash-sicher und materialisieren sie erst nach baseline-gebundener Anwendung des Remote-Gewinners; weitere Konfliktklassen fehlen weiterhin.
+- Konkurrierende Note-Creates am selben portablen Pfad evakuieren die verlierenden Bytes crash-sicher und materialisieren sie erst nach baseline-gebundener Anwendung des Remote-Gewinners.
+- Note-Move-Pfadkollisionen stellen den authentifizierten kanonischen Quellzustand wieder her und retten die lokal verschobenen sowie abhängig bearbeiteten Bytes als synchronisierte Konfliktkopie; weitere Konfliktklassen fehlen weiterhin.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
