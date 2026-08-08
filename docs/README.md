@@ -43,5 +43,6 @@
 | [0030](adr/0030-m2-outbound-folder-intent-binding.md) | Identitätsgebundene lokale Folder-Move/-Delete-Intents |
 | [0031](adr/0031-m2-cold-history-apply-convergence.md) | Kalter History-Apply über Serverneustarts |
 | [0032](adr/0032-m2-paginated-pull-resumption.md) | Dauerhafte Wiederaufnahme zwischen Pull-Seiten |
+| [0033](adr/0033-m2-folder-move-conflict-revert.md) | Identitätsgebundener Revert von Folder-Move-Konflikten |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

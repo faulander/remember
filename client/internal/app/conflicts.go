@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/frontmatter"
@@ -22,6 +23,8 @@ var testHookBeforeConflictRecoveredPublication func()
 var testHookBeforeConflictCompletion func()
 var testHookAfterConflictEvacuation func()
 var testHookAfterConflictFolderPublication func()
+var testHookAfterConflictFolderMoveRevert func()
+var testHookAfterConflictFolderMoveReconcile func()
 
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
@@ -47,6 +50,12 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
+			if err := c.revertFolderMoveConflict(ctx, store, conflict); err != nil {
+				return err
+			}
+			continue
+		}
 		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Delete && conflict.Code == "folder_not_empty" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
@@ -103,6 +112,111 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		}
 	}
 	return nil
+}
+
+func (c *LocalCore) revertFolderMoveConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+	m, canonical := conflict.Outbox.Mutation, conflict.Canonical
+	if canonical.Revision != m.BaseRevision || canonical.BlobHash != nil {
+		return errors.New("folder move conflict canonical state mismatch")
+	}
+	revert, err := store.ConflictFolderMoveRevert(ctx, m.OperationID)
+	if err != nil {
+		return err
+	}
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects[object.ID] = object
+	}
+	attempted, err := remoteNotePath(objects, m.ParentID, m.Name)
+	if err != nil {
+		return err
+	}
+	canonicalPath, err := remoteNotePath(objects, canonical.ParentID, canonical.Name)
+	if err != nil {
+		return err
+	}
+	object, exists := objects[m.ObjectID]
+	if !exists || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.FolderDevice == 0 || object.FolderInode == 0 {
+		return errors.New("moved conflict folder identity unavailable")
+	}
+	if revert == nil {
+		revert = &clientsync.ConflictFolderMoveRevert{OperationID: m.OperationID, FolderID: m.ObjectID, AttemptedRelative: attempted, CanonicalRelative: canonicalPath, Device: object.FolderDevice, Inode: object.FolderInode, State: "prepared"}
+		if err := store.PutConflictFolderMoveRevert(ctx, *revert); err != nil {
+			return err
+		}
+	}
+	if revert.FolderID != m.ObjectID || revert.AttemptedRelative != attempted || revert.CanonicalRelative != canonicalPath || revert.Device != object.FolderDevice || revert.Inode != object.FolderInode {
+		return errors.New("folder move revert identity mismatch")
+	}
+	needsReconcile := object.RelativePath == revert.AttemptedRelative
+	if !needsReconcile && object.RelativePath != revert.CanonicalRelative {
+		return errors.New("folder move revert snapshot path mismatch")
+	}
+	verify := func() error {
+		return repository.VerifyRootedFolderIdentity(c.root, revert.CanonicalRelative, revert.Device, revert.Inode)
+	}
+	if revert.State == "prepared" {
+		if verify() != nil {
+			if !needsReconcile {
+				return errors.New("reverted folder canonical inode unavailable")
+			}
+			if err := repository.VerifyRootedFolderIdentity(c.root, revert.AttemptedRelative, revert.Device, revert.Inode); err != nil {
+				return err
+			}
+			if err := repository.MoveRootedFolderExpected(c.root, revert.AttemptedRelative, revert.CanonicalRelative, revert.Device, revert.Inode); err != nil {
+				return err
+			}
+		}
+		if testHookAfterConflictFolderMoveRevert != nil {
+			testHookAfterConflictFolderMoveRevert()
+		}
+		if needsReconcile {
+			options := reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteFolders: map[uuid.UUID]bool{}, AppliedRemoteFolderPaths: map[uuid.UUID]string{}, AppliedRemoteNotes: map[uuid.UUID][32]byte{}, AppliedRemoteNotePaths: map[uuid.UUID]string{}, TrustedRemoteFolderMoves: map[string]string{revert.AttemptedRelative: revert.CanonicalRelative}, VerifyTrustedRemoteFolders: verify}
+			prefix := revert.AttemptedRelative + "/"
+			for _, before := range snapshot.Objects {
+				if before.RelativePath != revert.AttemptedRelative && !strings.HasPrefix(before.RelativePath, prefix) {
+					continue
+				}
+				target := revert.CanonicalRelative + strings.TrimPrefix(before.RelativePath, revert.AttemptedRelative)
+				if before.Type == localindex.ObjectFolder {
+					options.AppliedRemoteFolders[before.ID] = true
+					options.AppliedRemoteFolderPaths[before.ID] = target
+				} else if len(before.ContentHash) == sha256.Size {
+					var hash [sha256.Size]byte
+					copy(hash[:], before.ContentHash)
+					options.AppliedRemoteNotes[before.ID] = hash
+					options.AppliedRemoteNotePaths[before.ID] = target
+				}
+			}
+			if _, err := reconcile.Run(ctx, c.root, c.index, options); err != nil {
+				return err
+			}
+			if err := verify(); err != nil {
+				return err
+			}
+		}
+		if testHookAfterConflictFolderMoveReconcile != nil {
+			testHookAfterConflictFolderMoveReconcile()
+		}
+		if err := store.MarkConflictFolderMoveReverted(ctx, m.OperationID); err != nil {
+			return err
+		}
+		revert.State = "moved"
+	}
+	if revert.State == "moved" {
+		if err := verify(); err != nil {
+			return err
+		}
+		if err := store.CompleteConflictFolderMoveRevert(ctx, m.OperationID); err != nil {
+			return err
+		}
+		revert.State = "completed"
+	}
+	return verify()
 }
 
 func (c *LocalCore) restoreFolderNotEmptyConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {

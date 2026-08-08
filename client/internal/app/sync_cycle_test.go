@@ -846,6 +846,100 @@ func TestSyncOnceTreatsMissingRemoteDeleteAsSatisfied(t *testing.T) {
 	}
 }
 
+func TestSyncOnceRevertsFolderMovePathCollisionAndKeepsChildEdit(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Source"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := a.CreateNote(ctx, "Source/N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "Winner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "Source"), filepath.Join(rootB, "Winner")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := b.ReadNote(ctx, "Winner/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Winner/N.md", doc.Revision, "edited after move\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderMoveReconcile = func() {
+		testHookAfterConflictFolderMoveReconcile = nil
+		panic("simulated folder move revert reconcile crash")
+	}
+	defer func() { testHookAfterConflictFolderMoveReconcile = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected folder move revert reconcile crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := b.ReadNote(ctx, "Source/N.md")
+	if err != nil || restored.ID != note.ID || !strings.Contains(restored.Body, "edited after move") {
+		t.Fatalf("restored child=%#v err=%v", restored, err)
+	}
+	if info, err := os.Stat(filepath.Join(rootB, "Winner")); err != nil || !info.IsDir() {
+		t.Fatalf("remote winner folder=%v err=%v", info, err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("folder move conflict unresolved=%t err=%v", unresolved, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	remoteEdit, err := a.ReadNote(ctx, "Source/N.md")
+	if err != nil || !strings.Contains(remoteEdit.Body, "edited after move") {
+		t.Fatalf("remote child edit=%#v err=%v", remoteEdit, err)
+	}
+}
+
 func TestSyncOnceRescuesNoteCreateUnderUnavailableParent(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
