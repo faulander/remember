@@ -49,7 +49,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Deletes gegen bereits fehlende Remote-Objekte werden ohne künstlichen Tombstone dauerhaft als `already_deleted` aufgelöst.
 - Nach sichtbarer Konfliktveröffentlichung werden vollständige technische Staging- und Evakuierungsbytes descriptor-gebunden getruncated; nur leere crash-idempotente Sentinels bleiben zurück.
 - Finale content-addressed Outbox-Blobs werden nur ohne aktive Replay-/Konfliktreferenz und pro Hash-Wiederverwendung in einer eigenen Sequenzgeneration bereinigt.
-- Lokal gelöschte, serverseitig nichtleere Ordner werden nonce-/inode-gebunden restauriert, bevor ihre Remote-Kinder gepullt werden; weitere Strukturkonflikte fehlen weiterhin.
+- Lokal gelöschte, serverseitig nichtleere Ordner werden nonce-/inode-gebunden restauriert, bevor ihre Remote-Kinder gepullt werden.
+- Note-Create/-Move unter einem bereits remote gelöschten Parent retten lokale Bytes crash-sicher als sichtbare synchronisierte Konfliktkopie; weitere Folder-Strukturkonflikte fehlen weiterhin.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.

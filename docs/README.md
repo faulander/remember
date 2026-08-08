@@ -38,5 +38,6 @@
 | [0025](adr/0025-m2-evacuated-conflict-byte-cleanup.md) | Sichere Bereinigung evakuierter Konfliktbytes |
 | [0026](adr/0026-m2-outbox-blob-cleanup.md) | Generationsgebundene Bereinigung finaler Outbox-Blobs |
 | [0027](adr/0027-m2-folder-not-empty-preservation.md) | Bewahrung nichtleerer Remote-Ordner gegen lokale Deletes |
+| [0028](adr/0028-m2-note-parent-unavailable-rescue.md) | Notizrettung bei nicht verfügbarem Remote-Parent |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

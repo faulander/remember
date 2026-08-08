@@ -68,6 +68,18 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		r.server.results[m.OperationID] = result
 		return result, nil
 	}
+	if (m.Kind == clientsync.Create || m.Kind == clientsync.Move) && m.ParentID != nil {
+		parent, exists := r.server.states[*m.ParentID]
+		if !exists || parent.Deleted || parent.ObjectType != clientsync.Folder {
+			r.server.ensureConflictNamespace()
+			result := clientsync.Result{Conflict: "parent_unavailable"}
+			if m.Kind == clientsync.Move {
+				result.Canonical = &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
+			}
+			r.server.results[m.OperationID] = result
+			return result, nil
+		}
+	}
 	if m.Kind == clientsync.Create {
 		for id, existing := range r.server.states {
 			if id != m.ObjectID && !existing.Deleted && existing.Name == m.Name && ((existing.ParentID == nil && m.ParentID == nil) || (existing.ParentID != nil && m.ParentID != nil && *existing.ParentID == *m.ParentID)) {
@@ -831,6 +843,174 @@ func TestSyncOnceTreatsMissingRemoteDeleteAsSatisfied(t *testing.T) {
 	}
 	if err := store.ResolveMissingDelete(ctx, uuid.Must(uuid.NewV7())); err == nil {
 		t.Fatal("unauthorized missing delete resolution accepted")
+	}
+}
+
+func TestSyncOnceRescuesNoteCreateUnderUnavailableParent(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Gone"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	var goneID uuid.UUID
+	for id, state := range server.states {
+		if state.ObjectType == clientsync.Folder && state.Name == "Gone" {
+			goneID = id
+		}
+	}
+	if goneID == uuid.Nil {
+		t.Fatal("remote folder missing")
+	}
+	if result, err := remote.Submit(ctx, clientsync.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: clientsync.Delete, ObjectID: goneID, ObjectType: clientsync.Folder, BaseRevision: 1}); err != nil || !result.Accepted {
+		t.Fatalf("remote folder delete=%#v err=%v", result, err)
+	}
+	local, _, err := a.CreateNote(ctx, "Gone/Local.md", "must survive\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictEvacuation = func() { testHookAfterConflictEvacuation = nil; panic("simulated unavailable-parent evacuation crash") }
+	defer func() { testHookAfterConflictEvacuation = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected evacuation crash")
+			}
+		}()
+		if err := a.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("sync before unavailable-parent crash: %v", err)
+		}
+	}()
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a, _, err = Open(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "Gone")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted parent remains: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootA, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "Local (Konflikt *).md"))
+	if len(matches) != 1 {
+		t.Fatalf("conflict copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("must survive")) {
+		t.Fatalf("rescued bytes=%q err=%v", copyBytes, err)
+	}
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil || inspection.NoteID == local.ID {
+		t.Fatalf("rescued identity=%v err=%v", inspection.NoteID, err)
+	}
+	state, ok := server.states[inspection.NoteID]
+	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID {
+		t.Fatalf("rescued note not synchronized: %#v", state)
+	}
+	store, _ := clientsync.NewStore(a.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("parent conflict unresolved=%t err=%v", unresolved, err)
+	}
+}
+
+func TestSyncOnceRescuesNoteMoveToUnavailableParent(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Source"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "Gone"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := a.CreateNote(ctx, "Source/N.md", "original\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	var goneID uuid.UUID
+	for id, state := range server.states {
+		if state.ObjectType == clientsync.Folder && state.Name == "Gone" {
+			goneID = id
+		}
+	}
+	if goneID == uuid.Nil {
+		t.Fatal("remote folder missing")
+	}
+	if result, err := remote.Submit(ctx, clientsync.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: clientsync.Delete, ObjectID: goneID, ObjectType: clientsync.Folder, BaseRevision: 1}); err != nil || !result.Accepted {
+		t.Fatalf("remote folder delete=%#v err=%v", result, err)
+	}
+	doc, err := a.ReadNote(ctx, "Source/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "Source/N.md", "Gone/N.md", doc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := a.ReadNote(ctx, "Source/N.md")
+	if err != nil || canonical.ID != note.ID || !strings.Contains(canonical.Body, "original") {
+		t.Fatalf("canonical note=%#v err=%v", canonical, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "Gone")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted target parent remains: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootA, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "N (Konflikt *).md"))
+	if len(matches) != 1 {
+		t.Fatalf("move conflict copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("original")) {
+		t.Fatalf("move rescue=%q err=%v", copyBytes, err)
+	}
+	store, _ := clientsync.NewStore(a.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("move parent conflict unresolved=%t err=%v", unresolved, err)
 	}
 }
 

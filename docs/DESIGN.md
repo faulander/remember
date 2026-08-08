@@ -667,6 +667,13 @@ Umsetzung von `SYNC-008`:
 - Der fehlende Parent-Ordner wird ausschließlich aus kanonischem Zustand und über ein Nonce-/Inode-Journal wiederhergestellt.
 - Erst nach identitätsgebundener Restaurierung und dauerhafter Konfliktauflösung werden die Remote-Kinder angewendet.
 
+## 14.2.4 Notiz erstellen oder verschieben gegen gelöschten Parent
+
+- `parent_unavailable` verwirft den nicht mehr gültigen Zielpfad, nicht aber lokale Notizbytes.
+- Note-Create wird als kanonisch fehlendes Objekt evakuiert und unter neuer UUID im Konfliktbereich gerettet.
+- Note-Move rettet die lokale Zielfassung und stellt zusätzlich die authentifizierte kanonische Serverfassung an ihrem bisherigen Pfad wieder her.
+- Während der Evakuierung bleibt allgemeines Reconcile auch über Neustarts gesperrt.
+
 ## 14.3 Löschen gegen Verschieben
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.

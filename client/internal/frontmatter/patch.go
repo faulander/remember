@@ -92,7 +92,7 @@ func MaterializeConflictCopy(markdown []byte, expectedID, conflictID uuid.UUID, 
 	if err != nil {
 		return nil, err
 	}
-	if !parsed.inspection.HasRemember || parsed.inspection.NoteID != expectedID || expectedID == uuid.Nil || conflictID == uuid.Nil || conflictID.Variant() != uuid.RFC4122 || origin.OriginalNoteID != expectedID || origin.OperationID == uuid.Nil || origin.Reason == "" || origin.OriginalTarget == "" || origin.CanonicalRevision == 0 && origin.Reason != "path_collision" && origin.Reason != "object_missing" {
+	if !parsed.inspection.HasRemember || parsed.inspection.NoteID != expectedID || expectedID == uuid.Nil || conflictID == uuid.Nil || conflictID.Variant() != uuid.RFC4122 || origin.OriginalNoteID != expectedID || origin.OperationID == uuid.Nil || origin.Reason == "" || origin.OriginalTarget == "" || origin.CanonicalRevision == 0 && origin.Reason != "path_collision" && origin.Reason != "object_missing" && origin.Reason != "parent_unavailable" {
 		return nil, &ValidationError{Problem: ProblemInvalidNoteID, Detail: expectedID.String()}
 	}
 	setMappingPair(parsed.remember, "note_id", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: conflictID.String(), Style: yaml.DoubleQuotedStyle})

@@ -65,8 +65,8 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 			}
 			continue
 		}
-		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && conflict.Code == "path_collision") || ((m.Kind == clientsync.Update || m.Kind == clientsync.Move) && conflict.Code == "object_missing"))
-		moveCollision := m.Kind == clientsync.Move && conflict.Code == "path_collision" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size
+		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable")) || ((m.Kind == clientsync.Update || m.Kind == clientsync.Move) && conflict.Code == "object_missing"))
+		moveCollision := m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size
 		if m.ObjectType == clientsync.Note && (canonicalAbsent || moveCollision) {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
@@ -788,7 +788,7 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 				return err
 			}
 		}
-		if kind == clientsync.Move && code == "path_collision" {
+		if kind == clientsync.Move && (code == "path_collision" || code == "parent_unavailable") {
 			canonical, err := store.CanonicalConflictState(ctx, item.OperationID)
 			if err != nil {
 				return err
@@ -825,17 +825,17 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if err != nil {
 			return err
 		}
-		orphan := canonical == nil && (kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing"
+		orphan := canonical == nil && (((kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing") || (kind == clientsync.Create && code == "parent_unavailable"))
 		if canonical == nil && kind != clientsync.Create && !orphan {
 			return errors.New("canonical conflict state unavailable")
 		}
 		localDelete := kind == clientsync.Delete
-		if kind == clientsync.Create {
-			if err := c.verifyPathCollisionApplied(ctx, store, item); err != nil {
+		if orphan {
+			if err := c.verifyOrphanConflictEvacuated(ctx, item); err != nil {
 				return err
 			}
-		} else if orphan {
-			if err := c.verifyOrphanConflictEvacuated(ctx, item); err != nil {
+		} else if kind == clientsync.Create {
+			if err := c.verifyPathCollisionApplied(ctx, store, item); err != nil {
 				return err
 			}
 		} else {
@@ -875,12 +875,12 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode}); err != nil {
 			return err
 		}
-		if kind == clientsync.Create {
-			if err := c.verifyPathCollisionApplied(ctx, store, item); err != nil {
+		if orphan {
+			if err := c.verifyOrphanConflictEvacuated(ctx, item); err != nil {
 				return err
 			}
-		} else if orphan {
-			if err := c.verifyOrphanConflictEvacuated(ctx, item); err != nil {
+		} else if kind == clientsync.Create {
+			if err := c.verifyPathCollisionApplied(ctx, store, item); err != nil {
 				return err
 			}
 		} else if err := c.verifyCanonicalConflictApplied(ctx, item, *canonical, localDelete); err != nil {
@@ -964,7 +964,7 @@ func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *c
 		if err != nil {
 			return err
 		}
-		if (kind == clientsync.Create || kind == clientsync.Move) && code == "path_collision" || (kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing" {
+		if (kind == clientsync.Create || kind == clientsync.Move) && (code == "path_collision" || code == "parent_unavailable") || (kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing" {
 			evacuated := ".remember/trash/conflicts/" + item.OperationID.String() + ".md"
 			if err := repository.RemoveRootedConflictEvacuationExpected(c.root, evacuated, item.SourceHash); err != nil {
 				return err

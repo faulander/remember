@@ -9,7 +9,7 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - lokaler macOS-Desktop-Client mit Wails, Go, Svelte 5 und TypeScript
 - echte Markdown-Dateien mit versioniertem YAML-Frontmatter
 - verschachtelte Ordner, Tags, Vorschau, Themes und recoverbares Löschen
-- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete-, fehlende Remote-Objekt- und Note-Create/-Move-Pfadkonfliktkopien; bereits remote fehlende Deletes konvergieren ohne neue Kopie und nichtleere Remote-Ordner werden sicher bewahrt
+- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete-, fehlende Remote-Objekt-, fehlende Parent- und Note-Create/-Move-Pfadkonfliktkopien; bereits remote fehlende Deletes konvergieren ohne neue Kopie und nichtleere Remote-Ordner werden sicher bewahrt
 - modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
 - interner Identity-, Sync-, Sessions- und Devices-Core mit server-provisioniertem Konfliktbereich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync

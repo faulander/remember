@@ -175,7 +175,7 @@ func (s *Store) ConflictMutationKind(ctx context.Context, operationID uuid.UUID)
 func (s *Store) HasEvacuatingConflict(ctx context.Context) (bool, error) {
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_materializations m JOIN sync_outbox o ON o.operation_id=m.operation_id WHERE m.state IN ('copy_staged','copy_published') AND ((o.mutation IN ('create','move') AND o.conflict_code='path_collision') OR (o.mutation IN ('update','move') AND o.conflict_code='object_missing')))`).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_materializations m JOIN sync_outbox o ON o.operation_id=m.operation_id WHERE m.state IN ('copy_staged','copy_published') AND ((o.mutation IN ('create','move') AND o.conflict_code IN ('path_collision','parent_unavailable')) OR (o.mutation IN ('update','move') AND o.conflict_code='object_missing')))`).Scan(&exists)
 	})
 	return exists != 0, err
 }
