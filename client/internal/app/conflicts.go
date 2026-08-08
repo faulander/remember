@@ -18,6 +18,7 @@ import (
 )
 
 var testHookBeforeConflictRecoveredPublication func()
+var testHookBeforeConflictCompletion func()
 
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
@@ -36,24 +37,32 @@ func (c *LocalCore) rejectActiveNoteConflict(ctx context.Context, id uuid.UUID) 
 	return nil
 }
 
-func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsync.Store) error {
+func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsync.Store, resolver clientsync.BlobResolver) error {
 	conflicts, err := store.ListConflicts(ctx, 100)
 	if err != nil {
 		return err
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		if conflict.Canonical == nil {
+		if conflict.Canonical == nil || m.ObjectType != clientsync.Note || conflict.Canonical.ObjectType != clientsync.Note || len(conflict.Canonical.BlobHash) != sha256.Size || conflict.Canonical.Revision <= m.BaseRevision {
 			continue
 		}
-		supportedState := conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted || conflict.Code == "object_deleted" && conflict.Canonical.Deleted
-		if m.ObjectType != clientsync.Note || m.Kind != clientsync.Update || conflict.Canonical.ObjectType != clientsync.Note || !supportedState || len(conflict.Canonical.BlobHash) != sha256.Size || conflict.Canonical.Revision <= m.BaseRevision {
+		localUpdate := m.Kind == clientsync.Update && ((conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted) || (conflict.Code == "object_deleted" && conflict.Canonical.Deleted))
+		localDelete := m.Kind == clientsync.Delete && conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted
+		if !localUpdate && !localDelete {
+			continue
+		}
+		if localDelete && resolver == nil {
 			continue
 		}
 		if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 			return err
 		}
-		if err := c.stageNoteUpdateConflict(ctx, store, conflict); err != nil {
+		if localUpdate {
+			if err := c.stageNoteUpdateConflict(ctx, store, conflict); err != nil {
+				return err
+			}
+		} else if err := c.stageNoteDeleteConflict(ctx, store, resolver, conflict); err != nil {
 			return err
 		}
 	}
@@ -251,6 +260,78 @@ func (c *LocalCore) stageNoteUpdateConflict(ctx context.Context, store *clientsy
 	return store.MarkConflictCopyStaged(ctx, op)
 }
 
+func (c *LocalCore) stageNoteDeleteConflict(ctx context.Context, store *clientsync.Store, resolver clientsync.BlobResolver, conflict clientsync.ConflictItem) error {
+	op := conflict.Outbox.Mutation.OperationID
+	materialization, err := store.ConflictMaterialization(ctx, op)
+	if err != nil {
+		return err
+	}
+	canonical := conflict.Canonical
+	if materialization == nil {
+		conflictID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		rebaseID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		sourceHash := itemHash(canonical.BlobHash)
+		source, err := resolver.ResolveBlob(ctx, sourceHash)
+		if err != nil {
+			return err
+		}
+		if int64(len(source)) > clientsync.MaxBlobBytes || sha256.Sum256(source) != sourceHash {
+			return errors.New("canonical delete-conflict blob invalid")
+		}
+		inspection, err := frontmatter.Inspect(source)
+		if err != nil || inspection.NoteID != conflict.Outbox.Mutation.ObjectID {
+			return errors.New("canonical delete-conflict note identity mismatch")
+		}
+		original := canonical.Name
+		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFileName(canonical.Name, op)
+		copyBytes, err := frontmatter.MaterializeConflictCopy(source, conflict.Outbox.Mutation.ObjectID, conflictID, frontmatter.ConflictOrigin{OriginalNoteID: conflict.Outbox.Mutation.ObjectID, OperationID: op, Reason: conflict.Code, OriginalTarget: original, BaseRevision: conflict.Outbox.Mutation.BaseRevision, CanonicalRevision: canonical.Revision})
+		if err != nil {
+			return err
+		}
+		if int64(len(copyBytes)) > clientsync.MaxBlobBytes {
+			return errors.New("conflict copy exceeds sync blob limit")
+		}
+		materialization = &clientsync.ConflictMaterialization{OperationID: op, SourceObjectID: conflict.Outbox.Mutation.ObjectID, ConflictNoteID: conflictID, OriginalRelative: original, TargetRelative: target, SourceHash: sourceHash, MaterializedHash: sha256.Sum256(copyBytes), StagedRelative: ".remember/conflicts/materializations/" + op.String() + ".md", State: "prepared", RebasedOperationID: &rebaseID}
+		if err := store.PutConflictMaterialization(ctx, *materialization); err != nil {
+			return err
+		}
+	}
+	if materialization.State != "prepared" {
+		return nil
+	}
+	sourceHash := materialization.SourceHash
+	source, err := resolver.ResolveBlob(ctx, sourceHash)
+	if err != nil {
+		return err
+	}
+	copyBytes, err := frontmatter.MaterializeConflictCopy(source, materialization.SourceObjectID, materialization.ConflictNoteID, frontmatter.ConflictOrigin{OriginalNoteID: materialization.SourceObjectID, OperationID: op, Reason: conflict.Code, OriginalTarget: materialization.OriginalRelative, BaseRevision: conflict.Outbox.Mutation.BaseRevision, CanonicalRevision: canonical.Revision})
+	if err != nil {
+		return err
+	}
+	if sha256.Sum256(copyBytes) != materialization.MaterializedHash {
+		return errors.New("delete conflict materialization changed")
+	}
+	if err := repository.EnsureRootedDirectory(c.root, ".remember/conflicts", 0o700); err != nil {
+		return err
+	}
+	if err := repository.EnsureRootedDirectory(c.root, ".remember/conflicts/materializations", 0o700); err != nil {
+		return err
+	}
+	if err := repository.CreateRootedPrivate(c.root, materialization.StagedRelative, copyBytes); err != nil {
+		existing, readErr := repository.ReadRootedPrivate(c.root, materialization.StagedRelative, clientsync.MaxBlobBytes)
+		if readErr != nil || !bytes.Equal(existing, copyBytes) {
+			return err
+		}
+	}
+	return store.MarkConflictCopyStaged(ctx, op)
+}
+
 func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsync.Store) error {
 	_, _, durable, err := store.Projection(ctx, clientsync.ConflictRecoveredID)
 	if err != nil {
@@ -281,7 +362,12 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if revision != canonical.Revision {
 			return errors.New("conflicted note has newer local intent")
 		}
-		if err := c.verifyCanonicalConflictApplied(ctx, item, *canonical); err != nil {
+		kind, err := store.ConflictMutationKind(ctx, item.OperationID)
+		if err != nil {
+			return err
+		}
+		localDelete := kind == clientsync.Delete
+		if err := c.verifyCanonicalConflictApplied(ctx, item, *canonical, localDelete); err != nil {
 			return err
 		}
 		content, err := repository.ReadRootedPrivate(c.root, item.StagedRelative, clientsync.MaxBlobBytes)
@@ -306,10 +392,17 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode}); err != nil {
 			return err
 		}
-		if err := c.verifyCanonicalConflictApplied(ctx, item, *canonical); err != nil {
+		if err := c.verifyCanonicalConflictApplied(ctx, item, *canonical, localDelete); err != nil {
 			return err
 		}
-		if err := store.CompleteConflictMaterialization(ctx, item.OperationID); err != nil {
+		if testHookBeforeConflictCompletion != nil {
+			testHookBeforeConflictCompletion()
+		}
+		if localDelete {
+			if err := store.CompleteConflictMaterializationAndRebaseDelete(ctx, item, *canonical); err != nil {
+				return err
+			}
+		} else if err := store.CompleteConflictMaterialization(ctx, item.OperationID); err != nil {
 			return err
 		}
 	}
@@ -358,7 +451,7 @@ func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *c
 	return nil
 }
 
-func (c *LocalCore) verifyCanonicalConflictApplied(ctx context.Context, item clientsync.ConflictMaterialization, canonical clientsync.CanonicalState) error {
+func (c *LocalCore) verifyCanonicalConflictApplied(ctx context.Context, item clientsync.ConflictMaterialization, canonical clientsync.CanonicalState, localDelete bool) error {
 	if canonical.ObjectType != clientsync.Note || len(canonical.BlobHash) != sha256.Size {
 		return errors.New("unsupported canonical conflict state")
 	}
@@ -366,7 +459,7 @@ func (c *LocalCore) verifyCanonicalConflictApplied(ctx context.Context, item cli
 	if err != nil {
 		return err
 	}
-	if canonical.Deleted {
+	if canonical.Deleted || localDelete {
 		for _, object := range snapshot.Objects {
 			if object.ID == item.SourceObjectID {
 				return errors.New("canonically deleted conflicted note remains indexed")

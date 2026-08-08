@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -365,6 +366,97 @@ func runEditAgainstRemoteDelete(t *testing.T, maxPull int, crash bool) {
 	}
 	if state := server.states[visible.NoteID]; state.ObjectType != clientsync.Note || state.Deleted {
 		t.Fatalf("conflict copy not synchronized: %#v", state)
+	}
+}
+
+func TestSyncOnceRebasesLocalDeleteAgainstRemoteEdit(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, _ := b.ReadNote(ctx, "N.md")
+	if _, err := b.DeleteNote(ctx, "N.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ := a.ReadNote(ctx, "N.md")
+	if _, _, err := a.SaveNote(ctx, "N.md", aDoc.Revision, "remote edit to rescue\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	server.maxPull = 1
+	testHookBeforeConflictCompletion = func() { testHookBeforeConflictCompletion = nil; panic("simulated crash before delete rebase") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected delete rebase crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ReadNote(ctx, "N.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("local delete was undone: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if len(matches) != 1 {
+		t.Fatalf("rescued copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("remote edit to rescue")) {
+		t.Fatalf("rescued copy=%q err=%v", copyBytes, err)
+	}
+	var dependentKind clientsync.MutationKind
+	var dependencyObject string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT d.mutation,p.object_id FROM sync_outbox d JOIN sync_outbox_dependencies x ON x.operation_id=d.operation_id JOIN sync_outbox p ON p.operation_id=x.dependency_operation_id WHERE d.object_id=? AND d.mutation='delete' ORDER BY d.sequence DESC LIMIT 1`, doc.ID.String()).Scan(&dependentKind, &dependencyObject)
+	}); err != nil || dependentKind != clientsync.Delete || dependencyObject == doc.ID.String() {
+		t.Fatalf("rebased dependency kind=%s object=%s err=%v", dependentKind, dependencyObject, err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	state := server.states[doc.ID]
+	if !state.Deleted || state.Revision != 3 {
+		t.Fatalf("rebased tombstone=%#v", state)
+	}
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.Deleted || rescued.ObjectType != clientsync.Note {
+		t.Fatalf("rescued remote state=%#v", rescued)
 	}
 }
 

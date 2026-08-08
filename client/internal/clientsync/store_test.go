@@ -177,11 +177,17 @@ func TestConflictMaterializationTransitionsUnblockIntent(t *testing.T) {
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
 	defer index.Close()
 	store, _ := NewStore(index)
-	op := uuid.Must(uuid.NewV7())
+	createOp := uuid.Must(uuid.NewV7())
 	object := uuid.New()
 	hash := sha256.Sum256([]byte("x"))
-	mutation := Mutation{OperationID: op, Kind: Create, ObjectID: object, ObjectType: Note, Name: "N.md", BlobHash: hash[:]}
-	if err := store.Enqueue(ctx, []Mutation{mutation}); err != nil {
+	if err := store.Enqueue(ctx, []Mutation{{OperationID: createOp, Kind: Create, ObjectID: object, ObjectType: Note, Name: "N.md", BlobHash: hash[:]}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResult(ctx, createOp, Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	op := uuid.Must(uuid.NewV7())
+	if err := store.Enqueue(ctx, []Mutation{{OperationID: op, Kind: Update, ObjectID: object, ObjectType: Note, BaseRevision: 1, BlobHash: hash[:]}}); err != nil {
 		t.Fatal(err)
 	}
 	dependentOp := uuid.Must(uuid.NewV7())

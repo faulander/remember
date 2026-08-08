@@ -136,6 +136,14 @@ func (s *Store) MarkConflictFolderPublication(ctx context.Context, id uuid.UUID,
 	})
 }
 
+func (s *Store) ConflictMutationKind(ctx context.Context, operationID uuid.UUID) (MutationKind, error) {
+	var kind MutationKind
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT mutation FROM sync_outbox WHERE operation_id=?`, operationID.String()).Scan(&kind)
+	})
+	return kind, err
+}
+
 func (s *Store) HasStagedConflictForObject(ctx context.Context, objectID uuid.UUID) (bool, error) {
 	if !validObjectID(objectID) {
 		return false, errors.New("invalid conflict object")
@@ -156,7 +164,8 @@ func (s *Store) ConflictMaterialization(ctx context.Context, operationID uuid.UU
 		var m ConflictMaterialization
 		var op, obj, note string
 		var source, materialized []byte
-		err := tx.QueryRowContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state FROM conflict_materializations WHERE operation_id=?`, operationID.String()).Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State)
+		var rebase sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state,rebased_operation_id FROM conflict_materializations WHERE operation_id=?`, operationID.String()).Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State, &rebase)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -177,6 +186,9 @@ func (s *Store) ConflictMaterialization(ctx context.Context, operationID uuid.UU
 		}
 		copy(m.SourceHash[:], source)
 		copy(m.MaterializedHash[:], materialized)
+		if err := setRebasedOperation(&m, rebase); err != nil {
+			return err
+		}
 		if !validConflictMaterializationShape(m) {
 			return errors.New("corrupt conflict materialization shape")
 		}
@@ -186,11 +198,30 @@ func (s *Store) ConflictMaterialization(ctx context.Context, operationID uuid.UU
 	return result, err
 }
 
+func uuidString(id *uuid.UUID) any {
+	if id == nil {
+		return nil
+	}
+	return id.String()
+}
+
+func setRebasedOperation(m *ConflictMaterialization, raw sql.NullString) error {
+	if !raw.Valid {
+		return nil
+	}
+	id, err := uuid.Parse(raw.String)
+	if err != nil || !validOperationID(id) {
+		return errors.New("corrupt rebased conflict operation")
+	}
+	m.RebasedOperationID = &id
+	return nil
+}
+
 func validConflictMaterializationShape(m ConflictMaterialization) bool {
 	expectedStage := ".remember/conflicts/materializations/" + m.OperationID.String() + ".md"
 	targetParent := ConflictRootName + "/" + ConflictRecoveredName
 	expectedTarget := targetParent + "/" + ConflictFileName(path.Base(m.OriginalRelative), m.OperationID)
-	return validOperationID(m.OperationID) && validObjectID(m.SourceObjectID) && validObjectID(m.ConflictNoteID) && naming.ValidateRelativePath(m.OriginalRelative) == nil && m.TargetRelative == expectedTarget && naming.ValidateComponent(path.Base(m.TargetRelative)) == nil && m.StagedRelative == expectedStage
+	return validOperationID(m.OperationID) && validObjectID(m.SourceObjectID) && validObjectID(m.ConflictNoteID) && (m.RebasedOperationID == nil || validOperationID(*m.RebasedOperationID)) && naming.ValidateRelativePath(m.OriginalRelative) == nil && m.TargetRelative == expectedTarget && naming.ValidateComponent(path.Base(m.TargetRelative)) == nil && m.StagedRelative == expectedStage
 }
 
 func (s *Store) PutConflictMaterialization(ctx context.Context, m ConflictMaterialization) error {
@@ -198,7 +229,7 @@ func (s *Store) PutConflictMaterialization(ctx context.Context, m ConflictMateri
 		return errors.New("invalid conflict materialization")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_materializations(operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state) SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sync_outbox WHERE operation_id=? AND object_id=? AND status='conflict')`, m.OperationID.String(), m.SourceObjectID.String(), m.ConflictNoteID.String(), m.OriginalRelative, m.TargetRelative, m.SourceHash[:], m.MaterializedHash[:], m.StagedRelative, m.State, m.OperationID.String(), m.SourceObjectID.String())
+		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_materializations(operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state,rebased_operation_id) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sync_outbox WHERE operation_id=? AND object_id=? AND status='conflict' AND ((mutation='delete' AND ? IS NOT NULL) OR (mutation='update' AND ? IS NULL)))`, m.OperationID.String(), m.SourceObjectID.String(), m.ConflictNoteID.String(), m.OriginalRelative, m.TargetRelative, m.SourceHash[:], m.MaterializedHash[:], m.StagedRelative, m.State, uuidString(m.RebasedOperationID), m.OperationID.String(), m.SourceObjectID.String(), uuidString(m.RebasedOperationID), uuidString(m.RebasedOperationID))
 		if err != nil {
 			return err
 		}
@@ -241,7 +272,7 @@ func (s *Store) markConflictState(ctx context.Context, operationID uuid.UUID, st
 func (s *Store) StagedConflictMaterializations(ctx context.Context) ([]ConflictMaterialization, error) {
 	var result []ConflictMaterialization
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state FROM conflict_materializations WHERE state IN ('copy_staged','copy_published') ORDER BY operation_id`)
+		rows, err := tx.QueryContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state,rebased_operation_id FROM conflict_materializations WHERE state IN ('copy_staged','copy_published') ORDER BY operation_id`)
 		if err != nil {
 			return err
 		}
@@ -250,7 +281,8 @@ func (s *Store) StagedConflictMaterializations(ctx context.Context) ([]ConflictM
 			var m ConflictMaterialization
 			var op, obj, note string
 			var source, materialized []byte
-			if err := rows.Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State); err != nil {
+			var rebase sql.NullString
+			if err := rows.Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State, &rebase); err != nil {
 				return err
 			}
 			m.OperationID, err = uuid.Parse(op)
@@ -267,6 +299,9 @@ func (s *Store) StagedConflictMaterializations(ctx context.Context) ([]ConflictM
 			}
 			copy(m.SourceHash[:], source)
 			copy(m.MaterializedHash[:], materialized)
+			if err := setRebasedOperation(&m, rebase); err != nil {
+				return err
+			}
 			if !validConflictMaterializationShape(m) {
 				return errors.New("corrupt staged conflict materialization shape")
 			}
@@ -280,7 +315,7 @@ func (s *Store) StagedConflictMaterializations(ctx context.Context) ([]ConflictM
 func (s *Store) CompletedConflictCleanups(ctx context.Context) ([]ConflictMaterialization, error) {
 	var result []ConflictMaterialization
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state FROM conflict_materializations WHERE state='completed' AND cleaned_at_ms IS NULL ORDER BY operation_id`)
+		rows, err := tx.QueryContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state,rebased_operation_id FROM conflict_materializations WHERE state='completed' AND cleaned_at_ms IS NULL ORDER BY operation_id`)
 		if err != nil {
 			return err
 		}
@@ -289,7 +324,8 @@ func (s *Store) CompletedConflictCleanups(ctx context.Context) ([]ConflictMateri
 			var m ConflictMaterialization
 			var op, obj, note string
 			var source, materialized []byte
-			if err := rows.Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State); err != nil {
+			var rebase sql.NullString
+			if err := rows.Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State, &rebase); err != nil {
 				return err
 			}
 			m.OperationID, err = uuid.Parse(op)
@@ -306,6 +342,9 @@ func (s *Store) CompletedConflictCleanups(ctx context.Context) ([]ConflictMateri
 			}
 			copy(m.SourceHash[:], source)
 			copy(m.MaterializedHash[:], materialized)
+			if err := setRebasedOperation(&m, rebase); err != nil {
+				return err
+			}
 			if !validConflictMaterializationShape(m) {
 				return errors.New("corrupt conflict cleanup shape")
 			}
@@ -329,6 +368,34 @@ func (s *Store) MarkConflictMaterializationCleaned(ctx context.Context, operatio
 			return errors.New("conflict cleanup unavailable")
 		}
 		return nil
+	})
+}
+
+func (s *Store) CompleteConflictMaterializationAndRebaseDelete(ctx context.Context, m ConflictMaterialization, canonical CanonicalState) error {
+	if m.RebasedOperationID == nil || canonical.ObjectType != Note || canonical.Deleted || canonical.Revision == 0 {
+		return errors.New("invalid delete conflict rebase")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var baseline uint64
+		if err := tx.QueryRowContext(ctx, `SELECT revision FROM sync_baselines WHERE object_id=?`, m.SourceObjectID.String()).Scan(&baseline); err != nil || baseline != canonical.Revision {
+			return errors.New("delete conflict canonical baseline unavailable")
+		}
+		var dependencyRaw string
+		if err := tx.QueryRowContext(ctx, `SELECT operation_id FROM sync_outbox WHERE object_id=? AND mutation='create' AND status IN ('pending','attempted') ORDER BY sequence DESC LIMIT 1`, m.ConflictNoteID.String()).Scan(&dependencyRaw); err != nil {
+			return errors.New("delete conflict copy operation unavailable")
+		}
+		dependency, err := uuid.Parse(dependencyRaw)
+		if err != nil || !validOperationID(dependency) {
+			return errors.New("invalid delete conflict dependency")
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE conflict_materializations SET state='completed' WHERE operation_id=? AND state IN ('copy_published','completed')`, m.OperationID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("conflict completion unavailable")
+		}
+		return s.enqueueTx(ctx, tx, []Mutation{{OperationID: *m.RebasedOperationID, Kind: Delete, ObjectID: m.SourceObjectID, ObjectType: Note, BaseRevision: canonical.Revision, AdditionalDependencies: []uuid.UUID{dependency}}})
 	})
 }
 

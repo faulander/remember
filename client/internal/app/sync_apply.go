@@ -237,13 +237,13 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 			return nil, err
 		}
 		step.relative = target
-		deferredConflict, deferredErr := stagedIntermediateDeleteConflict(ctx, store, change)
+		deferredConflict, deferredErr := stagedConflictDeferredChange(ctx, store, change)
 		if deferredErr != nil {
 			return nil, deferredErr
 		}
 		if deferredConflict != nil {
 			object, exists := objects[change.ObjectID]
-			if !exists && change.State == "applied" {
+			if !exists && (change.State == "applied" || deferredConflict.RebasedOperationID != nil) {
 				step.conflictDeferred = true
 				prepared = append(prepared, step)
 				continue
@@ -482,7 +482,7 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 	return prepared, nil
 }
 
-func stagedIntermediateDeleteConflict(ctx context.Context, store *clientsync.Store, change clientsync.Change) (*clientsync.ConflictMaterialization, error) {
+func stagedConflictDeferredChange(ctx context.Context, store *clientsync.Store, change clientsync.Change) (*clientsync.ConflictMaterialization, error) {
 	if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Update && change.Mutation != clientsync.Move) {
 		return nil, nil
 	}
@@ -498,7 +498,14 @@ func stagedIntermediateDeleteConflict(ctx context.Context, store *clientsync.Sto
 		if err != nil {
 			return nil, err
 		}
-		if canonical != nil && canonical.ObjectType == clientsync.Note && canonical.Deleted && canonical.Revision > change.Revision {
+		if canonical == nil || canonical.ObjectType != clientsync.Note {
+			continue
+		}
+		kind, err := store.ConflictMutationKind(ctx, item.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		if kind == clientsync.Update && canonical.Deleted && canonical.Revision > change.Revision || kind == clientsync.Delete && !canonical.Deleted && canonical.Revision >= change.Revision {
 			copyItem := item
 			return &copyItem, nil
 		}

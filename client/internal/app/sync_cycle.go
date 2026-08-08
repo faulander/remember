@@ -44,7 +44,7 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err != nil {
 		return err
 	}
-	if err := c.stageSupportedConflicts(ctx, store); err != nil {
+	if err := c.stageSupportedConflicts(ctx, store, remote); err != nil {
 		return err
 	}
 	if err := c.cleanupCompletedConflictStages(ctx, store); err != nil {
@@ -104,7 +104,7 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			return err
 		}
 		if !result.Accepted {
-			if err := c.stageSupportedConflicts(ctx, store); err != nil {
+			if err := c.stageSupportedConflicts(ctx, store, remote); err != nil {
 				return err
 			}
 		}

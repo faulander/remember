@@ -106,6 +106,7 @@ type ConflictMaterialization struct {
 	OriginalRelative, TargetRelative            string
 	SourceHash, MaterializedHash                [32]byte
 	StagedRelative, State                       string
+	RebasedOperationID                          *uuid.UUID
 }
 
 type ConflictItem struct {

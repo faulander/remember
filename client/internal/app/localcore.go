@@ -141,7 +141,7 @@ func Open(ctx context.Context, root string) (*LocalCore, reconcile.Report, error
 		rootLock.Unlock()
 		return nil, reconcile.Report{}, storeErr
 	}
-	if err := core.stageSupportedConflicts(ctx, store); err != nil {
+	if err := core.stageSupportedConflicts(ctx, store, nil); err != nil {
 		index.Close()
 		rootLock.Unlock()
 		return nil, reconcile.Report{}, err
