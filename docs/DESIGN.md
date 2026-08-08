@@ -658,7 +658,8 @@ Umsetzung von `SYNC-008`:
 
 - Ein `object_missing` ohne kanonischen Zustand übernimmt niemals still die verwaiste UUID.
 - Die lokalen Bytes werden mit neuer UUID unter Wiederhergestellt gerettet und die alte Quellidentität nur als Konfliktherkunft bewahrt.
-- Die Evakuierung unterdrückt einen falschen lokalen Folge-Delete auch über Absturz und Neustart hinweg.
+- Die Evakuierung von Update oder Move unterdrückt einen falschen lokalen Folge-Delete auch über Absturz und Neustart hinweg.
+- Ein lokaler Delete gegen `object_missing` ist semantisch bereits erfüllt und wird unveränderlich als `already_deleted` journalisiert, ohne ein neues Serverobjekt zu erzeugen.
 
 ## 14.3 Löschen gegen Verschieben
 

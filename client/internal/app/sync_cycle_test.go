@@ -709,6 +709,101 @@ func TestSyncOnceMaterializesUpdateForMissingRemoteNote(t *testing.T) {
 	}
 }
 
+func TestSyncOnceMaterializesMoveForMissingRemoteNote(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	doc, _, err := core.CreateNote(ctx, "Original.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	delete(server.states, doc.ID)
+	current, _ := core.ReadNote(ctx, "Original.md")
+	moved, _, err := core.MoveNote(ctx, "Original.md", "Moved.md", current.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.SaveNote(ctx, "Moved.md", moved.Revision, "moved orphan edit\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.ReadNote(ctx, "Moved.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("orphan move remains: %v", err)
+	}
+	if _, err := core.ReadNote(ctx, "Original.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("missing source was recreated: %v", err)
+	}
+	copies, _ := filepath.Glob(filepath.Join(root, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if len(copies) != 1 {
+		t.Fatalf("move orphan copies=%v", copies)
+	}
+	content, _ := os.ReadFile(copies[0])
+	inspection, err := frontmatter.Inspect(content)
+	if err != nil || inspection.NoteID == doc.ID || !bytes.Contains(content, []byte("moved orphan edit")) || !bytes.Contains(content, []byte("object_missing")) {
+		t.Fatalf("move orphan copy=%q inspection=%#v err=%v", content, inspection, err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.ObjectType != clientsync.Note || rescued.Deleted {
+		t.Fatalf("remote move orphan=%#v", rescued)
+	}
+}
+
+func TestSyncOnceTreatsMissingRemoteDeleteAsSatisfied(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	core, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	doc, _, err := core.CreateNote(ctx, "Gone.md", "body\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	delete(server.states, doc.ID)
+	current, _ := core.ReadNote(ctx, "Gone.md")
+	if _, err := core.DeleteNote(ctx, "Gone.md", current.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("missing delete unresolved=%t err=%v", unresolved, err)
+	}
+	var conflict, resolution, rawOperation string
+	if err := core.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT o.operation_id,o.conflict_code,r.resolution FROM sync_outbox o JOIN sync_conflict_resolutions r ON r.operation_id=o.operation_id WHERE o.object_id=? AND o.mutation='delete'`, doc.ID.String()).Scan(&rawOperation, &conflict, &resolution)
+	}); err != nil || conflict != "object_missing" || resolution != "already_deleted" {
+		t.Fatalf("missing delete history=%s/%s err=%v", conflict, resolution, err)
+	}
+	operationID := uuid.MustParse(rawOperation)
+	if err := store.ResolveMissingDelete(ctx, operationID); err != nil {
+		t.Fatalf("idempotent missing delete resolution: %v", err)
+	}
+	if err := store.ResolveMissingDelete(ctx, uuid.Must(uuid.NewV7())); err == nil {
+		t.Fatal("unauthorized missing delete resolution accepted")
+	}
+}
+
 type cycleRemote struct {
 	events    []string
 	ambiguous bool

@@ -11,6 +11,26 @@ import (
 	"github.com/google/uuid"
 )
 
+func (s *Store) ResolveMissingDelete(ctx context.Context, operationID uuid.UUID) error {
+	if !validOperationID(operationID) {
+		return errors.New("invalid missing delete resolution")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `INSERT INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms) SELECT operation_id,'already_deleted',? FROM sync_outbox WHERE operation_id=? AND mutation='delete' AND status='conflict' AND conflict_code='object_missing' AND NOT EXISTS(SELECT 1 FROM sync_conflict_states c WHERE c.operation_id=sync_outbox.operation_id) ON CONFLICT(operation_id) DO NOTHING`, s.clock().UTC().UnixMilli(), operationID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_conflict_resolutions WHERE operation_id=? AND resolution='already_deleted')`, operationID.String()).Scan(&exists); err != nil || exists == 0 {
+				return errors.New("missing delete conflict unavailable")
+			}
+		}
+		_, err = tx.ExecContext(ctx, `WITH RECURSIVE doomed(operation_id) AS (SELECT d.operation_id FROM sync_outbox_dependencies d WHERE d.dependency_operation_id=? UNION SELECT d.operation_id FROM sync_outbox_dependencies d JOIN doomed ON d.dependency_operation_id=doomed.operation_id) UPDATE sync_outbox SET status='superseded' WHERE operation_id IN (SELECT operation_id FROM doomed) AND status IN ('pending','attempted')`, operationID.String())
+		return err
+	})
+}
+
 func (s *Store) ListConflicts(ctx context.Context, limit int) ([]ConflictItem, error) {
 	if limit <= 0 || limit > 100 {
 		return nil, errors.New("invalid conflict list limit")
@@ -20,7 +40,7 @@ func (s *Store) ListConflicts(ctx context.Context, limit int) ([]ConflictItem, e
 		rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.operation_id,o.mutation,o.object_id,o.object_type,o.base_revision,o.parent_id,o.name,o.blob_hash,o.conflict_code,
 			c.object_type,c.revision,c.parent_id,c.name,c.blob_hash,c.deleted
 			FROM sync_outbox o LEFT JOIN sync_conflict_states c ON c.operation_id=o.operation_id
-			WHERE o.status='conflict' AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed'))
+			WHERE o.status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed'))
 			ORDER BY o.sequence LIMIT ?`, limit)
 		if err != nil {
 			return err
@@ -155,7 +175,7 @@ func (s *Store) ConflictMutationKind(ctx context.Context, operationID uuid.UUID)
 func (s *Store) HasEvacuatingConflict(ctx context.Context) (bool, error) {
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_materializations m JOIN sync_outbox o ON o.operation_id=m.operation_id WHERE m.state IN ('copy_staged','copy_published') AND ((o.mutation IN ('create','move') AND o.conflict_code='path_collision') OR (o.mutation='update' AND o.conflict_code='object_missing')))`).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_materializations m JOIN sync_outbox o ON o.operation_id=m.operation_id WHERE m.state IN ('copy_staged','copy_published') AND ((o.mutation IN ('create','move') AND o.conflict_code='path_collision') OR (o.mutation IN ('update','move') AND o.conflict_code='object_missing')))`).Scan(&exists)
 	})
 	return exists != 0, err
 }

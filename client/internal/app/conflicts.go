@@ -45,7 +45,16 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && conflict.Code == "path_collision") || (m.Kind == clientsync.Update && conflict.Code == "object_missing"))
+		if m.Kind == clientsync.Delete && conflict.Code == "object_missing" && conflict.Canonical == nil {
+			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
+				return err
+			}
+			if err := store.ResolveMissingDelete(ctx, m.OperationID); err != nil {
+				return err
+			}
+			continue
+		}
+		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && conflict.Code == "path_collision") || ((m.Kind == clientsync.Update || m.Kind == clientsync.Move) && conflict.Code == "object_missing"))
 		moveCollision := m.Kind == clientsync.Move && conflict.Code == "path_collision" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size
 		if m.ObjectType == clientsync.Note && (canonicalAbsent || moveCollision) {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
@@ -668,7 +677,7 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 				return err
 			}
 		}
-		if kind == clientsync.Move {
+		if kind == clientsync.Move && code == "path_collision" {
 			canonical, err := store.CanonicalConflictState(ctx, item.OperationID)
 			if err != nil {
 				return err
@@ -705,7 +714,7 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if err != nil {
 			return err
 		}
-		orphan := canonical == nil && kind == clientsync.Update && code == "object_missing"
+		orphan := canonical == nil && (kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing"
 		if canonical == nil && kind != clientsync.Create && !orphan {
 			return errors.New("canonical conflict state unavailable")
 		}

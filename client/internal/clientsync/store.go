@@ -602,7 +602,7 @@ func (s *Store) ProjectionTx(ctx context.Context, tx *sql.Tx, objectID uuid.UUID
 func (s *Store) HasUnresolvedOutbox(ctx context.Context) (bool, error) {
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed'))) )`).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed'))) )`).Scan(&exists)
 	})
 	return exists != 0, err
 }
@@ -613,7 +613,7 @@ func (s *Store) HasUnresolvedLocalIntent(ctx context.Context, objectID uuid.UUID
 	}
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE object_id=? AND (status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')))))`, objectID.String()).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE object_id=? AND (status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')))))`, objectID.String()).Scan(&exists)
 	})
 	return exists != 0, err
 }
