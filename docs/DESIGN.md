@@ -647,6 +647,12 @@ Umsetzung von `SYNC-008`:
 - Die ursprüngliche Objekt-ID, Version und Geräteherkunft bleiben als Konfliktmetadaten erhalten.
 - Implementierungsstand M2: Sowohl lokales Note-Update gegen kanonischen Remote-Delete als auch lokaler Delete gegen kanonischen Remote-Edit sind crash-resumierbar umgesetzt; der lokale Delete wird erst nach synchronisierter Rettung der Remote-Fassung rebased.
 
+## 14.2.1 Gleichzeitiges Erstellen am selben Notizpfad
+
+- Der serverseitig zuerst akzeptierte Create bleibt am ursprünglichen Pfad.
+- Der verlierende Client evakuiert seine exakten Bytes in technischen Trash und materialisiert sie mit neuer UUID unter Wiederhergestellt.
+- Die Konfliktkopie wird erst sichtbar, wenn der Remote-Gewinner durch Baseline und abgeschlossenen Apply-Schritt authentifiziert ist.
+
 ## 14.3 Löschen gegen Verschieben
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.

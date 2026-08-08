@@ -170,6 +170,14 @@ func TestEnsureIdentityLeavesExistingIdentityByteExact(t *testing.T) {
 	}
 }
 
+func TestMaterializePathCollisionCopyAllowsMissingCanonicalRevision(t *testing.T) {
+	original, conflictID, operationID := uuid.New(), uuid.New(), uuid.Must(uuid.NewV7())
+	input := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + original.String() + "\"\n---\nbody\n")
+	if _, err := MaterializeConflictCopy(input, original, conflictID, ConflictOrigin{OriginalNoteID: original, OperationID: operationID, Reason: "path_collision", OriginalTarget: "N.md"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMaterializeConflictCopyRekeysAndRecordsOrigin(t *testing.T) {
 	original, conflictID, operationID := uuid.New(), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
 	input := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + original.String() + "\"\n  custom: keep\n---\nbody\n")

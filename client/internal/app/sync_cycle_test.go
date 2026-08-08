@@ -44,24 +44,36 @@ func (r *memoryRemote) ResolveBlob(_ context.Context, h [32]byte) ([]byte, error
 	}
 	return append([]byte(nil), b...), nil
 }
+func (s *memorySyncServer) ensureConflictNamespace() {
+	if _, exists := s.states[clientsync.ConflictRootID]; exists {
+		return
+	}
+	for _, reserved := range []clientsync.Change{{ObjectID: clientsync.ConflictRootID, ObjectType: clientsync.Folder, Revision: 1, Name: clientsync.ConflictRootName}, {ObjectID: clientsync.ConflictRecoveredID, ObjectType: clientsync.Folder, Revision: 1, ParentID: ptrUUID(clientsync.ConflictRootID), Name: clientsync.ConflictRecoveredName}} {
+		reserved.Cursor = uint64(len(s.changes) + 1)
+		reserved.OperationID = uuid.Must(uuid.NewV7())
+		reserved.Mutation = clientsync.Create
+		s.states[reserved.ObjectID] = reserved
+		s.changes = append(s.changes, reserved)
+	}
+}
+
 func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clientsync.Result, error) {
 	if result, ok := r.server.results[m.OperationID]; ok {
 		return result, nil
 	}
 	state := r.server.states[m.ObjectID]
-	if m.Kind != clientsync.Create && state.Revision != m.BaseRevision {
-		if _, exists := r.server.states[clientsync.ConflictRootID]; !exists {
-			for _, reserved := range []clientsync.Change{
-				{ObjectID: clientsync.ConflictRootID, ObjectType: clientsync.Folder, Revision: 1, Name: clientsync.ConflictRootName},
-				{ObjectID: clientsync.ConflictRecoveredID, ObjectType: clientsync.Folder, Revision: 1, ParentID: ptrUUID(clientsync.ConflictRootID), Name: clientsync.ConflictRecoveredName},
-			} {
-				reserved.Cursor = uint64(len(r.server.changes) + 1)
-				reserved.OperationID = uuid.Must(uuid.NewV7())
-				reserved.Mutation = clientsync.Create
-				r.server.states[reserved.ObjectID] = reserved
-				r.server.changes = append(r.server.changes, reserved)
+	if m.Kind == clientsync.Create {
+		for id, existing := range r.server.states {
+			if id != m.ObjectID && !existing.Deleted && existing.Name == m.Name && ((existing.ParentID == nil && m.ParentID == nil) || (existing.ParentID != nil && m.ParentID != nil && *existing.ParentID == *m.ParentID)) {
+				r.server.ensureConflictNamespace()
+				result := clientsync.Result{Conflict: "path_collision"}
+				r.server.results[m.OperationID] = result
+				return result, nil
 			}
 		}
+	}
+	if m.Kind != clientsync.Create && state.Revision != m.BaseRevision {
+		r.server.ensureConflictNamespace()
 		canonical := &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
 		code := "base_revision_mismatch"
 		if state.Deleted {
@@ -457,6 +469,75 @@ func TestSyncOnceRebasesLocalDeleteAgainstRemoteEdit(t *testing.T) {
 	}
 	if rescued := server.states[inspection.NoteID]; rescued.Deleted || rescued.ObjectType != clientsync.Note {
 		t.Fatalf("rescued remote state=%#v", rescued)
+	}
+}
+
+func TestSyncOnceMaterializesNoteCreatePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	winner, _, err := a.CreateNote(ctx, "Same.md", "remote winner\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	local, _, err := b.CreateNote(ctx, "Same.md", "local colliding note\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.pullErr = remotehttp.ErrRetryable
+	if err := b.SyncOnce(ctx, remote); !errors.Is(err, remotehttp.ErrRetryable) {
+		t.Fatalf("interrupted collision sync=%v", err)
+	}
+	if _, err := b.ReadNote(ctx, "Same.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("colliding source not evacuated: %v", err)
+	}
+	if copies, _ := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md")); len(copies) != 0 {
+		t.Fatalf("collision copy published before winner pull: %v", copies)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		snapshot, _ := b.index.ReadSnapshot(ctx)
+		t.Fatalf("collision resume=%v snapshot=%#v", err, snapshot.Objects)
+	}
+	winnerDoc, err := b.ReadNote(ctx, "Same.md")
+	if err != nil || winnerDoc.ID != winner.ID || !strings.Contains(winnerDoc.Body, "remote winner") {
+		t.Fatalf("winner=%#v err=%v", winnerDoc, err)
+	}
+	copies, _ := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if len(copies) != 1 {
+		t.Fatalf("collision copies=%v", copies)
+	}
+	copyBytes, _ := os.ReadFile(copies[0])
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil || inspection.NoteID == local.ID || !bytes.Contains(copyBytes, []byte("local colliding note")) {
+		t.Fatalf("collision copy=%q inspection=%#v err=%v", copyBytes, inspection, err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.ObjectType != clientsync.Note || rescued.Deleted {
+		t.Fatalf("rescued collision state=%#v", rescued)
 	}
 }
 

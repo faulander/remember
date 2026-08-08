@@ -629,6 +629,21 @@ func (s *Store) BaselineMatchesOperation(ctx context.Context, objectID uuid.UUID
 	return exists != 0, err
 }
 
+func (s *Store) BaselineMatchesAppliedNote(ctx context.Context, objectID uuid.UUID, parentID uuid.UUID, name string, hash []byte) (bool, error) {
+	if !validObjectID(objectID) || naming.ValidateComponent(name) != nil || len(hash) != sha256.Size {
+		return false, errors.New("invalid applied note baseline")
+	}
+	var parent any
+	if parentID != uuid.Nil {
+		parent = parentID.String()
+	}
+	var exists int
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_baselines b JOIN apply_steps s ON s.object_id=b.object_id AND s.revision=b.revision AND s.operation_id=b.operation_id JOIN apply_plans p ON p.plan_id=s.plan_id WHERE b.object_id=? AND s.object_type='note' AND s.state='applied' AND p.status='completed' AND s.name=? AND s.blob_hash=? AND ((s.parent_id IS NULL AND ? IS NULL) OR s.parent_id=?))`, objectID.String(), name, hash, parent, parent).Scan(&exists)
+	})
+	return exists != 0, err
+}
+
 func (s *Store) Baseline(ctx context.Context, objectID uuid.UUID) (uint64, bool, error) {
 	if !validObjectID(objectID) {
 		return 0, false, errors.New("invalid object id")

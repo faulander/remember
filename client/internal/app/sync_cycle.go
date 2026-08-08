@@ -109,6 +109,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			}
 		}
 	}
+	if err := c.publishStagedConflicts(ctx, store); err != nil {
+		return err
+	}
 	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil {
 		return err
 	} else if unresolved {
