@@ -27,7 +27,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
 - Expliziter Bootstrap für bestehende v1-Roots und UUIDv4-kompatible Sync-Objektidentitäten.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
-- Automatisierter Mehrgeräte-Konvergenztest über den vollständigen produktionsnahen Login-, Blob- und Sync-HTTP-Stack einschließlich Serverneustart, kaltem History-Bootstrap sowie Note-/Folder-Move/-Delete.
+- Automatisierter Mehrgeräte-Konvergenztest über den vollständigen produktionsnahen Login-, Blob- und Sync-HTTP-Stack einschließlich Serverneustart, kaltem History-Bootstrap, unterbrochener Pull-Seiten-Wiederaufnahme sowie Note-/Folder-Move/-Delete.
 - PRD, technisches Design, Architekturentscheidungen und manuelle Testpläne.
 
 ### Security
@@ -54,6 +54,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Note-Create/-Move unter einem bereits remote gelöschten Parent retten lokale Bytes crash-sicher als sichtbare synchronisierte Konfliktkopie; weitere Folder-Strukturkonflikte fehlen weiterhin.
 - Eigene akzeptierte Folder-Move/-Delete-Echos werden ausschließlich über atomar persistierte Quellpfad-/Device-/Inode-Intents als lokal ausgeführt bestätigt.
 - Mehrere Note-/Folder-Zustände derselben Pull-Seite verwenden pfadgenaue Zwischenzustände; Create→Delete-Publikationsmarker werden crash-resumierbar vom passenden Delete konsumiert.
+- Ein Netzwerkabbruch zwischen Pull-Seiten setzt nach Clientneustart nachweislich am dauerhaft bestätigten `NextCursor` statt bei Cursor null fort.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder sowie breitere Zwei-Geräte-Konvergenz für die verbleibenden Folder-/Strukturkonflikte sind noch nicht implementiert.

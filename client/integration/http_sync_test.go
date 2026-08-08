@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,6 +46,36 @@ func remote(t *testing.T, base, token string) *remotehttp.Client {
 		t.Fatal(err)
 	}
 	return client
+}
+
+type interruptingRemote struct {
+	*remotehttp.Client
+	pulls     int
+	afters    []uint64
+	firstNext uint64
+}
+
+func (r *interruptingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
+	r.afters = append(r.afters, after)
+	if r.pulls == 1 {
+		return remotehttp.PullPage{}, errors.New("simulated pull-page interruption")
+	}
+	r.pulls++
+	page, err := r.Client.Pull(ctx, after, limit)
+	if err == nil && r.firstNext == 0 {
+		r.firstNext = page.NextCursor
+	}
+	return page, err
+}
+
+type recordingRemote struct {
+	*remotehttp.Client
+	afters []uint64
+}
+
+func (r *recordingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
+	r.afters = append(r.afters, after)
+	return r.Client.Pull(ctx, after, limit)
 }
 
 func syncTimes(t *testing.T, ctx context.Context, core *clientapp.LocalCore, remote *remotehttp.Client, count int) {
@@ -218,5 +250,49 @@ func TestTwoClientsConvergeThroughAuthenticatedHTTP(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(rootC, "Moved")); !os.IsNotExist(err) {
 		t.Fatalf("cold client retained deleted folder: %v", err)
+	}
+	if _, err := a.CreateFolder(ctx, "Bulk"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 110; i++ {
+		name := fmt.Sprintf("Bulk/N%03d.md", i)
+		if _, _, err := a.CreateNote(ctx, name, fmt.Sprintf("bulk %03d\n", i), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	remoteD := remote(t, server.URL, login(t, server.URL, email, password, "Device D"))
+	rootD := t.TempDir()
+	d, _, err := clientapp.Initialize(ctx, rootD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted := &interruptingRemote{Client: remoteD}
+	if err := d.SyncOnce(ctx, interrupted); err == nil || !strings.Contains(err.Error(), "pull-page interruption") {
+		t.Fatalf("interrupted page sync err=%v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, _, err = clientapp.Open(ctx, rootD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	resumedRemote := &recordingRemote{Client: remoteD}
+	if err := d.SyncOnce(ctx, resumedRemote); err != nil {
+		t.Fatal(err)
+	}
+	if len(interrupted.afters) != 2 || interrupted.firstNext == 0 || interrupted.afters[1] != interrupted.firstNext || len(resumedRemote.afters) == 0 || resumedRemote.afters[0] != interrupted.firstNext {
+		t.Fatalf("pull resume interrupted=%v firstNext=%d resumed=%v", interrupted.afters, interrupted.firstNext, resumedRemote.afters)
+	}
+	for _, name := range []string{"Bulk/N000.md", "Bulk/N109.md"} {
+		note, err := d.ReadNote(ctx, name)
+		if err != nil || !strings.Contains(note.Body, "bulk") {
+			t.Fatalf("paged note %s=%#v err=%v", name, note, err)
+		}
+	}
+	if _, err := d.ReadNote(ctx, "Archive/N.md"); err == nil {
+		t.Fatal("paged client retained deleted note")
 	}
 }

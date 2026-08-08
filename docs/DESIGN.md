@@ -1128,6 +1128,7 @@ Tests beenden Prozesse kontrolliert zwischen:
 - Blob-Rename und DB-Commit,
 - DB-Commit und HTTP-Antwort,
 - lokaler Dateianwendung und Cursorfortschritt,
+- bestätigter Pull-Seite und Anforderung der Folgeseite,
 - Backup-Snapshot und Blobkopie.
 
 Nach Neustart müssen Invarianten bestehen oder ein sichtbarer Integritätsfehler entstehen.
@@ -1148,7 +1149,7 @@ Auf je einem realen Windows-, macOS- und Linux-System:
 
 ## 25.5 End-to-End-Tests
 
-Der automatisierte Mehrgeräte-Harness verwendet produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor, die byteidentische Update-Konfliktkonvergenz, Note-/Folder-Move/-Delete, einen Serverneustart auf denselben Datenpfaden und den kalten vollständigen History-Bootstrap eines dritten Geräts. Weitere Szenarien ergänzen dieselbe Oberfläche.
+Der automatisierte Mehrgeräte-Harness verwendet produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor, die byteidentische Update-Konfliktkonvergenz, Note-/Folder-Move/-Delete, einen Serverneustart auf denselben Datenpfaden, den kalten vollständigen History-Bootstrap und die cursor-exakte Wiederaufnahme nach Abbruch zwischen zwei Pull-Seiten. Weitere Szenarien ergänzen dieselbe Oberfläche.
 
 - Registrierung bis Verifikation,
 - Login und Tokenrotation,
