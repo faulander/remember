@@ -645,6 +645,7 @@ Umsetzung von `SYNC-008`:
 - Der Tombstone am ursprünglichen Pfad bleibt wirksam.
 - Die bearbeitete Fassung wird als neue Notiz unter dem reservierten Wiederherstellungsbereich gespeichert.
 - Die ursprüngliche Objekt-ID, Version und Geräteherkunft bleiben als Konfliktmetadaten erhalten.
+- Implementierungsstand M2: Lokales Note-Update gegen bereits kanonisch gelöschte Remote-Notiz ist crash-resumierbar umgesetzt; der umgekehrte lokale Delete gegen Remote-Edit folgt separat.
 
 ## 14.3 Löschen gegen Verschieben
 

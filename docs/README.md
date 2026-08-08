@@ -29,5 +29,6 @@
 | [0016](adr/0016-m2-reserved-conflict-namespace.md) | Server-provisionierter reservierter Konfliktbereich |
 | [0017](adr/0017-m2-note-update-conflict-materialization.md) | Crash-sichere Materialisierung konkurrierender Notiz-Updates |
 | [0018](adr/0018-m2-conflict-staging-cleanup.md) | Identitätsgebundene Bereinigung technischer Konfliktkopien |
+| [0019](adr/0019-m2-edit-delete-conflict-materialization.md) | Edit-vs-Delete-Konflikte mit Tombstone-Vorrang |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

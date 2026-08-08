@@ -62,7 +62,11 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 			}
 		}
 		canonical := &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
-		result := clientsync.Result{Conflict: "base_revision_mismatch", Canonical: canonical}
+		code := "base_revision_mismatch"
+		if state.Deleted {
+			code = "object_deleted"
+		}
+		result := clientsync.Result{Conflict: code, Canonical: canonical}
 		r.server.results[m.OperationID] = result
 		return result, nil
 	}
@@ -240,6 +244,127 @@ func TestSyncOnceMaterializesConcurrentNoteUpdate(t *testing.T) {
 	}
 	if staged, _ := filepath.Glob(filepath.Join(rootB, ".remember", "conflicts", "materializations", "*")); len(staged) != 0 {
 		t.Fatalf("completed conflict staging remains: %v", staged)
+	}
+}
+
+func TestSyncOnceMaterializesEditAgainstRemoteDelete(t *testing.T) {
+	t.Run("paged crash resume", func(t *testing.T) { runEditAgainstRemoteDelete(t, 1, true) })
+	t.Run("batched crash after reconcile", func(t *testing.T) { runEditAgainstRemoteDelete(t, 0, true) })
+}
+
+func runEditAgainstRemoteDelete(t *testing.T, maxPull int, crash bool) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ := a.ReadNote(ctx, "N.md")
+	if _, _, err := a.MoveNote(ctx, "N.md", "Moved.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ = a.ReadNote(ctx, "Moved.md")
+	if _, _, err := a.SaveNote(ctx, "Moved.md", aDoc.Revision, "remote intermediate\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ = a.ReadNote(ctx, "Moved.md")
+	if _, err := a.DeleteNote(ctx, "Moved.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, _ := b.ReadNote(ctx, "N.md")
+	if _, _, err := b.SaveNote(ctx, "N.md", bDoc.Revision, "edited after remote delete\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	server.maxPull = maxPull
+	if crash {
+		if maxPull == 0 {
+			testHookAfterNoteApplyReconcile = func() {
+				testHookAfterNoteApplyReconcile = nil
+				panic("simulated crash after conflicted delete reconcile")
+			}
+		} else {
+			testHookAfterApplyPublication = func() {
+				testHookAfterApplyPublication = nil
+				panic("simulated crash after conflicted delete publication")
+			}
+		}
+		func() {
+			defer func() {
+				if recovered := recover(); recovered == nil {
+					t.Fatalf("expected simulated crash")
+				}
+			}()
+			if err := b.SyncOnce(ctx, remote); err != nil {
+				t.Fatalf("sync before simulated crash: %v", err)
+			}
+		}()
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+		b, _, err = Open(ctx, rootB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Close()
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ReadNote(ctx, "N.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("deleted original remains: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootB, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if len(matches) != 1 {
+		t.Fatalf("conflict copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("edited after remote delete")) || !bytes.Contains(copyBytes, []byte("object_deleted")) {
+		t.Fatalf("copy=%q err=%v", copyBytes, err)
+	}
+	trash, _ := filepath.Glob(filepath.Join(rootB, ".remember", "trash", doc.ID.String()+"-*.md"))
+	if len(trash) != 1 {
+		t.Fatalf("recoverable delete trash=%v", trash)
+	}
+	trashBytes, _ := os.ReadFile(trash[0])
+	if !bytes.Contains(trashBytes, []byte("edited after remote delete")) {
+		t.Fatalf("trash lost edit: %q", trashBytes)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	visible, err := frontmatter.Inspect(copyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := server.states[visible.NoteID]; state.ObjectType != clientsync.Note || state.Deleted {
+		t.Fatalf("conflict copy not synchronized: %#v", state)
 	}
 }
 

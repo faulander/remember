@@ -43,7 +43,11 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		if conflict.Code != "base_revision_mismatch" || m.ObjectType != clientsync.Note || m.Kind != clientsync.Update || conflict.Canonical == nil || conflict.Canonical.ObjectType != clientsync.Note || conflict.Canonical.Deleted || len(conflict.Canonical.BlobHash) != sha256.Size || conflict.Canonical.Revision <= m.BaseRevision {
+		if conflict.Canonical == nil {
+			continue
+		}
+		supportedState := conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted || conflict.Code == "object_deleted" && conflict.Canonical.Deleted
+		if m.ObjectType != clientsync.Note || m.Kind != clientsync.Update || conflict.Canonical.ObjectType != clientsync.Note || !supportedState || len(conflict.Canonical.BlobHash) != sha256.Size || conflict.Canonical.Revision <= m.BaseRevision {
 			continue
 		}
 		if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
@@ -355,12 +359,26 @@ func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *c
 }
 
 func (c *LocalCore) verifyCanonicalConflictApplied(ctx context.Context, item clientsync.ConflictMaterialization, canonical clientsync.CanonicalState) error {
-	if canonical.ObjectType != clientsync.Note || canonical.Deleted || len(canonical.BlobHash) != sha256.Size {
+	if canonical.ObjectType != clientsync.Note || len(canonical.BlobHash) != sha256.Size {
 		return errors.New("unsupported canonical conflict state")
 	}
 	snapshot, err := c.index.ReadSnapshot(ctx)
 	if err != nil {
 		return err
+	}
+	if canonical.Deleted {
+		for _, object := range snapshot.Objects {
+			if object.ID == item.SourceObjectID {
+				return errors.New("canonically deleted conflicted note remains indexed")
+			}
+			if object.RelativePath == item.OriginalRelative {
+				return errors.New("canonically deleted note path is occupied")
+			}
+		}
+		if _, err := repository.ReadRooted(c.root, item.OriginalRelative, 1); !errors.Is(err, os.ErrNotExist) {
+			return errors.New("canonically deleted conflicted note remains visible")
+		}
+		return nil
 	}
 	for _, object := range snapshot.Objects {
 		if object.ID != item.SourceObjectID {

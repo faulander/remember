@@ -40,7 +40,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 ### Known limitations
 
 - Noch keine öffentliche Registrierung, Recovery oder Kontolöschung.
-- Crash-sichere, sichtbare und synchronisierte Konfliktkopien für konkurrierende Notiz-Updates einschließlich descriptor-gebundener technischer Bereinigung; weitere Konfliktklassen fehlen weiterhin.
+- Crash-sichere, sichtbare und synchronisierte Konfliktkopien für konkurrierende Notiz-Updates und lokale Edits gegen kanonische Remote-Deletes einschließlich descriptor-gebundener technischer Bereinigung.
+- Edit-vs-Delete-Apply überspringt authentifizierte kanonische Zwischen-Updates/-Moves, erhält die lokalen Bytes im recoverable Trash und nimmt Abstürze über Pull-Seitengrenzen wieder auf; weitere Konfliktklassen fehlen weiterhin.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.

@@ -62,6 +62,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
 			return err
 		}
+		if err := c.publishStagedConflicts(ctx, store); err != nil {
+			return err
+		}
 	}
 	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode}); err != nil {
 		return err

@@ -25,6 +25,7 @@ var ErrUnsupportedApplyPlan = errors.New("apply plan contains unsupported remote
 
 // Test-only race hook after durable publication and before reconciliation.
 var testHookAfterApplyPublication func()
+var testHookAfterNoteApplyReconcile func()
 var testHookBeforeFolderPublication func()
 var testHookAfterFolderReconcile func()
 var testHookAfterFolderMutationPublication func() error
@@ -37,6 +38,7 @@ type preparedNoteStep struct {
 	expected, content []byte
 	exists, deleted   bool
 	locallyApplied    bool
+	conflictDeferred  bool
 	folderPublication *clientsync.FolderPublication
 	folderMutation    bool
 	folderDevice      uint64
@@ -99,6 +101,12 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 		if step.change.State == "applied" {
 			continue
 		}
+		if step.conflictDeferred {
+			if err := store.MarkApplyStepApplied(ctx, plan.ID, step.index); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := c.publishNoteApplyStep(step); err != nil {
 			return err
 		}
@@ -121,6 +129,9 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 		}
 		if err := c.verifyNoteApplyStep(step); err != nil {
 			return err
+		}
+		if testHookAfterNoteApplyReconcile != nil {
+			testHookAfterNoteApplyReconcile()
 		}
 		if err := store.MarkApplyStepApplied(ctx, plan.ID, step.index); err != nil {
 			return err
@@ -226,13 +237,46 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 			return nil, err
 		}
 		step.relative = target
+		deferredConflict, deferredErr := stagedIntermediateDeleteConflict(ctx, store, change)
+		if deferredErr != nil {
+			return nil, deferredErr
+		}
+		if deferredConflict != nil {
+			object, exists := objects[change.ObjectID]
+			if !exists && change.State == "applied" {
+				step.conflictDeferred = true
+				prepared = append(prepared, step)
+				continue
+			}
+			if !exists || object.Type != localindex.ObjectNote {
+				return nil, errors.New("deferred delete conflict object is unavailable")
+			}
+			step.source, step.expected, step.conflictDeferred = object.RelativePath, append([]byte(nil), object.ContentHash...), true
+			object.RelativePath, object.CollisionPath, object.ContentHash = target, portablePathKey(target), append([]byte(nil), change.BlobHash...)
+			if change.ParentID == nil {
+				object.ParentID = uuid.Nil
+			} else {
+				object.ParentID = *change.ParentID
+			}
+			objects[change.ObjectID] = object
+			virtual[change.ObjectID] = step
+			prepared = append(prepared, step)
+			continue
+		}
 		if change.Mutation == clientsync.Delete {
 			step.trash = ".remember/trash/" + change.ObjectID.String() + "-" + change.OperationID.String() + ".md"
+		}
+		var exactDeleteConflict *clientsync.ConflictMaterialization
+		if change.Mutation == clientsync.Delete {
+			exactDeleteConflict, err = stagedRemoteDeleteConflict(ctx, store, change)
+			if err != nil {
+				return nil, err
+			}
 		}
 		prior, hadPrior := virtual[change.ObjectID]
 		if change.State == "applied" && lastStep[change.ObjectID] > index {
 			step.source, step.expected, step.exists = target, blob, true
-		} else if hadPrior {
+		} else if hadPrior && exactDeleteConflict == nil {
 			if prior.deleted {
 				return nil, errors.New("remote note changes after delete")
 			}
@@ -326,45 +370,63 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 					step.exists = true
 				}
 			case clientsync.Delete:
+				deleteConflict, conflictErr := exactDeleteConflict, error(nil)
+				deleteExpected := blob
+				if deleteConflict != nil {
+					deleteExpected, conflictErr = clientsync.ReadStagedNote(c.root, deleteConflict.SourceHash)
+					if conflictErr != nil {
+						return nil, conflictErr
+					}
+				}
 				if objectExists {
-					if object.Type != localindex.ObjectNote || object.RelativePath != target {
+					if object.Type != localindex.ObjectNote || object.RelativePath != target && (deleteConflict == nil || object.RelativePath != deleteConflict.OriginalRelative) {
 						return nil, errors.New("remote delete object state mismatch")
 					}
 					step.source = object.RelativePath
+					if deleteConflict != nil {
+						step.source = deleteConflict.OriginalRelative
+						if step.source != target {
+							if _, targetErr := repository.ReadRooted(c.root, target, 1); targetErr == nil {
+								return nil, errors.New("canonical delete target path is occupied")
+							} else if !errors.Is(targetErr, os.ErrNotExist) {
+								return nil, targetErr
+							}
+						}
+					}
 					step.expected, err = repository.ReadRooted(c.root, step.source, clientsync.MaxBlobBytes)
 					if errors.Is(err, os.ErrNotExist) {
 						trashed, trashErr := repository.ReadRooted(c.root, step.trash, clientsync.MaxBlobBytes)
-						if trashErr == nil && bytes.Equal(trashed, blob) {
-							step.exists = true
+						if trashErr == nil && bytes.Equal(trashed, deleteExpected) {
+							step.exists, step.expected = true, trashed
 						} else {
-							staged, stagedErr := repository.RootedStagedMoveExists(c.root, step.source, blob)
+							staged, stagedErr := repository.RootedStagedMoveExists(c.root, step.source, deleteExpected)
 							if stagedErr != nil || !staged {
 								return nil, errors.New("remote delete source missing without recoverable trash")
 							}
+							step.expected = deleteExpected
 						}
-						step.expected, err = blob, nil
+						err = nil
 					} else if err != nil {
 						return nil, err
-					} else if !bytes.Equal(step.expected, blob) {
+					} else if !bytes.Equal(step.expected, deleteExpected) {
 						return nil, errors.New("remote delete source bytes differ")
 					}
 				} else {
 					trashed, trashErr := repository.ReadRooted(c.root, step.trash, clientsync.MaxBlobBytes)
-					if trashErr == nil && bytes.Equal(trashed, blob) {
-						step.exists = true
+					if trashErr == nil && bytes.Equal(trashed, deleteExpected) {
+						step.exists, step.expected = true, trashed
 					} else {
-						staged, stagedErr := repository.RootedStagedMoveExists(c.root, target, blob)
+						staged, stagedErr := repository.RootedStagedMoveExists(c.root, target, deleteExpected)
 						if stagedErr == nil && staged {
-							step.exists = false
+							step.expected = deleteExpected
 						} else {
 							matches, matchErr := store.BaselineMatchesOperation(ctx, change.ObjectID, change.Revision, change.OperationID)
 							if matchErr != nil || change.State != "applied" || !matches {
 								return nil, errors.New("remote delete lacks recoverable trash")
 							}
-							step.exists, step.locallyApplied = true, true
+							step.exists, step.locallyApplied, step.expected = true, true, deleteExpected
 						}
 					}
-					step.expected = blob
 				}
 			}
 		}
@@ -418,6 +480,56 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 		}
 	}
 	return prepared, nil
+}
+
+func stagedIntermediateDeleteConflict(ctx context.Context, store *clientsync.Store, change clientsync.Change) (*clientsync.ConflictMaterialization, error) {
+	if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Update && change.Mutation != clientsync.Move) {
+		return nil, nil
+	}
+	items, err := store.StagedConflictMaterializations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.SourceObjectID != change.ObjectID {
+			continue
+		}
+		canonical, err := store.CanonicalConflictState(ctx, item.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		if canonical != nil && canonical.ObjectType == clientsync.Note && canonical.Deleted && canonical.Revision > change.Revision {
+			copyItem := item
+			return &copyItem, nil
+		}
+	}
+	return nil, nil
+}
+
+func stagedRemoteDeleteConflict(ctx context.Context, store *clientsync.Store, change clientsync.Change) (*clientsync.ConflictMaterialization, error) {
+	items, err := store.StagedConflictMaterializations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var found *clientsync.ConflictMaterialization
+	for _, item := range items {
+		if item.SourceObjectID != change.ObjectID {
+			continue
+		}
+		canonical, err := store.CanonicalConflictState(ctx, item.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		if canonical == nil || canonical.ObjectType != clientsync.Note || !canonical.Deleted || canonical.Revision != change.Revision || canonical.Name != change.Name || !bytes.Equal(canonical.BlobHash, change.BlobHash) || canonical.ParentID == nil && change.ParentID != nil || canonical.ParentID != nil && (change.ParentID == nil || *canonical.ParentID != *change.ParentID) {
+			continue
+		}
+		if found != nil {
+			return nil, errors.New("multiple staged delete conflicts for note")
+		}
+		copyItem := item
+		found = &copyItem
+	}
+	return found, nil
 }
 
 func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.Store, planID uuid.UUID, index int, change clientsync.Change, objects map[uuid.UUID]localindex.Object, pathOwners map[string]uuid.UUID) (preparedNoteStep, error) {
@@ -772,7 +884,7 @@ func (c *LocalCore) verifyNoteApplyStep(step preparedNoteStep) error {
 			return nil
 		}
 		trashed, err := repository.ReadRooted(c.root, step.trash, clientsync.MaxBlobBytes)
-		if err != nil || !bytes.Equal(trashed, step.content) {
+		if err != nil || !bytes.Equal(trashed, step.expected) {
 			return errors.New("recoverable remote note delete missing")
 		}
 		return nil
