@@ -47,6 +47,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err := c.stageSupportedConflicts(ctx, store); err != nil {
 		return err
 	}
+	if err := c.cleanupCompletedConflictStages(ctx, store); err != nil {
+		return err
+	}
 	if err := c.publishStagedConflicts(ctx, store); err != nil {
 		return err
 	}

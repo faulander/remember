@@ -19,4 +19,4 @@ App-interne Save-/Move-/Delete-Aktionen auf der Quellnotiz sind zwischen technis
 
 ## Folgen
 
-Konkurrierende Note-Updates konvergieren ohne Text-Merge zu einer kanonischen Originalnotiz und einer sichtbaren, synchronisierten Konfliktkopie. Abstürze vor oder nach Ordnerpublikation, technischem Staging, kanonischem Pull, sichtbarer Kopie und SQLite-Abschluss sind wiederholbar. Technische Stagingdateien werden derzeit nicht automatisch garbage-collected; begrenzte Cleanup-/Retention-Logik folgt separat.
+Konkurrierende Note-Updates konvergieren ohne Text-Merge zu einer kanonischen Originalnotiz und einer sichtbaren, synchronisierten Konfliktkopie. Abstürze vor oder nach Ordnerpublikation, technischem Staging, kanonischem Pull, sichtbarer Kopie und SQLite-Abschluss sind wiederholbar. ADR 0018 ergänzt die identitätsgebundene Bereinigung vollständig abgeschlossener technischer Stagingdateien.

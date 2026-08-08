@@ -226,6 +226,21 @@ func TestConflictMaterializationTransitionsUnblockIntent(t *testing.T) {
 	if err != nil || got == nil || got.State != "completed" {
 		t.Fatalf("materialization=%#v err=%v", got, err)
 	}
+	if cleanups, err := store.CompletedConflictCleanups(ctx); err != nil || len(cleanups) != 1 {
+		t.Fatalf("cleanups=%#v err=%v", cleanups, err)
+	}
+	if err := store.MarkConflictMaterializationCleaned(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if cleanups, err := store.CompletedConflictCleanups(ctx); err != nil || len(cleanups) != 0 {
+		t.Fatalf("cleaned remains=%#v err=%v", cleanups, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE conflict_materializations SET cleaned_at_ms=NULL WHERE operation_id=?`, op.String())
+		return err
+	}); err == nil {
+		t.Fatal("cleanup completion moved backwards")
+	}
 }
 
 func TestMutationShapesDependenciesAndCursorAreFailClosed(t *testing.T) {

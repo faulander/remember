@@ -4,6 +4,7 @@ package repository
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -47,6 +48,57 @@ func TestFolderPublicationBindsNonceInodeAndCleansMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "Folder", folderNonceMarker)); !os.IsNotExist(err) {
 		t.Fatalf("marker remains: %v", err)
+	}
+}
+
+func TestRemoveRootedConflictStageExpectedIsResumableAndPreservesReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".remember", "conflicts", "materializations"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	relative := ".remember/conflicts/materializations/019fdd87-1767-722a-bfd1-482994163db8.md"
+	content := []byte("copy")
+	hash := sha256.Sum256(content)
+	if err := CreateRootedPrivate(root, relative, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedConflictStageExpected(root, relative, hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedConflictStageExpected(root, relative, hash); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := filepath.Join(root, filepath.FromSlash(relative+".cleanup"))
+	if err := os.WriteFile(cleanup, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("replacement")
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(relative)), replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedConflictStageExpected(root, relative, hash); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative))); err != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement=%q err=%v", got, err)
+	}
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash(relative))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cleanup, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testHookBeforeConflictCleanupUnlink = func() {
+		testHookBeforeConflictCleanupUnlink = nil
+		_ = os.Rename(cleanup, cleanup+".saved")
+		_ = os.WriteFile(cleanup, []byte("do not delete"), 0o600)
+	}
+	defer func() { testHookBeforeConflictCleanupUnlink = nil }()
+	if err := RemoveRootedConflictStageExpected(root, relative, hash); err == nil {
+		t.Fatal("cleanup sibling replacement was deleted")
+	}
+	if got, err := os.ReadFile(cleanup); err != nil || string(got) != "do not delete" {
+		t.Fatalf("cleanup replacement=%q err=%v", got, err)
 	}
 }
 

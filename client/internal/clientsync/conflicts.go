@@ -277,6 +277,61 @@ func (s *Store) StagedConflictMaterializations(ctx context.Context) ([]ConflictM
 	return result, err
 }
 
+func (s *Store) CompletedConflictCleanups(ctx context.Context) ([]ConflictMaterialization, error) {
+	var result []ConflictMaterialization
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT operation_id,source_object_id,conflict_note_id,original_relative,target_relative,source_hash,materialized_hash,staged_relative,state FROM conflict_materializations WHERE state='completed' AND cleaned_at_ms IS NULL ORDER BY operation_id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m ConflictMaterialization
+			var op, obj, note string
+			var source, materialized []byte
+			if err := rows.Scan(&op, &obj, &note, &m.OriginalRelative, &m.TargetRelative, &source, &materialized, &m.StagedRelative, &m.State); err != nil {
+				return err
+			}
+			m.OperationID, err = uuid.Parse(op)
+			if err != nil {
+				return err
+			}
+			m.SourceObjectID, err = uuid.Parse(obj)
+			if err != nil {
+				return err
+			}
+			m.ConflictNoteID, err = uuid.Parse(note)
+			if err != nil || len(source) != 32 || len(materialized) != 32 {
+				return errors.New("corrupt conflict cleanup")
+			}
+			copy(m.SourceHash[:], source)
+			copy(m.MaterializedHash[:], materialized)
+			if !validConflictMaterializationShape(m) {
+				return errors.New("corrupt conflict cleanup shape")
+			}
+			result = append(result, m)
+		}
+		return rows.Err()
+	})
+	return result, err
+}
+
+func (s *Store) MarkConflictMaterializationCleaned(ctx context.Context, operationID uuid.UUID) error {
+	if !validOperationID(operationID) {
+		return errors.New("invalid conflict cleanup")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE conflict_materializations SET cleaned_at_ms=COALESCE(cleaned_at_ms,?) WHERE operation_id=? AND state='completed'`, s.clock().UTC().UnixMilli(), operationID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("conflict cleanup unavailable")
+		}
+		return nil
+	})
+}
+
 func (s *Store) CompleteConflictMaterialization(ctx context.Context, operationID uuid.UUID) error {
 	if !validOperationID(operationID) {
 		return errors.New("invalid conflict operation")

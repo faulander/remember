@@ -238,6 +238,9 @@ func TestSyncOnceMaterializesConcurrentNoteUpdate(t *testing.T) {
 	if _, exists := server.states[clientsync.ConflictRecoveredID]; !exists {
 		t.Fatal("reserved conflict namespace not synchronized")
 	}
+	if staged, _ := filepath.Glob(filepath.Join(rootB, ".remember", "conflicts", "materializations", "*")); len(staged) != 0 {
+		t.Fatalf("completed conflict staging remains: %v", staged)
+	}
 }
 
 type cycleRemote struct {

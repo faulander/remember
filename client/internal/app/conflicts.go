@@ -206,6 +206,9 @@ func (c *LocalCore) stageNoteUpdateConflict(ctx context.Context, store *clientsy
 		if err != nil {
 			return err
 		}
+		if int64(len(copyBytes)) > clientsync.MaxBlobBytes {
+			return errors.New("conflict copy exceeds sync blob limit")
+		}
 		materializedHash := sha256.Sum256(copyBytes)
 		materialization = &clientsync.ConflictMaterialization{OperationID: op, SourceObjectID: object.ID, ConflictNoteID: conflictID, OriginalRelative: object.RelativePath, TargetRelative: target, SourceHash: sourceHash, MaterializedHash: materializedHash, StagedRelative: ".remember/conflicts/materializations/" + op.String() + ".md", State: "prepared"}
 		if err := store.PutConflictMaterialization(ctx, *materialization); err != nil {
@@ -222,6 +225,9 @@ func (c *LocalCore) stageNoteUpdateConflict(ctx context.Context, store *clientsy
 	copyBytes, err := frontmatter.MaterializeConflictCopy(source, materialization.SourceObjectID, materialization.ConflictNoteID, frontmatter.ConflictOrigin{OriginalNoteID: materialization.SourceObjectID, OperationID: materialization.OperationID, Reason: conflict.Code, OriginalTarget: materialization.OriginalRelative, BaseRevision: conflict.Outbox.Mutation.BaseRevision, CanonicalRevision: conflict.Canonical.Revision})
 	if err != nil {
 		return err
+	}
+	if int64(len(copyBytes)) > clientsync.MaxBlobBytes {
+		return errors.New("conflict copy exceeds sync blob limit")
 	}
 	if sha256.Sum256(copyBytes) != materialization.MaterializedHash {
 		return errors.New("conflict copy staging hash mismatch")
@@ -300,6 +306,48 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 			return err
 		}
 		if err := store.CompleteConflictMaterialization(ctx, item.OperationID); err != nil {
+			return err
+		}
+	}
+	return c.cleanupCompletedConflictStages(ctx, store)
+}
+
+func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *clientsync.Store) error {
+	items, err := store.CompletedConflictCleanups(ctx)
+	if err != nil {
+		return err
+	}
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		visible := false
+		for _, object := range snapshot.Objects {
+			if object.ID != item.ConflictNoteID {
+				continue
+			}
+			if object.Type != localindex.ObjectNote || object.IdentityState == localindex.IdentityPending || !bytes.Equal(object.ContentHash, item.MaterializedHash[:]) {
+				return errors.New("materialized conflict copy is not durably indexed")
+			}
+			content, readErr := repository.ReadRooted(c.root, object.RelativePath, clientsync.MaxBlobBytes)
+			if readErr != nil || sha256.Sum256(content) != item.MaterializedHash {
+				return errors.New("materialized conflict copy is unavailable")
+			}
+			inspection, inspectErr := frontmatter.Inspect(content)
+			if inspectErr != nil || inspection.NoteID != item.ConflictNoteID {
+				return errors.New("materialized conflict copy identity mismatch")
+			}
+			visible = true
+			break
+		}
+		if !visible {
+			return errors.New("materialized conflict copy is absent")
+		}
+		if err := repository.RemoveRootedConflictStageExpected(c.root, item.StagedRelative, item.MaterializedHash); err != nil {
+			return err
+		}
+		if err := store.MarkConflictMaterializationCleaned(ctx, item.OperationID); err != nil {
 			return err
 		}
 	}

@@ -13,7 +13,7 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
 - interner Identity-, Sync-, Sessions- und Devices-Core mit server-provisioniertem Konfliktbereich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
-- lokaler Index v6 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konfliktjournalen und resumierbarem Notiz-/Folder-Apply
+- lokaler Index v7 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konfliktjournalen und resumierbarem Notiz-/Folder-Apply
 - strikter Client-HTTP-Transport und manueller Vordergrund-Sync für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen
 
 Öffentliche Registrierung, Reminder, weitere Konfliktklassen und sichere Client-Tokenablage folgen in späteren Schnitten.
