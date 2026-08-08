@@ -176,6 +176,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 					return nil, nil, err
 				}
 				m := clientsync.Mutation{OperationID: id, Kind: clientsync.Move, ObjectID: o.ID, ObjectType: syncType(o.Type), BaseRevision: base, Name: path.Base(o.RelativePath), DependencyOperationID: dependency}
+				if o.Type == localindex.ObjectFolder && before.IdentityState == localindex.IdentityKnown && before.FolderDevice > 0 && before.FolderInode > 0 {
+					m.FolderSourceRelative, m.FolderDevice, m.FolderInode = before.RelativePath, before.FolderDevice, before.FolderInode
+				}
 				if o.ParentID != uuid.Nil {
 					p := o.ParentID
 					m.ParentID = &p
@@ -222,6 +225,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 				return nil, nil, err
 			}
 			mutation := clientsync.Mutation{OperationID: id, Kind: clientsync.Delete, ObjectID: o.ID, ObjectType: syncType(o.Type), BaseRevision: base, DependencyOperationID: projected.dependency}
+			if o.Type == localindex.ObjectFolder && o.IdentityState == localindex.IdentityKnown && o.FolderDevice > 0 && o.FolderInode > 0 {
+				mutation.FolderSourceRelative, mutation.FolderDevice, mutation.FolderInode = o.RelativePath, o.FolderDevice, o.FolderInode
+			}
 			if lastDelete != nil && (projected.dependency == nil || *lastDelete != *projected.dependency) {
 				mutation.AdditionalDependencies = []uuid.UUID{*lastDelete}
 			}

@@ -120,6 +120,57 @@ func TestAttemptedOperationRemainsReadyWithStableAttemptTimestamp(t *testing.T) 
 	}
 }
 
+func TestAcceptedFolderIntentIsExactAndImmutable(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	folder := uuid.New()
+	createOp, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.Enqueue(ctx, []Mutation{{OperationID: createOp, Kind: Create, ObjectID: folder, ObjectType: Folder, Name: "Folder"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAttempted(ctx, createOp); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResult(ctx, createOp, Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Enqueue(ctx, []Mutation{{OperationID: moveOp, Kind: Move, ObjectID: folder, ObjectType: Folder, BaseRevision: 1, Name: "Moved", FolderSourceRelative: "Folder", FolderDevice: 11, FolderInode: 22}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAttempted(ctx, moveOp); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResult(ctx, moveOp, Result{Accepted: true, Revision: 2, Cursor: 2}); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{OperationID: moveOp, ObjectID: folder, ObjectType: Folder, Mutation: Move, Revision: 2, Cursor: 2}
+	intent, err := store.AcceptedFolderIntent(ctx, change)
+	if err != nil || intent == nil || intent.SourceRelative != "Folder" || intent.Device != 11 || intent.Inode != 22 {
+		t.Fatalf("intent=%#v err=%v", intent, err)
+	}
+	change.Cursor = 3
+	if intent, err := store.AcceptedFolderIntent(ctx, change); err != nil || intent != nil {
+		t.Fatalf("mismatched cursor intent=%#v err=%v", intent, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_outbox_folder_intents SET inode=23 WHERE operation_id=?`, moveOp.String())
+		return err
+	}); err == nil {
+		t.Fatal("folder intent was mutable")
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM sync_outbox_folder_intents WHERE operation_id=?`, moveOp.String())
+		return err
+	}); err == nil {
+		t.Fatal("folder intent was deletable")
+	}
+}
+
 func TestConflictAndReplayMismatchPersistence(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

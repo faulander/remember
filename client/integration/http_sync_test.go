@@ -118,4 +118,43 @@ func TestTwoClientsConvergeThroughAuthenticatedHTTP(t *testing.T) {
 	if errA != nil || errB != nil || !bytes.Equal(contentA, contentB) || !bytes.Contains(contentA, []byte("conflicting from B")) {
 		t.Fatalf("conflict convergence errA=%v errB=%v equal=%t", errA, errB, bytes.Equal(contentA, contentB))
 	}
+	if _, err := a.CreateFolder(ctx, "MoveMe"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.CreateNote(ctx, "MoveMe/Inside.md", "inside\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	if err := os.Rename(filepath.Join(rootA, "MoveMe"), filepath.Join(rootA, "Moved")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	if info, err := os.Stat(filepath.Join(rootB, "Moved")); err != nil || !info.IsDir() {
+		t.Fatalf("folder move did not converge: %v", err)
+	}
+	inside, err := a.ReadNote(ctx, "Moved/Inside.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DeleteNote(ctx, "Moved/Inside.md", inside.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	if err := os.Remove(filepath.Join(rootA, "Moved")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	if _, err := os.Stat(filepath.Join(rootB, "Moved")); !os.IsNotExist(err) {
+		t.Fatalf("folder delete did not converge: %v", err)
+	}
 }

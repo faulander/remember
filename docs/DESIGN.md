@@ -667,6 +667,12 @@ Umsetzung von `SYNC-008`:
 - Der fehlende Parent-Ordner wird ausschließlich aus kanonischem Zustand und über ein Nonce-/Inode-Journal wiederhergestellt.
 - Erst nach identitätsgebundener Restaurierung und dauerhafter Konfliktauflösung werden die Remote-Kinder angewendet.
 
+## 14.2.3.1 Lokale Folder-Mutations-Echos
+
+- Reconcile bindet bekannte lokale Folder-Moves und -Deletes bereits beim Outbox-Enqueue an Quellpfad sowie Device/Inode.
+- Nur ein exakt passendes akzeptiertes Operation-/Revision-/Cursor-Echo darf diese Bindung übernehmen.
+- Move-Ziel beziehungsweise Delete-Abwesenheit und reale Pfadidentität werden vor dem Apply-Abschluss erneut geprüft.
+
 ## 14.2.4 Notiz erstellen oder verschieben gegen gelöschten Parent
 
 - `parent_unavailable` verwirft den nicht mehr gültigen Zielpfad, nicht aber lokale Notizbytes.
@@ -1140,7 +1146,7 @@ Auf je einem realen Windows-, macOS- und Linux-System:
 
 ## 25.5 End-to-End-Tests
 
-Der automatisierte Zwei-Client-Harness verwendet bereits produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor und die byteidentische Update-Konfliktkonvergenz. Weitere Szenarien ergänzen dieselbe Oberfläche.
+Der automatisierte Zwei-Client-Harness verwendet bereits produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor, die byteidentische Update-Konfliktkonvergenz sowie Folder-Create/-Move/-Delete. Weitere Szenarien ergänzen dieselbe Oberfläche.
 
 - Registrierung bis Verifikation,
 - Login und Tokenrotation,

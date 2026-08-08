@@ -588,14 +588,28 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 	}
 	object, exists := objects[change.ObjectID]
 	if binding == nil {
-		if !exists || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.FolderDevice == 0 || object.FolderInode == 0 {
-			return step, errors.New("remote folder mutation lacks durable inode identity")
+		intent, err := store.AcceptedFolderIntent(ctx, change)
+		if err != nil {
+			return step, err
 		}
 		bindingTarget := target
 		if change.Mutation == clientsync.Delete {
 			bindingTarget = ".remember/trash/folders/" + change.ObjectID.String() + "-" + change.OperationID.String()
 		}
-		binding = &clientsync.FolderMutation{PlanID: planID, StepIndex: index, FolderID: change.ObjectID, Mutation: change.Mutation, SourceRelative: object.RelativePath, TargetRelative: bindingTarget, Device: object.FolderDevice, Inode: object.FolderInode}
+		if intent != nil {
+			if change.Mutation == clientsync.Move && (!exists || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.RelativePath != target || object.FolderDevice != intent.Device || object.FolderInode != intent.Inode) {
+				return step, errors.New("accepted folder move no longer matches local intent")
+			}
+			if change.Mutation == clientsync.Delete && exists {
+				return step, errors.New("accepted folder delete remains locally present")
+			}
+			binding = &clientsync.FolderMutation{PlanID: planID, StepIndex: index, FolderID: change.ObjectID, Mutation: change.Mutation, SourceRelative: intent.SourceRelative, TargetRelative: bindingTarget, Device: intent.Device, Inode: intent.Inode}
+		} else {
+			if !exists || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.FolderDevice == 0 || object.FolderInode == 0 {
+				return step, errors.New("remote folder mutation lacks durable inode identity")
+			}
+			binding = &clientsync.FolderMutation{PlanID: planID, StepIndex: index, FolderID: change.ObjectID, Mutation: change.Mutation, SourceRelative: object.RelativePath, TargetRelative: bindingTarget, Device: object.FolderDevice, Inode: object.FolderInode}
+		}
 		if err := store.PutFolderMutation(ctx, *binding); err != nil {
 			return step, err
 		}

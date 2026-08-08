@@ -40,16 +40,18 @@ const (
 )
 
 type Mutation struct {
-	OperationID            uuid.UUID
-	Kind                   MutationKind
-	ObjectID               uuid.UUID
-	ObjectType             ObjectType
-	BaseRevision           uint64
-	ParentID               *uuid.UUID
-	Name                   string
-	BlobHash               []byte
-	DependencyOperationID  *uuid.UUID
-	AdditionalDependencies []uuid.UUID
+	OperationID               uuid.UUID
+	Kind                      MutationKind
+	ObjectID                  uuid.UUID
+	ObjectType                ObjectType
+	BaseRevision              uint64
+	ParentID                  *uuid.UUID
+	Name                      string
+	BlobHash                  []byte
+	DependencyOperationID     *uuid.UUID
+	AdditionalDependencies    []uuid.UUID
+	FolderSourceRelative      string
+	FolderDevice, FolderInode uint64
 }
 
 type OutboxItem struct {
@@ -208,6 +210,10 @@ func validateMutation(m Mutation) error {
 	if (m.Kind == Create || m.Kind == Move) && naming.ValidateComponent(m.Name) != nil {
 		return errors.New("invalid sync mutation name")
 	}
+	hasFolderBinding := m.FolderSourceRelative != "" || m.FolderDevice != 0 || m.FolderInode != 0
+	if hasFolderBinding && (m.ObjectType != Folder || (m.Kind != Move && m.Kind != Delete) || naming.ValidateUserRelativePath(m.FolderSourceRelative) != nil || m.FolderDevice == 0 || m.FolderInode == 0 || m.FolderDevice > math.MaxInt64 || m.FolderInode > math.MaxInt64) {
+		return errors.New("invalid local folder mutation binding")
+	}
 	return nil
 }
 
@@ -342,6 +348,11 @@ func (s *Store) enqueueTx(ctx context.Context, tx *sql.Tx, mutations []Mutation)
 			VALUES(?,?,?,?,?,?,?,?,?,'pending',?)`, m.OperationID.String(), m.Kind, m.ObjectID.String(), m.ObjectType, m.BaseRevision, parent, m.Name, blob, dep, s.clock().UTC().UnixMilli())
 		if err != nil {
 			return fmt.Errorf("enqueue sync mutation: %w", err)
+		}
+		if m.FolderSourceRelative != "" {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO sync_outbox_folder_intents(operation_id,folder_id,mutation_kind,source_relative,device,inode) VALUES(?,?,?,?,?,?)`, m.OperationID.String(), m.ObjectID.String(), m.Kind, m.FolderSourceRelative, m.FolderDevice, m.FolderInode); err != nil {
+				return fmt.Errorf("bind local folder mutation: %w", err)
+			}
 		}
 		dependencies := append([]uuid.UUID(nil), m.AdditionalDependencies...)
 		if m.DependencyOperationID != nil {

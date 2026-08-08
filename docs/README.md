@@ -40,5 +40,6 @@
 | [0027](adr/0027-m2-folder-not-empty-preservation.md) | Bewahrung nichtleerer Remote-Ordner gegen lokale Deletes |
 | [0028](adr/0028-m2-note-parent-unavailable-rescue.md) | Notizrettung bei nicht verfügbarem Remote-Parent |
 | [0029](adr/0029-m2-authenticated-two-client-convergence.md) | Authentifizierte Zwei-Client-Konvergenz im Integrationstest |
+| [0030](adr/0030-m2-outbound-folder-intent-binding.md) | Identitätsgebundene lokale Folder-Move/-Delete-Intents |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
