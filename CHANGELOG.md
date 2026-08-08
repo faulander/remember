@@ -27,6 +27,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
 - Expliziter Bootstrap für bestehende v1-Roots und UUIDv4-kompatible Sync-Objektidentitäten.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
+- Automatisierter Zwei-Client-Konvergenztest über den vollständigen produktionsnahen Login-, Blob- und Sync-HTTP-Stack.
 - PRD, technisches Design, Architekturentscheidungen und manuelle Testpläne.
 
 ### Security
@@ -53,7 +54,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Note-Create/-Move unter einem bereits remote gelöschten Parent retten lokale Bytes crash-sicher als sichtbare synchronisierte Konfliktkopie; weitere Folder-Strukturkonflikte fehlen weiterhin.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
-- Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
+- Reminder sowie breitere Zwei-Geräte-Konvergenz für die verbleibenden Folder-/Strukturkonflikte sind noch nicht implementiert.
 - Windows- und Linux-Desktop-Builds wurden noch nicht real auf Zielgeräten geprüft.
 - Builds sind unsigniert und besitzen noch keinen automatischen Updater.
 - TLS muss durch einen vorgeschalteten Reverse Proxy terminiert werden.

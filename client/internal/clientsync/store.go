@@ -940,7 +940,8 @@ func (s *Store) PutFolderPublication(ctx context.Context, publication FolderPubl
 		zeroNonce = zeroNonce && value == 0
 	}
 	expectedStage := fmt.Sprintf(".remember/apply/folders/%s/%d", publication.PlanID.String(), publication.StepIndex)
-	if !validOperationID(publication.PlanID) || publication.StepIndex < 0 || !validObjectID(publication.FolderID) || naming.ValidateUserRelativePath(publication.TargetRelative) != nil || publication.StageRelative != expectedStage || zeroNonce || publication.Device > math.MaxInt64 || publication.Inode > math.MaxInt64 {
+	validTarget := naming.ValidateUserRelativePath(publication.TargetRelative) == nil || (publication.FolderID == ConflictRootID && publication.TargetRelative == ConflictRootName) || (publication.FolderID == ConflictRecoveredID && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName)
+	if !validOperationID(publication.PlanID) || publication.StepIndex < 0 || !validObjectID(publication.FolderID) || !validTarget || publication.StageRelative != expectedStage || zeroNonce || publication.Device > math.MaxInt64 || publication.Inode > math.MaxInt64 {
 		return errors.New("invalid folder publication")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {

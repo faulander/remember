@@ -39,5 +39,6 @@
 | [0026](adr/0026-m2-outbox-blob-cleanup.md) | Generationsgebundene Bereinigung finaler Outbox-Blobs |
 | [0027](adr/0027-m2-folder-not-empty-preservation.md) | Bewahrung nichtleerer Remote-Ordner gegen lokale Deletes |
 | [0028](adr/0028-m2-note-parent-unavailable-rescue.md) | Notizrettung bei nicht verfügbarem Remote-Parent |
+| [0029](adr/0029-m2-authenticated-two-client-convergence.md) | Authentifizierte Zwei-Client-Konvergenz im Integrationstest |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -1140,6 +1140,8 @@ Auf je einem realen Windows-, macOS- und Linux-System:
 
 ## 25.5 End-to-End-Tests
 
+Der automatisierte Zwei-Client-Harness verwendet bereits produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor und die byteidentische Update-Konfliktkonvergenz. Weitere Szenarien ergänzen dieselbe Oberfläche.
+
 - Registrierung bis Verifikation,
 - Login und Tokenrotation,
 - Gerätewiderruf,
