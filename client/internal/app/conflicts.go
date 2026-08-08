@@ -50,7 +50,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable" || conflict.Code == "folder_cycle") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable" || conflict.Code == "folder_cycle" || conflict.Code == "base_revision_mismatch") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
 			if err := c.revertFolderMoveConflict(ctx, store, conflict); err != nil {
 				return err
 			}
@@ -116,7 +116,9 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 
 func (c *LocalCore) revertFolderMoveConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
 	m, canonical := conflict.Outbox.Mutation, conflict.Canonical
-	if canonical.Revision != m.BaseRevision || canonical.BlobHash != nil {
+	validRevision := canonical.Revision == m.BaseRevision && conflict.Code != "base_revision_mismatch" || canonical.Revision > m.BaseRevision && conflict.Code == "base_revision_mismatch"
+	equivalentRevisionMove := conflict.Code != "base_revision_mismatch" || canonical.Name == m.Name && ((canonical.ParentID == nil && m.ParentID == nil) || (canonical.ParentID != nil && m.ParentID != nil && *canonical.ParentID == *m.ParentID))
+	if !validRevision || !equivalentRevisionMove || canonical.BlobHash != nil {
 		return errors.New("folder move conflict canonical state mismatch")
 	}
 	revert, err := store.ConflictFolderMoveRevert(ctx, m.OperationID)
@@ -152,8 +154,8 @@ func (c *LocalCore) revertFolderMoveConflict(ctx context.Context, store *clients
 	if revert.FolderID != m.ObjectID || revert.AttemptedRelative != attempted || revert.CanonicalRelative != canonicalPath || revert.Device != object.FolderDevice || revert.Inode != object.FolderInode {
 		return errors.New("folder move revert identity mismatch")
 	}
-	needsReconcile := object.RelativePath == revert.AttemptedRelative
-	if !needsReconcile && object.RelativePath != revert.CanonicalRelative {
+	needsReconcile := revert.AttemptedRelative != revert.CanonicalRelative && object.RelativePath == revert.AttemptedRelative
+	if object.RelativePath != revert.AttemptedRelative && object.RelativePath != revert.CanonicalRelative {
 		return errors.New("folder move revert snapshot path mismatch")
 	}
 	verify := func() error {

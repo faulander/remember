@@ -681,6 +681,8 @@ Umsetzung von `SYNC-008`:
 - Nur deterministisch mitbewegte Nachfahrenpfade werden beim Reconcile unterdrückt; externe Abweichungen bleiben lokale Intents.
 - Abhängige Operationen anderer Objekte dürfen nach der unveränderlichen Auflösung `folder_move_reverted` fortfahren.
 - Ein serverseitiger `folder_cycle` verwendet denselben Revert: Erst kehrt der stale lokale Folder zurück, danach wird die aktuelle Remote-Ancestry gepullt.
+- Zwei konkurrierende Moves mit exakt derselben Parent-ID und demselben Namen gelten nach Inode-Prüfung als äquivalent; nur die höhere Remote-Revision wird anschließend gepullt.
+- Divergente Move-Ziele bleiben fail-closed, weil der kanonische Snapshot keinen authentifizierten Pfad der gesamten Parent-Ancestry enthält.
 - Spätere Operationen desselben Folders verhindern den automatischen Revert, weil ihre Basisrevision neu berechnet werden müsste.
 
 ## 14.2.4 Notiz erstellen oder verschieben gegen gelöschten Parent

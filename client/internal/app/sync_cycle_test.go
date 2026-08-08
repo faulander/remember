@@ -957,6 +957,136 @@ func TestSyncOnceRevertsFolderMovePathCollisionAndKeepsChildEdit(t *testing.T) {
 	}
 }
 
+func TestSyncOnceResolvesEquivalentFolderMoveRevisionConflictAndKeepsChildEdit(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, folder := range []string{"F", "Remote"} {
+		if _, err := a.CreateFolder(ctx, folder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	note, _, err := a.CreateNote(ctx, "F/N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Remote", "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Remote", "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := b.ReadNote(ctx, "Remote/F/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Remote/F/N.md", doc.Revision, "edited after concurrent folder moves\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := b.ReadNote(ctx, "Remote/F/N.md")
+	if err != nil || restored.ID != note.ID || !strings.Contains(restored.Body, "edited after concurrent") {
+		t.Fatalf("revised folder child=%#v err=%v", restored, err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("folder revision conflict unresolved=%t err=%v", unresolved, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	remoteEdit, err := a.ReadNote(ctx, "Remote/F/N.md")
+	if err != nil || !strings.Contains(remoteEdit.Body, "edited after concurrent") {
+		t.Fatalf("concurrent folder edit not synchronized=%#v err=%v", remoteEdit, err)
+	}
+}
+
+func TestSyncOnceRejectsDivergentFolderMoveRevisionConflict(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, folder := range []string{"F", "Remote", "Local"} {
+		if _, err := a.CreateFolder(ctx, folder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := a.CreateNote(ctx, "F/N.md", "base\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Remote", "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local", "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil || !strings.Contains(err.Error(), "canonical state mismatch") {
+		t.Fatalf("divergent folder move err=%v", err)
+	}
+	if _, err := b.ReadNote(ctx, "Local/F/N.md"); err != nil {
+		t.Fatalf("divergent local tree changed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Remote", "F")); !os.IsNotExist(err) {
+		t.Fatalf("remote target was guessed: %v", err)
+	}
+}
+
 func TestSyncOnceRevertsFolderCycleAndKeepsDescendantEdits(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
