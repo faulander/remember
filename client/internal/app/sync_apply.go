@@ -85,16 +85,33 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 	if err := store.BeginApplyPlan(ctx, plan.ID); err != nil {
 		return err
 	}
+	appliedFolders := make(map[uuid.UUID]bool)
+	appliedFolderPaths := make(map[uuid.UUID]string)
 	for _, step := range steps {
 		if step.folderPublication != nil {
 			if err := c.applyFolderCreateStep(ctx, store, plan.ID, step); err != nil {
 				return err
 			}
+			appliedFolders[step.change.ObjectID] = true
+			appliedFolderPaths[step.change.ObjectID] = step.relative
 			continue
 		}
 		if step.folderMutation {
 			if err := c.applyFolderMutationStep(ctx, store, plan.ID, step); err != nil {
 				return err
+			}
+			if step.deleted {
+				delete(appliedFolders, step.change.ObjectID)
+				delete(appliedFolderPaths, step.change.ObjectID)
+			} else {
+				oldPrefix := step.source + "/"
+				for id, current := range appliedFolderPaths {
+					if current == step.source || strings.HasPrefix(current, oldPrefix) {
+						appliedFolderPaths[id] = step.relative + strings.TrimPrefix(current, step.source)
+					}
+				}
+				appliedFolders[step.change.ObjectID] = true
+				appliedFolderPaths[step.change.ObjectID] = step.relative
 			}
 			continue
 		}
@@ -118,11 +135,12 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 				return err
 			}
 		}
-		options := reconcile.Options{RecoveryMode: c.recoveryMode}
+		options := reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteFolders: appliedFolders, AppliedRemoteFolderPaths: appliedFolderPaths}
 		if step.deleted {
 			options.AppliedRemoteDeletes = map[uuid.UUID]bool{step.change.ObjectID: true}
 		} else {
 			options.AppliedRemoteNotes = map[uuid.UUID][32]byte{step.change.ObjectID: sha256.Sum256(step.content)}
+			options.AppliedRemoteNotePaths = map[uuid.UUID]string{step.change.ObjectID: step.relative}
 		}
 		if _, err := reconcile.Run(ctx, c.root, c.index, options); err != nil {
 			return err
@@ -213,6 +231,15 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 				return nil, err
 			}
 			prepared = append(prepared, step)
+			if change.Mutation == clientsync.Move {
+				for id, prior := range virtual {
+					object, exists := objects[id]
+					if exists && object.Type == localindex.ObjectNote {
+						prior.relative = object.RelativePath
+						virtual[id] = prior
+					}
+				}
+			}
 			continue
 		}
 		var hash [sha256.Size]byte
@@ -728,7 +755,14 @@ func (c *LocalCore) applyFolderCreateStep(ctx context.Context, store *clientsync
 		return store.MarkApplyStepApplied(ctx, planID, step.index)
 	}
 	if publication.CleanupAuthorized {
-		return repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode)
+		consumed, err := store.FolderPublicationConsumedByDelete(ctx, planID, publication.FolderID)
+		if err != nil {
+			return err
+		}
+		if consumed {
+			return nil
+		}
+		return repository.VerifyRootedFolderIdentity(c.root, publication.TargetRelative, publication.Device, publication.Inode)
 	}
 	if err := repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode); err != nil {
 		if testHookBeforeFolderPublication != nil {
@@ -749,7 +783,7 @@ func (c *LocalCore) applyFolderCreateStep(ctx context.Context, store *clientsync
 		return repository.VerifyRootedFolderPublication(c.root, publication.TargetRelative, publication.Nonce, publication.Device, publication.Inode)
 	}
 	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{
-		RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{publication.TargetRelative: publication.FolderID}, VerifyTrustedRemoteFolders: verify,
+		RecoveryMode: c.recoveryMode, AppliedRemoteFolderPaths: map[uuid.UUID]string{publication.FolderID: publication.TargetRelative}, TrustedRemoteFolders: map[string]uuid.UUID{publication.TargetRelative: publication.FolderID}, VerifyTrustedRemoteFolders: verify,
 	}); err != nil {
 		return err
 	}
@@ -782,6 +816,27 @@ func (c *LocalCore) applyFolderMutationStep(ctx context.Context, store *clientsy
 		return store.MarkApplyStepApplied(ctx, planID, step.index)
 	}
 	if step.deleted {
+		publication, err := store.FolderPublicationForFolder(ctx, planID, step.change.ObjectID)
+		if err != nil {
+			return err
+		}
+		if publication != nil {
+			if publication.Device != step.folderDevice || publication.Inode != step.folderInode {
+				return errors.New("folder delete publication identity mismatch")
+			}
+			consumed, err := store.FolderPublicationConsumedByDelete(ctx, planID, step.change.ObjectID)
+			if err != nil {
+				return err
+			}
+			if !consumed {
+				if err := repository.CleanupRootedFolderPublication(c.root, step.source, publication.Nonce, publication.Device, publication.Inode); err != nil {
+					return err
+				}
+				if err := store.MarkFolderPublicationConsumedByDelete(ctx, planID, step.change.ObjectID); err != nil {
+					return err
+				}
+			}
+		}
 		if err := repository.DeleteRootedFolderExpected(c.root, step.source, step.folderDevice, step.folderInode); err != nil {
 			return err
 		}
@@ -817,6 +872,25 @@ func (c *LocalCore) applyFolderMutationStep(ctx context.Context, store *clientsy
 		options.TrustedRemoteFolderDeletes = map[string]uuid.UUID{step.source: step.change.ObjectID}
 	} else {
 		options.AppliedRemoteFolders = map[uuid.UUID]bool{step.change.ObjectID: true}
+		options.AppliedRemoteFolderPaths = make(map[uuid.UUID]string)
+		options.AppliedRemoteNotes = make(map[uuid.UUID][32]byte)
+		options.AppliedRemoteNotePaths = make(map[uuid.UUID]string)
+		prefix := step.source + "/"
+		for _, object := range before.Objects {
+			if object.RelativePath != step.source && !strings.HasPrefix(object.RelativePath, prefix) {
+				continue
+			}
+			targetPath := step.relative + strings.TrimPrefix(object.RelativePath, step.source)
+			if object.Type == localindex.ObjectFolder {
+				options.AppliedRemoteFolders[object.ID] = true
+				options.AppliedRemoteFolderPaths[object.ID] = targetPath
+			} else if len(object.ContentHash) == sha256.Size {
+				var hash [sha256.Size]byte
+				copy(hash[:], object.ContentHash)
+				options.AppliedRemoteNotes[object.ID] = hash
+				options.AppliedRemoteNotePaths[object.ID] = targetPath
+			}
+		}
 		options.TrustedRemoteFolderMoves = map[string]string{step.source: step.relative}
 	}
 	if _, err := reconcile.Run(ctx, c.root, c.index, options); err != nil {

@@ -968,6 +968,63 @@ func (s *Store) PutFolderPublication(ctx context.Context, publication FolderPubl
 	})
 }
 
+func (s *Store) FolderPublicationForFolder(ctx context.Context, planID, folderID uuid.UUID) (*FolderPublication, error) {
+	if !validOperationID(planID) || !validObjectID(folderID) {
+		return nil, errors.New("invalid folder publication lookup")
+	}
+	var result *FolderPublication
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var p FolderPublication
+		var rawFolder string
+		var nonce []byte
+		var cleanup int
+		err := tx.QueryRowContext(ctx, `SELECT step_index,folder_id,target_relative,stage_relative,nonce,device,inode,cleanup_authorized FROM apply_folder_publications WHERE plan_id=? AND folder_id=? ORDER BY step_index LIMIT 1`, planID.String(), folderID.String()).Scan(&p.StepIndex, &rawFolder, &p.TargetRelative, &p.StageRelative, &nonce, &p.Device, &p.Inode, &cleanup)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		p.PlanID = planID
+		p.FolderID, err = uuid.Parse(rawFolder)
+		if err != nil || p.FolderID != folderID || len(nonce) != 32 {
+			return errors.New("corrupt folder publication lookup")
+		}
+		copy(p.Nonce[:], nonce)
+		p.CleanupAuthorized = cleanup == 1
+		result = &p
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) FolderPublicationConsumedByDelete(ctx context.Context, planID, folderID uuid.UUID) (bool, error) {
+	if !validOperationID(planID) || !validObjectID(folderID) {
+		return false, errors.New("invalid consumed folder publication lookup")
+	}
+	var exists int
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM apply_folder_publications f JOIN apply_plans p ON p.plan_id=f.plan_id JOIN apply_steps d ON d.plan_id=p.plan_id WHERE f.plan_id=? AND f.folder_id=? AND f.cleanup_authorized=1 AND f.cleaned_at_ms IS NOT NULL AND p.status='applying' AND d.object_id=f.folder_id AND d.object_type='folder' AND d.mutation='delete')`, planID.String(), folderID.String()).Scan(&exists)
+	})
+	return exists != 0, err
+}
+
+func (s *Store) MarkFolderPublicationConsumedByDelete(ctx context.Context, planID, folderID uuid.UUID) error {
+	if !validOperationID(planID) || !validObjectID(folderID) {
+		return errors.New("invalid consumed folder publication")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE apply_folder_publications SET cleaned_at_ms=COALESCE(cleaned_at_ms,?) WHERE plan_id=? AND folder_id=? AND cleanup_authorized=1 AND EXISTS(SELECT 1 FROM apply_plans p JOIN apply_steps d ON d.plan_id=p.plan_id WHERE p.plan_id=? AND p.status='applying' AND d.object_id=? AND d.object_type='folder' AND d.mutation='delete' AND d.state IN ('pending','applied'))`, s.clock().UTC().UnixMilli(), planID.String(), folderID.String(), planID.String(), folderID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("folder publication delete consumption unavailable")
+		}
+		return nil
+	})
+}
+
 func (s *Store) FolderPublication(ctx context.Context, planID uuid.UUID, stepIndex int) (*FolderPublication, error) {
 	if !validOperationID(planID) || stepIndex < 0 {
 		return nil, errors.New("invalid folder publication key")

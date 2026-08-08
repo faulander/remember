@@ -34,9 +34,11 @@ type Options struct {
 	NewOperationID func() (uuid.UUID, error)
 	// AppliedRemoteNotes suppresses Outbox derivation only for authenticated
 	// remote note bytes whose exact observed SHA-256 matches the supplied hash.
-	AppliedRemoteNotes   map[uuid.UUID][32]byte
-	AppliedRemoteFolders map[uuid.UUID]bool
-	AppliedRemoteDeletes map[uuid.UUID]bool
+	AppliedRemoteNotes       map[uuid.UUID][32]byte
+	AppliedRemoteNotePaths   map[uuid.UUID]string
+	AppliedRemoteFolders     map[uuid.UUID]bool
+	AppliedRemoteFolderPaths map[uuid.UUID]string
+	AppliedRemoteDeletes     map[uuid.UUID]bool
 	// Trusted remote folder changes are accepted only with a verifier bound
 	// to a persisted filesystem identity.
 	TrustedRemoteFolders       map[string]uuid.UUID

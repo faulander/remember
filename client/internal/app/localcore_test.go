@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,6 +214,103 @@ func TestExecuteActiveApplyPlanRejectsNonEmptyFolderDelete(t *testing.T) {
 	}
 	if cursor, err := store.ConfirmedCursor(ctx); err != nil || cursor != 1 {
 		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+}
+
+func TestSamePlanFolderCreateDeleteResumesAfterPhysicalDelete(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	planID, folderID := uuid.Must(uuid.NewV7()), uuid.New()
+	createOp, deleteOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: planID, FromCursor: 0, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 1, OperationID: createOp, ObjectID: folderID, Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "Transient"}, {Cursor: 2, OperationID: deleteOp, ObjectID: folderID, Mutation: clientsync.Delete, ObjectType: clientsync.Folder, Revision: 2, Name: "Transient", Deleted: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(context.Context, [32]byte) ([]byte, error) { return nil, errors.New("unexpected blob") })
+	testHookAfterFolderMutationPublication = func() error {
+		testHookAfterFolderMutationPublication = nil
+		return errors.New("simulated crash after same-plan folder delete")
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err == nil || !strings.Contains(err.Error(), "simulated crash") {
+		t.Fatalf("interrupted delete err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Transient")); !os.IsNotExist(err) {
+		t.Fatalf("folder still visible after interrupted delete: %v", err)
+	}
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resumed, _, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Close()
+	if err := resumed.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	resumedStore, _ := clientsync.NewStore(resumed.index)
+	if cursor, err := resumedStore.ConfirmedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Transient")); !os.IsNotExist(err) {
+		t.Fatalf("resumed folder delete=%v", err)
+	}
+}
+
+func TestFolderMoveApplyCapturesConcurrentDescendantMove(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ := clientsync.NewStore(core.index)
+	folderID, noteID := uuid.New(), uuid.New()
+	folderCreate, noteCreate := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	content, _ := frontmatter.EnsureIdentity([]byte("body\n"), noteID)
+	hash := sha256.Sum256(content.Markdown)
+	firstPlan := uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: firstPlan, FromCursor: 0, ThroughCursor: 2, Steps: []clientsync.Change{{Cursor: 1, OperationID: folderCreate, ObjectID: folderID, Mutation: clientsync.Create, ObjectType: clientsync.Folder, Revision: 1, Name: "A"}, {Cursor: 2, OperationID: noteCreate, ObjectID: noteID, Mutation: clientsync.Create, ObjectType: clientsync.Note, Revision: 1, ParentID: &folderID, Name: "N.md", BlobHash: hash[:]}}}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := clientsync.BlobResolverFunc(func(_ context.Context, want [32]byte) ([]byte, error) {
+		if want != hash {
+			return nil, errors.New("unexpected blob")
+		}
+		return content.Markdown, nil
+	})
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	movePlan, moveOp := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: movePlan, FromCursor: 2, ThroughCursor: 3, Steps: []clientsync.Change{{Cursor: 3, OperationID: moveOp, ObjectID: folderID, Mutation: clientsync.Move, ObjectType: clientsync.Folder, Revision: 2, Name: "B"}}}); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterFolderMutationPublication = func() error {
+		testHookAfterFolderMutationPublication = nil
+		return os.Rename(filepath.Join(root, "B", "N.md"), filepath.Join(root, "Escaped.md"))
+	}
+	defer func() { testHookAfterFolderMutationPublication = nil }()
+	if err := core.ExecuteActiveApplyPlan(ctx, resolver); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListPending(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range pending {
+		if item.Mutation.ObjectID == noteID && item.Mutation.Kind == clientsync.Move && item.Mutation.Name == "Escaped.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("concurrent descendant move intent=%#v", pending)
 	}
 }
 

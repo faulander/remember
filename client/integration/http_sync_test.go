@@ -57,17 +57,18 @@ func syncTimes(t *testing.T, ctx context.Context, core *clientapp.LocalCore, rem
 
 func TestTwoClientsConvergeThroughAuthenticatedHTTP(t *testing.T) {
 	ctx := context.Background()
-	server, err := integrationtest.New(ctx, t.TempDir())
+	serverRoot := t.TempDir()
+	server, err := integrationtest.New(ctx, serverRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	const email, password = "sync@example.test", "correct horse battery staple"
 	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
 		t.Fatal(err)
 	}
-	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Device A"))
-	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Device B"))
+	tokenA, tokenB := login(t, server.URL, email, password, "Device A"), login(t, server.URL, email, password, "Device B")
+	remoteA, remoteB := remote(t, server.URL, tokenA), remote(t, server.URL, tokenB)
 	rootA, rootB := t.TempDir(), t.TempDir()
 	a, _, err := clientapp.Initialize(ctx, rootA)
 	if err != nil {
@@ -118,6 +119,60 @@ func TestTwoClientsConvergeThroughAuthenticatedHTTP(t *testing.T) {
 	if errA != nil || errB != nil || !bytes.Equal(contentA, contentB) || !bytes.Contains(contentA, []byte("conflicting from B")) {
 		t.Fatalf("conflict convergence errA=%v errB=%v equal=%t", errA, errB, bytes.Equal(contentA, contentB))
 	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server, err = integrationtest.New(ctx, serverRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteA, remoteB = remote(t, server.URL, tokenA), remote(t, server.URL, tokenB)
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Device C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	cold, err := c.ReadNote(ctx, "N.md")
+	if err != nil || !strings.Contains(cold.Body, "canonical from A") {
+		t.Fatalf("cold bootstrap canonical=%#v err=%v", cold, err)
+	}
+	coldCopies, _ := filepath.Glob(filepath.Join(rootC, "_Konflikte", "Wiederhergestellt", "N (Konflikt *).md"))
+	if len(coldCopies) != 1 {
+		t.Fatalf("cold bootstrap conflict copies=%v", coldCopies)
+	}
+	if _, err := a.CreateFolder(ctx, "Archive"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	canonical, err := a.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "N.md", "Archive/N.md", canonical.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	moved, err := b.ReadNote(ctx, "Archive/N.md")
+	if err != nil || !strings.Contains(moved.Body, "canonical from A") {
+		t.Fatalf("note move did not converge: %#v err=%v", moved, err)
+	}
+	if _, err := b.DeleteNote(ctx, "Archive/N.md", moved.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, b, remoteB, 1)
+	syncTimes(t, ctx, a, remoteA, 1)
+	for label, core := range map[string]*clientapp.LocalCore{"A": a, "B": b} {
+		if _, err := core.ReadNote(ctx, "Archive/N.md"); err == nil {
+			t.Fatalf("%s note delete did not converge", label)
+		}
+	}
 	if _, err := a.CreateFolder(ctx, "MoveMe"); err != nil {
 		t.Fatal(err)
 	}
@@ -156,5 +211,12 @@ func TestTwoClientsConvergeThroughAuthenticatedHTTP(t *testing.T) {
 	syncTimes(t, ctx, b, remoteB, 1)
 	if _, err := os.Stat(filepath.Join(rootB, "Moved")); !os.IsNotExist(err) {
 		t.Fatalf("folder delete did not converge: %v", err)
+	}
+	syncTimes(t, ctx, c, remoteC, 1)
+	if _, err := c.ReadNote(ctx, "Archive/N.md"); err == nil {
+		t.Fatal("cold client retained deleted note")
+	}
+	if _, err := os.Stat(filepath.Join(rootC, "Moved")); !os.IsNotExist(err) {
+		t.Fatalf("cold client retained deleted folder: %v", err)
 	}
 }

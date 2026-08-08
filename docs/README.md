@@ -41,5 +41,6 @@
 | [0028](adr/0028-m2-note-parent-unavailable-rescue.md) | Notizrettung bei nicht verfügbarem Remote-Parent |
 | [0029](adr/0029-m2-authenticated-two-client-convergence.md) | Authentifizierte Zwei-Client-Konvergenz im Integrationstest |
 | [0030](adr/0030-m2-outbound-folder-intent-binding.md) | Identitätsgebundene lokale Folder-Move/-Delete-Intents |
+| [0031](adr/0031-m2-cold-history-apply-convergence.md) | Kalter History-Apply über Serverneustarts |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -672,6 +672,8 @@ Umsetzung von `SYNC-008`:
 - Reconcile bindet bekannte lokale Folder-Moves und -Deletes bereits beim Outbox-Enqueue an Quellpfad sowie Device/Inode.
 - Nur ein exakt passendes akzeptiertes Operation-/Revision-/Cursor-Echo darf diese Bindung übernehmen.
 - Move-Ziel beziehungsweise Delete-Abwesenheit und reale Pfadidentität werden vor dem Apply-Abschluss erneut geprüft.
+- Innerhalb einer Pull-Seite folgen virtuelle Notizpfade verifizierten Ancestor-Moves; Reconcile unterdrückt nur exakte ID-/Hash-/Zielpfadzustände.
+- Ein im selben Plan erstellter und gelöschter Folder konsumiert seinen Nonce-Marker journalisiert und über Neustarts resumierbar.
 
 ## 14.2.4 Notiz erstellen oder verschieben gegen gelöschten Parent
 
@@ -1146,7 +1148,7 @@ Auf je einem realen Windows-, macOS- und Linux-System:
 
 ## 25.5 End-to-End-Tests
 
-Der automatisierte Zwei-Client-Harness verwendet bereits produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor, die byteidentische Update-Konfliktkonvergenz sowie Folder-Create/-Move/-Delete. Weitere Szenarien ergänzen dieselbe Oberfläche.
+Der automatisierte Mehrgeräte-Harness verwendet produktionsnahe Identity-/Session-, Blob- und Sync-Komponenten hinter den echten HTTP-Routen. Er prüft getrennte Geräte-Tokens, Roots, Cursor, die byteidentische Update-Konfliktkonvergenz, Note-/Folder-Move/-Delete, einen Serverneustart auf denselben Datenpfaden und den kalten vollständigen History-Bootstrap eines dritten Geräts. Weitere Szenarien ergänzen dieselbe Oberfläche.
 
 - Registrierung bis Verifikation,
 - Login und Tokenrotation,
