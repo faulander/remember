@@ -37,5 +37,6 @@
 | [0024](adr/0024-m2-object-missing-move-delete-resolution.md) | `object_missing` für Note-Move und bereits erfüllte Deletes |
 | [0025](adr/0025-m2-evacuated-conflict-byte-cleanup.md) | Sichere Bereinigung evakuierter Konfliktbytes |
 | [0026](adr/0026-m2-outbox-blob-cleanup.md) | Generationsgebundene Bereinigung finaler Outbox-Blobs |
+| [0027](adr/0027-m2-folder-not-empty-preservation.md) | Bewahrung nichtleerer Remote-Ordner gegen lokale Deletes |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

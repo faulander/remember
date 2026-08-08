@@ -89,6 +89,17 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		r.server.results[m.OperationID] = result
 		return result, nil
 	}
+	if m.Kind == clientsync.Delete && state.ObjectType == clientsync.Folder {
+		for _, child := range r.server.states {
+			if child.ParentID != nil && *child.ParentID == m.ObjectID && !child.Deleted {
+				r.server.ensureConflictNamespace()
+				canonical := &clientsync.CanonicalState{ObjectType: clientsync.Folder, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name}
+				result := clientsync.Result{Conflict: "folder_not_empty", Canonical: canonical}
+				r.server.results[m.OperationID] = result
+				return result, nil
+			}
+		}
+	}
 	if m.Kind == clientsync.Move {
 		for id, existing := range r.server.states {
 			if id != m.ObjectID && !existing.Deleted && existing.Name == m.Name && ((existing.ParentID == nil && m.ParentID == nil) || (existing.ParentID != nil && m.ParentID != nil && *existing.ParentID == *m.ParentID)) {
@@ -820,6 +831,148 @@ func TestSyncOnceTreatsMissingRemoteDeleteAsSatisfied(t *testing.T) {
 	}
 	if err := store.ResolveMissingDelete(ctx, uuid.Must(uuid.NewV7())); err == nil {
 		t.Fatal("unauthorized missing delete resolution accepted")
+	}
+}
+
+func TestSyncOnceTreatsMissingRemoteFolderDeleteAsSatisfied(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	if _, err := core.CreateFolder(ctx, "GoneFolder"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := core.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var folderID uuid.UUID
+	for _, object := range snapshot.Objects {
+		if object.Type == "folder" && object.RelativePath == "GoneFolder" {
+			folderID = object.ID
+		}
+	}
+	if folderID == uuid.Nil {
+		t.Fatal("folder identity unavailable")
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	delete(server.states, folderID)
+	if err := os.Remove(filepath.Join(root, "GoneFolder")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("missing folder delete unresolved=%t err=%v", unresolved, err)
+	}
+	var resolution string
+	if err := core.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT r.resolution FROM sync_outbox o JOIN sync_conflict_resolutions r ON r.operation_id=o.operation_id WHERE o.object_id=? AND o.object_type='folder' AND o.mutation='delete'`, folderID.String()).Scan(&resolution)
+	}); err != nil || resolution != "already_deleted" {
+		t.Fatalf("folder delete resolution=%s err=%v", resolution, err)
+	}
+}
+
+func TestSyncOnceRestoresFolderRejectedAsNotEmpty(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Folder"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	child, _, err := a.CreateNote(ctx, "Folder/Remote.md", "remote child\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := b.index.ReadSnapshot(ctx)
+	var folderID uuid.UUID
+	for _, object := range snapshot.Objects {
+		if object.Type == "folder" && object.RelativePath == "Folder" {
+			folderID = object.ID
+		}
+	}
+	if err := os.Remove(filepath.Join(rootB, "Folder")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderPublication = func() { testHookAfterConflictFolderPublication = nil; panic("simulated folder restoration crash") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected folder restoration crash")
+			}
+		}()
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("sync before folder restoration crash: %v", err)
+		}
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReadNote(ctx, "Folder/Remote.md")
+	if err != nil || got.ID != child.ID || !strings.Contains(got.Body, "remote child") {
+		t.Fatalf("restored folder child=%#v err=%v", got, err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("folder-not-empty unresolved=%t err=%v", unresolved, err)
+	}
+	var resolution string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT r.resolution FROM sync_outbox o JOIN sync_conflict_resolutions r ON r.operation_id=o.operation_id WHERE o.object_id=? AND o.conflict_code='folder_not_empty'`, folderID.String()).Scan(&resolution)
+	}); err != nil || resolution != "folder_not_empty_preserved" {
+		t.Fatalf("folder restoration resolution=%s err=%v", resolution, err)
+	}
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE conflict_folder_restorations SET state='prepared'`)
+		return err
+	}); err == nil {
+		t.Fatal("folder restoration moved backwards")
+	}
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error { _, err := tx.Exec(`DELETE FROM conflict_folder_restorations`); return err }); err == nil {
+		t.Fatal("folder restoration history was deleted")
 	}
 }
 

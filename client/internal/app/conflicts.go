@@ -21,6 +21,7 @@ import (
 var testHookBeforeConflictRecoveredPublication func()
 var testHookBeforeConflictCompletion func()
 var testHookAfterConflictEvacuation func()
+var testHookAfterConflictFolderPublication func()
 
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
@@ -46,6 +47,15 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Delete && conflict.Code == "folder_not_empty" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
+			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
+				return err
+			}
+			if err := c.restoreFolderNotEmptyConflict(ctx, store, conflict); err != nil {
+				return err
+			}
+			continue
+		}
 		if m.Kind == clientsync.Delete && conflict.Code == "object_missing" && conflict.Canonical == nil {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
@@ -93,6 +103,106 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		}
 	}
 	return nil
+}
+
+func (c *LocalCore) restoreFolderNotEmptyConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+	m, canonical := conflict.Outbox.Mutation, conflict.Canonical
+	if canonical.Revision != m.BaseRevision {
+		return errors.New("folder-not-empty canonical revision mismatch")
+	}
+	restoration, err := store.ConflictFolderRestoration(ctx, m.OperationID)
+	if err != nil {
+		return err
+	}
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects[object.ID] = object
+	}
+	target, err := remoteNotePath(objects, canonical.ParentID, canonical.Name)
+	if err != nil {
+		return err
+	}
+	var parent *localindex.Object
+	if canonical.ParentID != nil {
+		value, ok := objects[*canonical.ParentID]
+		if !ok || value.Type != localindex.ObjectFolder || value.IdentityState != localindex.IdentityKnown || value.FolderDevice == 0 || value.FolderInode == 0 {
+			return errors.New("folder restoration parent identity unavailable")
+		}
+		parent = &value
+	}
+	if restoration == nil {
+		if _, _, err := repository.RootedFolderIdentity(c.root, target); err == nil {
+			return errors.New("folder restoration target already exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		stage := ".remember/conflicts/restores/" + m.OperationID.String()
+		if err := repository.RemoveRootedFolderPublicationStage(c.root, stage); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		var nonce [32]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return err
+		}
+		device, inode, err := repository.CreateRootedFolderPublication(c.root, stage, nonce)
+		if err != nil {
+			return err
+		}
+		restoration = &clientsync.ConflictFolderRestoration{OperationID: m.OperationID, FolderID: m.ObjectID, TargetRelative: target, StageRelative: stage, Nonce: nonce, Device: device, Inode: inode, State: "prepared"}
+		if err := store.PutConflictFolderRestoration(ctx, *restoration); err != nil {
+			return err
+		}
+	}
+	if restoration.FolderID != m.ObjectID || restoration.TargetRelative != target {
+		return errors.New("folder restoration identity mismatch")
+	}
+	verify := func() error {
+		if parent != nil {
+			if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
+				return err
+			}
+		}
+		return repository.VerifyRootedFolderPublication(c.root, target, restoration.Nonce, restoration.Device, restoration.Inode)
+	}
+	if restoration.State == "prepared" {
+		if verify() != nil {
+			if err := repository.PublishRootedFolderPublication(c.root, restoration.StageRelative, target, restoration.Nonce, restoration.Device, restoration.Inode); err != nil {
+				return err
+			}
+		}
+		if testHookAfterConflictFolderPublication != nil {
+			testHookAfterConflictFolderPublication()
+		}
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{target: m.ObjectID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+			return err
+		}
+		if err := verify(); err != nil {
+			return err
+		}
+		if err := store.MarkConflictFolderRestorationPublished(ctx, m.OperationID); err != nil {
+			return err
+		}
+		restoration.State = "published"
+	}
+	if restoration.State == "published" {
+		if err := repository.CleanupRootedFolderPublication(c.root, target, restoration.Nonce, restoration.Device, restoration.Inode); err != nil {
+			return err
+		}
+		if err := store.CompleteFolderNotEmptyResolution(ctx, m.OperationID); err != nil {
+			return err
+		}
+		restoration.State = "completed"
+	}
+	if parent != nil {
+		if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
+			return err
+		}
+	}
+	return repository.VerifyRootedFolderIdentity(c.root, target, restoration.Device, restoration.Inode)
 }
 
 func (c *LocalCore) ensureLocalConflictNamespace(ctx context.Context, store *clientsync.Store) error {

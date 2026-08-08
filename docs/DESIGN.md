@@ -661,6 +661,12 @@ Umsetzung von `SYNC-008`:
 - Die Evakuierung von Update oder Move unterdrückt einen falschen lokalen Folge-Delete auch über Absturz und Neustart hinweg.
 - Ein lokaler Delete gegen `object_missing` ist semantisch bereits erfüllt und wird unveränderlich als `already_deleted` journalisiert, ohne ein neues Serverobjekt zu erzeugen.
 
+## 14.2.3 Leeren Ordner löschen gegen neue Remote-Kinder
+
+- Ein serverseitiges `folder_not_empty` verwirft die lokale Delete-Absicht zugunsten der bereits synchronisierten Kinder.
+- Der fehlende Parent-Ordner wird ausschließlich aus kanonischem Zustand und über ein Nonce-/Inode-Journal wiederhergestellt.
+- Erst nach identitätsgebundener Restaurierung und dauerhafter Konfliktauflösung werden die Remote-Kinder angewendet.
+
 ## 14.3 Löschen gegen Verschieben
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.

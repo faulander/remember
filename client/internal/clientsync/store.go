@@ -101,6 +101,14 @@ type ConflictFolderPublication struct {
 	State                         string
 }
 
+type ConflictFolderRestoration struct {
+	OperationID, FolderID         uuid.UUID
+	TargetRelative, StageRelative string
+	Nonce                         [32]byte
+	Device, Inode                 uint64
+	State                         string
+}
+
 type ConflictMaterialization struct {
 	OperationID, SourceObjectID, ConflictNoteID uuid.UUID
 	OriginalRelative, TargetRelative            string
