@@ -9,11 +9,11 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - lokaler macOS-Desktop-Client mit Wails, Go, Svelte 5 und TypeScript
 - echte Markdown-Dateien mit versioniertem YAML-Frontmatter
 - verschachtelte Ordner, Tags, Vorschau, Themes und recoverbares Löschen
-- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete-, fehlende Remote-Objekt-, fehlende Parent- und Note-Create/-Move-Pfadkonfliktkopien; Folder-Move-Pfad-/Parent-Konflikte werden inode-gebunden zurückgesetzt, bereits remote fehlende Deletes konvergieren ohne neue Kopie und nichtleere Remote-Ordner werden sicher bewahrt
+- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete-, fehlende Remote-Objekt-, fehlende Parent- und Note-Create/-Move-Pfadkonfliktkopien; Folder-Move-Pfad-/Parent-/Cycle-Konflikte werden inode-gebunden zurückgesetzt, bereits remote fehlende Deletes konvergieren ohne neue Kopie und nichtleere Remote-Ordner werden sicher bewahrt
 - modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
 - interner Identity-, Sync-, Sessions- und Devices-Core mit server-provisioniertem Konfliktbereich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
-- lokaler Index v13 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konflikt-/Rebase-/No-op-/Folder-Restore-/Folder-Move-Revert-/Folder-Intent-/Blob-Cleanup-Journalen, descriptor-gebundener Löschung technischer Bytes und resumierbarem Notiz-/Folder-Apply
+- lokaler Index v14 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konflikt-/Rebase-/No-op-/Folder-Restore-/Folder-Move-Revert-/Folder-Intent-/Blob-Cleanup-Journalen, descriptor-gebundener Löschung technischer Bytes und resumierbarem Notiz-/Folder-Apply
 - strikter Client-HTTP-Transport und manueller Vordergrund-Sync für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen
 - automatisierter Mehrgeräte-Konvergenztest über echte Login-, Blob- und Sync-HTTP-Routen einschließlich Serverneustart, kaltem History-Bootstrap, dauerhafter Pull-Seiten-Wiederaufnahme, sichtbarer Update-Konfliktkopie sowie Note-/Folder-Move/-Delete
 

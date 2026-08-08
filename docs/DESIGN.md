@@ -675,11 +675,12 @@ Umsetzung von `SYNC-008`:
 - Innerhalb einer Pull-Seite folgen virtuelle Notizpfade verifizierten Ancestor-Moves; Reconcile unterdrückt nur exakte ID-/Hash-/Zielpfadzustände.
 - Ein im selben Plan erstellter und gelöschter Folder konsumiert seinen Nonce-Marker journalisiert und über Neustarts resumierbar.
 
-## 14.2.3.2 Folder-Move gegen belegten Pfad oder gelöschten Parent
+## 14.2.3.2 Folder-Move gegen belegten Pfad, gelöschten Parent oder Zyklus
 
 - Der konfliktbehaftete Folder wird anhand des vor dem Outbox-Enqueue gebundenen Device/Inode an seinen authentifizierten kanonischen Pfad zurückverschoben.
 - Nur deterministisch mitbewegte Nachfahrenpfade werden beim Reconcile unterdrückt; externe Abweichungen bleiben lokale Intents.
 - Abhängige Operationen anderer Objekte dürfen nach der unveränderlichen Auflösung `folder_move_reverted` fortfahren.
+- Ein serverseitiger `folder_cycle` verwendet denselben Revert: Erst kehrt der stale lokale Folder zurück, danach wird die aktuelle Remote-Ancestry gepullt.
 - Spätere Operationen desselben Folders verhindern den automatischen Revert, weil ihre Basisrevision neu berechnet werden müsste.
 
 ## 14.2.4 Notiz erstellen oder verschieben gegen gelöschten Parent

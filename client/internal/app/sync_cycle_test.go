@@ -101,6 +101,23 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		r.server.results[m.OperationID] = result
 		return result, nil
 	}
+	if m.Kind == clientsync.Move && state.ObjectType == clientsync.Folder && m.ParentID != nil {
+		cursor := m.ParentID
+		for depth := 0; cursor != nil && depth < 1000; depth++ {
+			if *cursor == m.ObjectID {
+				r.server.ensureConflictNamespace()
+				canonical := &clientsync.CanonicalState{ObjectType: clientsync.Folder, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name}
+				result := clientsync.Result{Conflict: "folder_cycle", Canonical: canonical}
+				r.server.results[m.OperationID] = result
+				return result, nil
+			}
+			parent, exists := r.server.states[*cursor]
+			if !exists || parent.Deleted {
+				break
+			}
+			cursor = parent.ParentID
+		}
+	}
 	if m.Kind == clientsync.Delete && state.ObjectType == clientsync.Folder {
 		for _, child := range r.server.states {
 			if child.ParentID != nil && *child.ParentID == m.ObjectID && !child.Deleted {
@@ -937,6 +954,91 @@ func TestSyncOnceRevertsFolderMovePathCollisionAndKeepsChildEdit(t *testing.T) {
 	remoteEdit, err := a.ReadNote(ctx, "Source/N.md")
 	if err != nil || !strings.Contains(remoteEdit.Body, "edited after move") {
 		t.Fatalf("remote child edit=%#v err=%v", remoteEdit, err)
+	}
+}
+
+func TestSyncOnceRevertsFolderCycleAndKeepsDescendantEdits(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "X"); err != nil {
+		t.Fatal(err)
+	}
+	fNote, _, err := a.CreateNote(ctx, "F/F.md", "f base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.CreateNote(ctx, "X/X.md", "x base\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootA, "X"), filepath.Join(rootA, "F", "X")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "X", "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := b.ReadNote(ctx, "X/F/F.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "X/F/F.md", doc.Revision, "f edited after cycle move\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := b.ReadNote(ctx, "F/F.md")
+	if err != nil || restored.ID != fNote.ID || !strings.Contains(restored.Body, "edited after cycle") {
+		t.Fatalf("cycle child=%#v err=%v", restored, err)
+	}
+	if nested, err := b.ReadNote(ctx, "F/X/X.md"); err != nil || !strings.Contains(nested.Body, "x base") {
+		t.Fatalf("remote descendant=%#v err=%v", nested, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "X")); !os.IsNotExist(err) {
+		t.Fatalf("stale root X remains: %v", err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("folder cycle unresolved=%t err=%v", unresolved, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	remoteEdit, err := a.ReadNote(ctx, "F/F.md")
+	if err != nil || !strings.Contains(remoteEdit.Body, "edited after cycle") {
+		t.Fatalf("cycle edit not synchronized=%#v err=%v", remoteEdit, err)
 	}
 }
 
