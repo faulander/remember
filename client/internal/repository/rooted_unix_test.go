@@ -100,6 +100,19 @@ func TestRemoveRootedConflictStageExpectedIsResumableAndPreservesReplacement(t *
 	if got, err := os.ReadFile(cleanup); err != nil || string(got) != "do not delete" {
 		t.Fatalf("cleanup replacement=%q err=%v", got, err)
 	}
+	evacuation := ".remember/trash/conflicts/019fdd87-1767-722a-bfd1-482994163db8.md"
+	if err := os.MkdirAll(filepath.Join(root, ".remember", "trash", "conflicts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(evacuation)), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedConflictEvacuationExpected(root, evacuation, hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedConflictEvacuationExpected(root, evacuation, hash); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMoveRootedFolderExpectedBindsInodeAndResumes(t *testing.T) {

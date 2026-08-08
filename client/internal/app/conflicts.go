@@ -821,6 +821,20 @@ func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *c
 		if !visible {
 			return errors.New("materialized conflict copy is absent")
 		}
+		kind, err := store.ConflictMutationKind(ctx, item.OperationID)
+		if err != nil {
+			return err
+		}
+		code, err := store.ConflictCode(ctx, item.OperationID)
+		if err != nil {
+			return err
+		}
+		if (kind == clientsync.Create || kind == clientsync.Move) && code == "path_collision" || (kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing" {
+			evacuated := ".remember/trash/conflicts/" + item.OperationID.String() + ".md"
+			if err := repository.RemoveRootedConflictEvacuationExpected(c.root, evacuated, item.SourceHash); err != nil {
+				return err
+			}
+		}
 		if err := repository.RemoveRootedConflictStageExpected(c.root, item.StagedRelative, item.MaterializedHash); err != nil {
 			return err
 		}

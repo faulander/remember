@@ -272,8 +272,16 @@ func TestSyncOnceMaterializesConcurrentNoteUpdate(t *testing.T) {
 	if _, exists := server.states[clientsync.ConflictRecoveredID]; !exists {
 		t.Fatal("reserved conflict namespace not synchronized")
 	}
-	if staged, _ := filepath.Glob(filepath.Join(rootB, ".remember", "conflicts", "materializations", "*")); len(staged) != 0 {
-		t.Fatalf("completed conflict staging remains: %v", staged)
+	if staged, _ := filepath.Glob(filepath.Join(rootB, ".remember", "conflicts", "materializations", "*")); len(staged) > 1 {
+		t.Fatalf("unexpected conflict staging artifacts: %v", staged)
+	} else if len(staged) == 1 {
+		info, err := os.Stat(staged[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() != 0 || !strings.HasSuffix(staged[0], ".cleanup") {
+			t.Fatalf("completed conflict bytes remain: %v", staged)
+		}
 	}
 }
 
@@ -747,6 +755,17 @@ func TestSyncOnceMaterializesMoveForMissingRemoteNote(t *testing.T) {
 	copies, _ := filepath.Glob(filepath.Join(root, "_Konflikte", "Wiederhergestellt", "*.md"))
 	if len(copies) != 1 {
 		t.Fatalf("move orphan copies=%v", copies)
+	}
+	if technical, _ := filepath.Glob(filepath.Join(root, ".remember", "trash", "conflicts", "*")); len(technical) > 1 {
+		t.Fatalf("unexpected evacuation artifacts: %v", technical)
+	} else if len(technical) == 1 {
+		info, err := os.Stat(technical[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() != 0 || !strings.HasSuffix(technical[0], ".cleanup") {
+			t.Fatalf("evacuation bytes remain: %v size=%v", technical, info.Size())
+		}
 	}
 	content, _ := os.ReadFile(copies[0])
 	inspection, err := frontmatter.Inspect(content)

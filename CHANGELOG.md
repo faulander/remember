@@ -46,7 +46,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Konkurrierende Note-Creates am selben portablen Pfad evakuieren die verlierenden Bytes crash-sicher und materialisieren sie erst nach baseline-gebundener Anwendung des Remote-Gewinners.
 - Note-Move-Pfadkollisionen stellen den authentifizierten kanonischen Quellzustand wieder her und retten die lokal verschobenen sowie abhängig bearbeiteten Bytes als synchronisierte Konfliktkopie.
 - Note-Updates und -Moves gegen `object_missing` evakuieren verwaiste Quellbytes samt abhängiger Edits mit crash-sicherer Delete-Unterdrückung und synchronisieren sie unter neuer UUID.
-- Deletes gegen bereits fehlende Remote-Objekte werden ohne künstlichen Tombstone dauerhaft als `already_deleted` aufgelöst; weitere Konfliktklassen fehlen weiterhin.
+- Deletes gegen bereits fehlende Remote-Objekte werden ohne künstlichen Tombstone dauerhaft als `already_deleted` aufgelöst.
+- Nach sichtbarer Konfliktveröffentlichung werden vollständige technische Staging- und Evakuierungsbytes descriptor-gebunden getruncated; nur leere crash-idempotente Sentinels bleiben zurück. Weitere Konfliktklassen fehlen weiterhin.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.

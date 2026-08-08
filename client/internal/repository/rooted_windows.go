@@ -25,6 +25,9 @@ func ReadRootedPrivate(string, string, int64) ([]byte, error) {
 func RemoveRootedConflictStageExpected(string, string, [32]byte) error {
 	return errors.New("private sync staging is not yet supported on Windows")
 }
+func RemoveRootedConflictEvacuationExpected(string, string, [32]byte) error {
+	return errors.New("private sync staging is not yet supported on Windows")
+}
 
 func ReadRooted(root, relative string, maxBytes int64) ([]byte, error) {
 	return readBoundedFile(filepath.Join(root, filepath.FromSlash(relative)), maxBytes)
