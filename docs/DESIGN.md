@@ -654,6 +654,12 @@ Umsetzung von `SYNC-008`:
 - Die Konfliktkopie wird erst sichtbar, wenn der Remote-Gewinner durch Baseline und abgeschlossenen Apply-Schritt authentifiziert ist.
 - Bei einer Note-Move-Kollision wird zusätzlich die Quell-UUID am authentifizierten kanonischen Pfad wiederhergestellt; lokal verschobene und abhängig bearbeitete Bytes werden mit neuer UUID gerettet.
 
+## 14.2.2 Update gegen fehlendes Remote-Objekt
+
+- Ein `object_missing` ohne kanonischen Zustand übernimmt niemals still die verwaiste UUID.
+- Die lokalen Bytes werden mit neuer UUID unter Wiederhergestellt gerettet und die alte Quellidentität nur als Konfliktherkunft bewahrt.
+- Die Evakuierung unterdrückt einen falschen lokalen Folge-Delete auch über Absturz und Neustart hinweg.
+
 ## 14.3 Löschen gegen Verschieben
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.

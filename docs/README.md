@@ -33,5 +33,6 @@
 | [0020](adr/0020-m2-delete-edit-conflict-rebase.md) | Lokaler Delete gegen Remote-Edit mit abhängigem Tombstone-Rebase |
 | [0021](adr/0021-m2-note-create-path-collision.md) | Verlustfreie Note-Create-Pfadkollisionen |
 | [0022](adr/0022-m2-note-move-path-collision.md) | Note-Move-Pfadkollisionen mit kanonischer Wiederherstellung |
+| [0023](adr/0023-m2-note-update-object-missing.md) | Note-Update gegen fehlendes Remote-Objekt |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

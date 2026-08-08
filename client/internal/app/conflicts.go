@@ -19,6 +19,7 @@ import (
 
 var testHookBeforeConflictRecoveredPublication func()
 var testHookBeforeConflictCompletion func()
+var testHookAfterConflictEvacuation func()
 
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
@@ -44,12 +45,14 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		if m.ObjectType == clientsync.Note && conflict.Code == "path_collision" && ((m.Kind == clientsync.Create && conflict.Canonical == nil) || (m.Kind == clientsync.Move && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size)) {
+		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && conflict.Code == "path_collision") || (m.Kind == clientsync.Update && conflict.Code == "object_missing"))
+		moveCollision := m.Kind == clientsync.Move && conflict.Code == "path_collision" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size
+		if m.ObjectType == clientsync.Note && (canonicalAbsent || moveCollision) {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
 			}
-			if m.Kind == clientsync.Create {
-				if err := c.stageNoteCreatePathCollision(ctx, store, conflict); err != nil {
+			if canonicalAbsent {
+				if err := c.stageNoteCanonicalAbsentConflict(ctx, store, conflict); err != nil {
 					return err
 				}
 			} else if err := c.stageNoteMovePathCollision(ctx, store, conflict); err != nil {
@@ -188,7 +191,7 @@ func (c *LocalCore) ensureLocalConflictNamespace(ctx context.Context, store *cli
 	return nil
 }
 
-func (c *LocalCore) stageNoteCreatePathCollision(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+func (c *LocalCore) stageNoteCanonicalAbsentConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
 	op := conflict.Outbox.Mutation.OperationID
 	materialization, err := store.ConflictMaterialization(ctx, op)
 	if err != nil {
@@ -507,11 +510,15 @@ func (c *LocalCore) ensurePathCollisionEvacuated(ctx context.Context, item clien
 	if err != nil {
 		return err
 	}
+	finish := func() error {
+		_, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{item.SourceObjectID: true}})
+		return err
+	}
 	source, err := repository.ReadRooted(c.root, item.OriginalRelative, clientsync.MaxBlobBytes)
 	if err == nil && sha256.Sum256(source) != item.SourceHash {
 		existing, trashErr := repository.ReadRooted(c.root, trash, clientsync.MaxBlobBytes)
 		if trashErr == nil && sha256.Sum256(existing) == item.SourceHash {
-			return nil
+			return finish()
 		}
 		return errors.New("path-collision source changed")
 	}
@@ -520,8 +527,10 @@ func (c *LocalCore) ensurePathCollisionEvacuated(ctx context.Context, item clien
 	}
 	moveErr := repository.MoveRootedExpected(c.root, item.OriginalRelative, trash, expected)
 	if moveErr == nil {
-		_, err = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{item.SourceObjectID: true}})
-		return err
+		if testHookAfterConflictEvacuation != nil {
+			testHookAfterConflictEvacuation()
+		}
+		return finish()
 	}
 	if !errors.Is(moveErr, os.ErrNotExist) && !errors.Is(moveErr, os.ErrExist) {
 		return moveErr
@@ -530,7 +539,7 @@ func (c *LocalCore) ensurePathCollisionEvacuated(ctx context.Context, item clien
 	if err != nil || sha256.Sum256(evacuated) != item.SourceHash {
 		return errors.New("path-collision evacuation unavailable")
 	}
-	return nil
+	return finish()
 }
 
 func (c *LocalCore) verifyPathCollisionApplied(ctx context.Context, store *clientsync.Store, item clientsync.ConflictMaterialization) error {
@@ -563,6 +572,24 @@ func (c *LocalCore) verifyPathCollisionApplied(ctx context.Context, store *clien
 		return nil
 	}
 	return errors.New("remote path-collision winner is absent")
+}
+
+func (c *LocalCore) verifyOrphanConflictEvacuated(ctx context.Context, item clientsync.ConflictMaterialization) error {
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	for _, object := range snapshot.Objects {
+		if object.ID == item.SourceObjectID {
+			return errors.New("object-missing conflict source remains indexed")
+		}
+	}
+	trash := ".remember/trash/conflicts/" + item.OperationID.String() + ".md"
+	content, err := repository.ReadRooted(c.root, trash, clientsync.MaxBlobBytes)
+	if err != nil || sha256.Sum256(content) != item.SourceHash {
+		return errors.New("object-missing conflict evacuation unavailable")
+	}
+	return nil
 }
 
 func (c *LocalCore) ensureMoveCollisionCanonical(ctx context.Context, store *clientsync.Store, item clientsync.ConflictMaterialization, canonical clientsync.CanonicalState, resolver clientsync.BlobResolver) (bool, error) {
@@ -632,7 +659,11 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if err != nil {
 			return err
 		}
-		if kind == clientsync.Create || kind == clientsync.Move {
+		code, err := store.ConflictCode(ctx, item.OperationID)
+		if err != nil {
+			return err
+		}
+		if kind == clientsync.Create || kind == clientsync.Move || kind == clientsync.Update && code == "object_missing" {
 			if err := c.ensurePathCollisionEvacuated(ctx, item); err != nil {
 				return err
 			}
@@ -670,12 +701,21 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		if err != nil {
 			return err
 		}
-		if canonical == nil && kind != clientsync.Create {
+		code, err := store.ConflictCode(ctx, item.OperationID)
+		if err != nil {
+			return err
+		}
+		orphan := canonical == nil && kind == clientsync.Update && code == "object_missing"
+		if canonical == nil && kind != clientsync.Create && !orphan {
 			return errors.New("canonical conflict state unavailable")
 		}
 		localDelete := kind == clientsync.Delete
 		if kind == clientsync.Create {
 			if err := c.verifyPathCollisionApplied(ctx, store, item); err != nil {
+				return err
+			}
+		} else if orphan {
+			if err := c.verifyOrphanConflictEvacuated(ctx, item); err != nil {
 				return err
 			}
 		} else {
@@ -717,6 +757,10 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		}
 		if kind == clientsync.Create {
 			if err := c.verifyPathCollisionApplied(ctx, store, item); err != nil {
+				return err
+			}
+		} else if orphan {
+			if err := c.verifyOrphanConflictEvacuated(ctx, item); err != nil {
 				return err
 			}
 		} else if err := c.verifyCanonicalConflictApplied(ctx, item, *canonical, localDelete); err != nil {

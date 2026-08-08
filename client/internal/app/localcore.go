@@ -171,6 +171,19 @@ func Open(ctx context.Context, root string) (*LocalCore, reconcile.Report, error
 		}
 		return core, reconcile.Report{Objects: len(snapshot.Objects)}, nil
 	}
+	if evacuating, err := store.HasEvacuatingConflict(ctx); err != nil {
+		index.Close()
+		rootLock.Unlock()
+		return nil, reconcile.Report{}, err
+	} else if evacuating {
+		snapshot, snapshotErr := index.ReadSnapshot(ctx)
+		if snapshotErr != nil {
+			index.Close()
+			rootLock.Unlock()
+			return nil, reconcile.Report{}, snapshotErr
+		}
+		return core, reconcile.Report{Objects: len(snapshot.Objects)}, nil
+	}
 	report, err := core.reconcileWithOptions(ctx, reconcile.Options{RecoveryMode: recoveryMode})
 	if err != nil {
 		index.Close()

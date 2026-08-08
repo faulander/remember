@@ -62,6 +62,12 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		return result, nil
 	}
 	state := r.server.states[m.ObjectID]
+	if m.Kind != clientsync.Create && state.Revision == 0 {
+		r.server.ensureConflictNamespace()
+		result := clientsync.Result{Conflict: "object_missing"}
+		r.server.results[m.OperationID] = result
+		return result, nil
+	}
 	if m.Kind == clientsync.Create {
 		for id, existing := range r.server.states {
 			if id != m.ObjectID && !existing.Deleted && existing.Name == m.Name && ((existing.ParentID == nil && m.ParentID == nil) || (existing.ParentID != nil && m.ParentID != nil && *existing.ParentID == *m.ParentID)) {
@@ -635,6 +641,71 @@ func TestSyncOnceMaterializesNoteMovePathCollision(t *testing.T) {
 	}
 	if rescued := server.states[inspection.NoteID]; rescued.ObjectType != clientsync.Note || rescued.Deleted {
 		t.Fatalf("remote rescued move=%#v", rescued)
+	}
+}
+
+func TestSyncOnceMaterializesUpdateForMissingRemoteNote(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	doc, _, err := core.CreateNote(ctx, "Missing.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	delete(server.states, doc.ID)
+	current, _ := core.ReadNote(ctx, "Missing.md")
+	if _, _, err := core.SaveNote(ctx, "Missing.md", current.Revision, "local orphan edit\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictEvacuation = func() { testHookAfterConflictEvacuation = nil; panic("simulated crash after orphan evacuation") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected orphan evacuation crash")
+			}
+		}()
+		_ = core.SyncOnce(ctx, remote)
+	}()
+	if _, err := core.ReadNote(ctx, "Missing.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("orphan source not evacuated: %v", err)
+	}
+	if copies, _ := filepath.Glob(filepath.Join(root, "_Konflikte", "Wiederhergestellt", "*.md")); len(copies) != 0 {
+		t.Fatalf("orphan copy published before reserved pull: %v", copies)
+	}
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	core, _, err = Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	copies, _ := filepath.Glob(filepath.Join(root, "_Konflikte", "Wiederhergestellt", "*.md"))
+	if len(copies) != 1 {
+		t.Fatalf("orphan copies=%v", copies)
+	}
+	content, _ := os.ReadFile(copies[0])
+	inspection, err := frontmatter.Inspect(content)
+	if err != nil || inspection.NoteID == doc.ID || !bytes.Contains(content, []byte("local orphan edit")) || !bytes.Contains(content, []byte("object_missing")) {
+		t.Fatalf("orphan copy=%q inspection=%#v err=%v", content, inspection, err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.ObjectType != clientsync.Note || rescued.Deleted {
+		t.Fatalf("remote orphan rescue=%#v", rescued)
 	}
 }
 

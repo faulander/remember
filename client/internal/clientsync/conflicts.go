@@ -136,12 +136,28 @@ func (s *Store) MarkConflictFolderPublication(ctx context.Context, id uuid.UUID,
 	})
 }
 
+func (s *Store) ConflictCode(ctx context.Context, operationID uuid.UUID) (string, error) {
+	var code string
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT conflict_code FROM sync_outbox WHERE operation_id=? AND status='conflict'`, operationID.String()).Scan(&code)
+	})
+	return code, err
+}
+
 func (s *Store) ConflictMutationKind(ctx context.Context, operationID uuid.UUID) (MutationKind, error) {
 	var kind MutationKind
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		return tx.QueryRowContext(ctx, `SELECT mutation FROM sync_outbox WHERE operation_id=?`, operationID.String()).Scan(&kind)
 	})
 	return kind, err
+}
+
+func (s *Store) HasEvacuatingConflict(ctx context.Context) (bool, error) {
+	var exists int
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_materializations m JOIN sync_outbox o ON o.operation_id=m.operation_id WHERE m.state IN ('copy_staged','copy_published') AND ((o.mutation IN ('create','move') AND o.conflict_code='path_collision') OR (o.mutation='update' AND o.conflict_code='object_missing')))`).Scan(&exists)
+	})
+	return exists != 0, err
 }
 
 func (s *Store) HasStagedConflictForObject(ctx context.Context, objectID uuid.UUID) (bool, error) {
