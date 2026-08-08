@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path"
@@ -787,6 +788,30 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 		}
 	}
 	return c.cleanupCompletedConflictStages(ctx, store)
+}
+
+func (c *LocalCore) cleanupCompletedOutboxBlobs(ctx context.Context, store *clientsync.Store) error {
+	for {
+		hashes, err := store.PendingOutboxBlobCleanups(ctx, 100)
+		if err != nil {
+			return err
+		}
+		if len(hashes) == 0 {
+			return nil
+		}
+		for _, item := range hashes {
+			relative := ".remember/sync/outbox/" + hex.EncodeToString(item.Hash[:])
+			if err := repository.RemoveRootedOutboxBlobExpected(c.root, relative, item.Hash, item.ThroughSequence); err != nil {
+				return err
+			}
+			if err := store.MarkOutboxBlobCleaned(ctx, item); err != nil {
+				return err
+			}
+		}
+		if len(hashes) < 100 {
+			return nil
+		}
+	}
 }
 
 func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *clientsync.Store) error {

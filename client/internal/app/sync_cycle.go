@@ -50,6 +50,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err := c.cleanupCompletedConflictStages(ctx, store); err != nil {
 		return err
 	}
+	if err := c.cleanupCompletedOutboxBlobs(ctx, store); err != nil {
+		return err
+	}
 	if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
 		return err
 	}
@@ -112,6 +115,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
 		return err
 	}
+	if err := c.cleanupCompletedOutboxBlobs(ctx, store); err != nil {
+		return err
+	}
 	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil {
 		return err
 	} else if unresolved {
@@ -162,6 +168,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			return err
 		}
 		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
+			return err
+		}
+		if err := c.cleanupCompletedOutboxBlobs(ctx, store); err != nil {
 			return err
 		}
 		if !page.HasMore {

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,6 +113,35 @@ func TestRemoveRootedConflictStageExpectedIsResumableAndPreservesReplacement(t *
 	}
 	if err := RemoveRootedConflictEvacuationExpected(root, evacuation, hash); err != nil {
 		t.Fatal(err)
+	}
+	outboxHash := sha256.Sum256([]byte("outbox"))
+	outbox := ".remember/sync/outbox/" + fmt.Sprintf("%x", outboxHash)
+	if err := os.MkdirAll(filepath.Join(root, ".remember", "sync", "outbox"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateRootedPrivate(root, outbox, []byte("outbox")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedOutboxBlobExpected(root, outbox, outboxHash, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedOutboxBlobExpected(root, outbox, outboxHash, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateRootedPrivate(root, outbox, []byte("outbox")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveRootedOutboxBlobExpected(root, outbox, outboxHash, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(outbox))); !os.IsNotExist(err) {
+		t.Fatalf("reused outbox base remains: %v", err)
+	}
+	for _, suffix := range []string{".cleanup-1", ".cleanup-2"} {
+		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(outbox+suffix)))
+		if err != nil || info.Size() != 0 {
+			t.Fatalf("outbox sentinel %s info=%v err=%v", suffix, info, err)
+		}
 	}
 }
 

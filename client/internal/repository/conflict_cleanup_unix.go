@@ -5,6 +5,7 @@ package repository
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -30,27 +31,35 @@ func validConflictTechnicalNote(relative string) bool {
 // conflict-copy bytes. Rename-before-validate and a final inode check preserve
 // both the original pathname and a concurrently replaced cleanup pathname.
 func RemoveRootedConflictStageExpected(root, relative string, expected [32]byte) error {
-	if !strings.HasPrefix(relative, ".remember/conflicts/materializations/") {
+	if !strings.HasPrefix(relative, ".remember/conflicts/materializations/") || !validConflictTechnicalNote(relative) {
 		return errors.New("invalid conflict materialization stage")
 	}
-	return removeRootedConflictTechnicalExpected(root, relative, expected, 0o600)
+	return removeRootedTechnicalExpected(root, relative, expected, 0o600, ".cleanup")
 }
 func RemoveRootedConflictEvacuationExpected(root, relative string, expected [32]byte) error {
-	if !strings.HasPrefix(relative, ".remember/trash/conflicts/") {
+	if !strings.HasPrefix(relative, ".remember/trash/conflicts/") || !validConflictTechnicalNote(relative) {
 		return errors.New("invalid conflict evacuation")
 	}
-	return removeRootedConflictTechnicalExpected(root, relative, expected, 0o644)
+	return removeRootedTechnicalExpected(root, relative, expected, 0o644, ".cleanup")
 }
-func removeRootedConflictTechnicalExpected(root, relative string, expected [32]byte, expectedMode uint32) error {
-	if !validConflictTechnicalNote(relative) {
-		return errors.New("invalid conflict technical note")
+func RemoveRootedOutboxBlobExpected(root, relative string, expected [32]byte, throughSequence int64) error {
+	parts := strings.Split(relative, "/")
+	if len(parts) != 4 || parts[0] != ".remember" || parts[1] != "sync" || parts[2] != "outbox" || len(parts[3]) != 64 || throughSequence <= 0 {
+		return errors.New("invalid outbox blob cleanup")
 	}
+	decoded, err := hex.DecodeString(parts[3])
+	if err != nil || parts[3] != strings.ToLower(parts[3]) || !bytes.Equal(decoded, expected[:]) {
+		return errors.New("outbox blob cleanup hash path mismatch")
+	}
+	return removeRootedTechnicalExpected(root, relative, expected, 0o600, fmt.Sprintf(".cleanup-%d", throughSequence))
+}
+func removeRootedTechnicalExpected(root, relative string, expected [32]byte, expectedMode uint32, cleanupSuffix string) error {
 	parent, base, err := openRootedParent(root, relative)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(parent)
-	cleanup := base + ".cleanup"
+	cleanup := base + cleanupSuffix
 	fd, err := unix.Openat(parent, cleanup, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if errors.Is(err, unix.ENOENT) {
 		if err := renameFolderNoReplace(parent, base, parent, cleanup); err != nil {

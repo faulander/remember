@@ -21,7 +21,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen, paginierten Cursor-Pull und wiederholbare kanonische Konfliktzustände.
-- Lokaler Index v9 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-, Konflikt-, Rebase-, No-op- und Cleanup-Journalen.
+- Lokaler Index v10 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
 - Crash-resumierbarer Remote-Apply für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen ohne permanente Marker.
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
@@ -47,7 +47,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Note-Move-Pfadkollisionen stellen den authentifizierten kanonischen Quellzustand wieder her und retten die lokal verschobenen sowie abhängig bearbeiteten Bytes als synchronisierte Konfliktkopie.
 - Note-Updates und -Moves gegen `object_missing` evakuieren verwaiste Quellbytes samt abhängiger Edits mit crash-sicherer Delete-Unterdrückung und synchronisieren sie unter neuer UUID.
 - Deletes gegen bereits fehlende Remote-Objekte werden ohne künstlichen Tombstone dauerhaft als `already_deleted` aufgelöst.
-- Nach sichtbarer Konfliktveröffentlichung werden vollständige technische Staging- und Evakuierungsbytes descriptor-gebunden getruncated; nur leere crash-idempotente Sentinels bleiben zurück. Weitere Konfliktklassen fehlen weiterhin.
+- Nach sichtbarer Konfliktveröffentlichung werden vollständige technische Staging- und Evakuierungsbytes descriptor-gebunden getruncated; nur leere crash-idempotente Sentinels bleiben zurück.
+- Finale content-addressed Outbox-Blobs werden nur ohne aktive Replay-/Konfliktreferenz und pro Hash-Wiederverwendung in einer eigenen Sequenzgeneration bereinigt. Weitere Konfliktklassen fehlen weiterhin.
 - Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
 - Noch keine sichere Clientablage für Refresh-Tokens.
 - Reminder und Zwei-Geräte-End-to-End-Konvergenz sind noch nicht implementiert.
