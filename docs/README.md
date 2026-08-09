@@ -56,5 +56,6 @@
 | [0043](adr/0043-m2-direct-note-folder-create-recovery.md) | Recovery nichtleerer Folder-Creates mit direkten Notes |
 | [0044](adr/0044-m2-authenticated-structural-conflict-convergence.md) | Authentifizierte Strukturkonflikt-Konvergenz |
 | [0045](adr/0045-m2-empty-folder-move-delete-recovery.md) | Leerer Folder-Move gegen Remote-Delete |
+| [0046](adr/0046-m2-equivalent-root-note-moves.md) | Äquivalente konkurrierende Root-Note-Moves |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

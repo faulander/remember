@@ -397,7 +397,7 @@ func (s *Store) listReady(ctx context.Context, limit int, includeAttempted bool)
 		rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.operation_id,o.mutation,o.object_id,o.object_type,o.base_revision,o.parent_id,o.name,o.blob_hash,o.dependency_operation_id,o.status
 			FROM sync_outbox o WHERE `+statuses+` AND NOT EXISTS(
 				SELECT 1 FROM sync_outbox_dependencies d JOIN sync_outbox prerequisite ON prerequisite.operation_id=d.dependency_operation_id
-				WHERE d.operation_id=o.operation_id AND prerequisite.status<>'accepted' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=prerequisite.operation_id AND r.resolution='folder_move_reverted'))
+				WHERE d.operation_id=o.operation_id AND prerequisite.status<>'accepted' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=prerequisite.operation_id AND r.resolution IN ('folder_move_reverted','note_move_equivalent')))
 			ORDER BY o.sequence LIMIT ?`, limit)
 		if err != nil {
 			return err
@@ -434,7 +434,7 @@ func (s *Store) MarkAttempted(ctx context.Context, operationID uuid.UUID) error 
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE sync_outbox SET status='attempted',attempted_at_ms=COALESCE(attempted_at_ms,?) WHERE operation_id=? AND status IN ('pending','attempted') AND NOT EXISTS(
 			SELECT 1 FROM sync_outbox_dependencies d JOIN sync_outbox prerequisite ON prerequisite.operation_id=d.dependency_operation_id
-			WHERE d.operation_id=sync_outbox.operation_id AND prerequisite.status<>'accepted' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=prerequisite.operation_id AND r.resolution='folder_move_reverted'))`, s.clock().UTC().UnixMilli(), operationID.String())
+			WHERE d.operation_id=sync_outbox.operation_id AND prerequisite.status<>'accepted' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=prerequisite.operation_id AND r.resolution IN ('folder_move_reverted','note_move_equivalent')))`, s.clock().UTC().UnixMilli(), operationID.String())
 		if err != nil {
 			return err
 		}
@@ -465,7 +465,7 @@ func (s *Store) RecordResult(ctx context.Context, operationID uuid.UUID, result 
 			var unmet int
 			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_outbox_dependencies d
 				JOIN sync_outbox prerequisite ON prerequisite.operation_id=d.dependency_operation_id
-				WHERE d.operation_id=? AND prerequisite.status<>'accepted' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=prerequisite.operation_id AND r.resolution='folder_move_reverted')`, operationID.String()).Scan(&unmet); err != nil {
+				WHERE d.operation_id=? AND prerequisite.status<>'accepted' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=prerequisite.operation_id AND r.resolution IN ('folder_move_reverted','note_move_equivalent'))`, operationID.String()).Scan(&unmet); err != nil {
 				return err
 			}
 			if unmet != 0 {

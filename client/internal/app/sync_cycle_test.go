@@ -703,6 +703,88 @@ func runEditAgainstRemoteDelete(t *testing.T, maxPull int, crash bool) {
 	}
 }
 
+func TestSyncOnceResolvesEquivalentRootNoteMoves(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "base equivalent move\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for _, core := range []*LocalCore{a, b} {
+		current, err := core.ReadNote(ctx, "N.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.MoveNote(ctx, "N.md", "Same.md", current.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	local, err := b.ReadNote(ctx, "Same.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Same.md", local.Revision, "dependent edit survives equivalent move\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.ReadNote(ctx, "Same.md")
+	if err != nil || got.ID != doc.ID || !strings.Contains(got.Body, "dependent edit survives") {
+		t.Fatalf("equivalent local=%#v err=%v", got, err)
+	}
+	var resolution string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT r.resolution FROM sync_conflict_resolutions r JOIN sync_outbox o ON o.operation_id=r.operation_id WHERE o.object_id=? AND o.mutation='move' AND o.status='conflict'`, doc.ID.String()).Scan(&resolution)
+	}); err != nil || resolution != "note_move_equivalent" {
+		t.Fatalf("resolution=%q err=%v", resolution, err)
+	}
+	if copies, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md")); len(copies) != 0 {
+		t.Fatalf("equivalent move created copies=%v", copies)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, err := a.ReadNote(ctx, "Same.md")
+	if err != nil || aDoc.ID != doc.ID || !strings.Contains(aDoc.Body, "dependent edit survives") {
+		t.Fatalf("A convergence=%#v err=%v", aDoc, err)
+	}
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	cDoc, err := c.ReadNote(ctx, "Same.md")
+	if err != nil || cDoc.ID != doc.ID || !strings.Contains(cDoc.Body, "dependent edit survives") {
+		t.Fatalf("cold C=%#v err=%v", cDoc, err)
+	}
+}
+
 func TestSyncOnceMaterializesDivergentRootNoteMoves(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}

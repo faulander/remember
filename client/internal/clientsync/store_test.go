@@ -84,6 +84,66 @@ func TestOutboxUUIDv4CoalescingResultsAndReopen(t *testing.T) {
 	}
 }
 
+func TestEquivalentRootNoteMoveResolutionGuardsAndUnlocksDependency(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	setup := func(name, canonical string, parent *uuid.UUID) (uuid.UUID, uuid.UUID, uuid.UUID) {
+		object := uuid.New()
+		create, _ := uuid.NewV7()
+		hash := sha256.Sum256([]byte(name))
+		if err := store.Enqueue(ctx, []Mutation{{OperationID: create, Kind: Create, ObjectID: object, ObjectType: Note, Name: "N.md", BlobHash: hash[:]}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkAttempted(ctx, create); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordResult(ctx, create, Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+			t.Fatal(err)
+		}
+		move, _ := uuid.NewV7()
+		if err := store.Enqueue(ctx, []Mutation{{OperationID: move, Kind: Move, ObjectID: object, ObjectType: Note, BaseRevision: 1, ParentID: parent, Name: name}}); err != nil {
+			t.Fatal(err)
+		}
+		update, _ := uuid.NewV7()
+		dependentHash := sha256.Sum256([]byte("dependent"))
+		if err := store.Enqueue(ctx, []Mutation{{OperationID: update, Kind: Update, ObjectID: object, ObjectType: Note, BaseRevision: 2, BlobHash: dependentHash[:], DependencyOperationID: &move}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkAttempted(ctx, move); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordResult(ctx, move, Result{Conflict: "base_revision_mismatch", Canonical: &CanonicalState{ObjectType: Note, Revision: 2, ParentID: parent, Name: canonical, BlobHash: hash[:]}}); err != nil {
+			t.Fatal(err)
+		}
+		return object, move, update
+	}
+	_, move, update := setup("Same.md", "Same.md", nil)
+	if err := store.ResolveEquivalentRootNoteMove(ctx, move); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.ListReady(ctx, 10)
+	if err != nil || len(ready) != 1 || ready[0].Mutation.OperationID != update {
+		t.Fatalf("ready=%#v err=%v", ready, err)
+	}
+	_, divergent, _ := setup("Local.md", "Remote.md", nil)
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms) VALUES(?,'note_move_equivalent',1)`, divergent.String())
+		return err
+	}); err == nil {
+		t.Fatal("SQL guard accepted divergent note move")
+	}
+	parent := uuid.New()
+	_, nonroot, _ := setup("SameNested.md", "SameNested.md", &parent)
+	if err := store.ResolveEquivalentRootNoteMove(ctx, nonroot); err == nil {
+		t.Fatal("non-root equivalent move resolved")
+	}
+}
+
 func TestAttemptedOperationRemainsReadyWithStableAttemptTimestamp(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

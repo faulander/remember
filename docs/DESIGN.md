@@ -730,6 +730,7 @@ Umsetzung von `SYNC-008`:
 - Bei zwei unterschiedlichen Root-Zielnamen bleibt die kanonische Note-ID am Serverziel.
 - Die verlierende lokale Fassung einschließlich abhängiger Edits wird unter neuer UUID in Wiederhergestellt materialisiert.
 - Die kanonische Revision muss strikt fortschreiten; nicht fortschreitende Antworten bleiben ohne Evakuierung fail-closed.
+- Äquivalente Root-Moves auf exakt denselben Namen werden nach lokaler ID-/Dateiprüfung als immutable `note_move_equivalent`-No-op aufgelöst; abhängige Edits bleiben sendbar.
 - Nicht-root-basierte Moves bleiben ohne authentifizierte aktuelle Parent-Ancestry fail-closed.
 
 ## 14.3 Löschen gegen Verschieben
