@@ -1039,6 +1039,243 @@ func TestSyncOnceMaterializesDivergentRootNoteMoves(t *testing.T) {
 	}
 }
 
+func TestSyncOnceMaterializesDivergentNestedNoteMoves(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := a.CreateNote(ctx, "F/N.md", "nested move base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, err := a.ReadNote(ctx, "F/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "F/N.md", "F/Remote.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, err := b.ReadNote(ctx, "F/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.MoveNote(ctx, "F/N.md", "F/Local.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	local, err := b.ReadNote(ctx, "F/Local.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "F/Local.md", local.Revision, "nested losing edit survives\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictEvacuation = func() {
+		testHookAfterConflictEvacuation = nil
+		panic("simulated nested divergent move evacuation crash")
+	}
+	defer func() { testHookAfterConflictEvacuation = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected nested divergent move crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+	}
+	canonical, err := b.ReadNote(ctx, "F/Remote.md")
+	if err != nil || canonical.ID != doc.ID || canonical.Body != "nested move base\n" {
+		t.Fatalf("nested canonical=%#v err=%v", canonical, err)
+	}
+	if _, err := b.ReadNote(ctx, "F/Local.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("nested losing target remains: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(matches) != 1 {
+		t.Fatalf("nested copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("nested losing edit survives")) || !bytes.Contains(copyBytes, []byte("base_revision_mismatch")) {
+		t.Fatalf("nested copy=%q err=%v", copyBytes, err)
+	}
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil || inspection.NoteID == doc.ID {
+		t.Fatalf("nested copy identity=%#v err=%v", inspection, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for label, core := range map[string]*LocalCore{"A": a, "B": b, "C": c} {
+		got, err := core.ReadNote(ctx, "F/Remote.md")
+		if err != nil || got.ID != doc.ID || got.Body != "nested move base\n" {
+			t.Fatalf("%s canonical=%#v err=%v", label, got, err)
+		}
+		copies, _ := filepath.Glob(filepath.Join(core.Root(), clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+		if len(copies) != 1 {
+			t.Fatalf("%s copies=%v", label, copies)
+		}
+		content, err := os.ReadFile(copies[0])
+		copyInspection, inspectErr := frontmatter.Inspect(content)
+		if err != nil || inspectErr != nil || copyInspection.NoteID != inspection.NoteID || !bytes.Contains(content, []byte("nested losing edit survives")) {
+			t.Fatalf("%s copy=%q identity=%#v err=%v inspect=%v", label, content, copyInspection, err, inspectErr)
+		}
+	}
+}
+
+func TestSyncOnceRejectsDivergentNestedMoveWithParentIntent(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := a.CreateNote(ctx, "F/N.md", "must remain unchanged\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ := a.ReadNote(ctx, "F/N.md")
+	if _, _, err := a.MoveNote(ctx, "F/N.md", "F/Remote.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, _ := b.ReadNote(ctx, "F/N.md")
+	if _, _, err := b.MoveNote(ctx, "F/N.md", "F/Local.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "LocalF")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("nested divergent move crossed unresolved parent intent")
+	}
+	got, err := b.ReadNote(ctx, "LocalF/Local.md")
+	if err != nil || got.ID != doc.ID || got.Body != "must remain unchanged\n" {
+		t.Fatalf("local note=%#v err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, clientsync.ConflictRootName)); !os.IsNotExist(err) {
+		t.Fatalf("conflict namespace mutated on rejected recovery: %v", err)
+	}
+}
+
+func TestSyncOnceRejectsDivergentNestedMoveAcrossParents(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "G"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := a.CreateNote(ctx, "F/N.md", "different parents remain\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, _ := a.ReadNote(ctx, "F/N.md")
+	if _, _, err := a.MoveNote(ctx, "F/N.md", "G/Remote.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, _ := b.ReadNote(ctx, "F/N.md")
+	if _, _, err := b.MoveNote(ctx, "F/N.md", "F/Local.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("different-parent divergent move resolved")
+	}
+	got, err := b.ReadNote(ctx, "F/Local.md")
+	if err != nil || got.ID != doc.ID || got.Body != "different parents remain\n" {
+		t.Fatalf("different-parent local=%#v err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, clientsync.ConflictRootName)); !os.IsNotExist(err) {
+		t.Fatalf("different-parent conflict namespace mutated: %v", err)
+	}
+}
+
 func TestSyncOnceRejectsNonAdvancingRootMoveConflict(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}

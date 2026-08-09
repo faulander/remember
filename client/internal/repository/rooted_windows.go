@@ -63,6 +63,9 @@ func CreateRootedPrivate(root, relative string, content []byte) error {
 func CreateRooted(root, relative string, content []byte, validate Validator) error {
 	return CreateExclusive(filepath.Join(root, filepath.FromSlash(relative)), content, validate)
 }
+func CreateRootedInFolderExpected(string, string, string, uint64, uint64, []byte, Validator) error {
+	return errors.New("handle-safe rooted folder publication is not yet supported on Windows")
+}
 
 func WriteRootedExpected(root, relative string, expected, content []byte, validate Validator) error {
 	return WriteAtomicExpected(filepath.Join(root, filepath.FromSlash(relative)), expected, content, validate)

@@ -726,13 +726,14 @@ Umsetzung von `SYNC-008`:
 - Der Client bleibt vor Pull und Apply fail-closed; Note-Bytes, Folder-Inodes und Unterbäume bleiben unverändert.
 - Eine spätere automatische Reparatur benötigt ein vollständiges crash-resumierbares Rekey-Protokoll für Objekt und abhängige Intents.
 
-## 14.2.6 Divergente Root-Note-Moves
+## 14.2.6 Divergente Note-Moves
 
-- Bei zwei unterschiedlichen Root-Zielnamen bleibt die kanonische Note-ID am Serverziel.
+- Bei zwei unterschiedlichen Root-Zielnamen oder zwei unterschiedlichen Namen innerhalb derselben exakten Parent-ID bleibt die kanonische Note-ID am Serverziel.
 - Die verlierende lokale Fassung einschließlich abhängiger Edits wird unter neuer UUID in Wiederhergestellt materialisiert.
 - Die kanonische Revision muss strikt fortschreiten; nicht fortschreitende Antworten bleiben ohne Evakuierung fail-closed.
+- Nicht-Root-Materialisierung verlangt einen lokal bekannten descriptor-verifizierten Parent-Inode ohne ungelöste lokale Parent-Absicht sowie den exakten aus Parentpfad und Outbox-Namen abgeleiteten lokalen Note-Pfad. Abweichungen bleiben vor Konfliktordner-Publikation fail-closed.
 - Äquivalente Moves auf exakt dieselbe nullable Parent-ID und denselben Namen werden nach lokaler ID-/Dateiprüfung als immutable `note_move_equivalent`-No-op aufgelöst; Nicht-Root-Parents benötigen bekannte descriptor-verifizierte Inodes und dürfen keine ungelöste lokale Absicht tragen. Abhängige Edits bleiben sendbar.
-- Nicht-root-basierte Moves bleiben ohne authentifizierte aktuelle Parent-Ancestry fail-closed.
+- Divergente Moves zwischen unterschiedlichen Parent-IDs und Nicht-Root-Moves ohne verifizierbare aktuelle Parent-Ancestry bleiben fail-closed.
 
 ## 14.3 Löschen gegen Verschieben
 

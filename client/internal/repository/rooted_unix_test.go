@@ -171,6 +171,36 @@ func TestVerifyRootedFolderEntriesExpectedRejectsSymlink(t *testing.T) {
 	}
 }
 
+func TestCreateRootedInFolderExpectedRejectsReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "F"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "F"), filepath.Join(root, "Old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "F"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateRootedInFolderExpected(root, "F", "N.md", device, inode, []byte("x"), nil); err == nil {
+		t.Fatal("replacement folder accepted")
+	}
+	if _, err := os.Stat(filepath.Join(root, "F", "N.md")); !os.IsNotExist(err) {
+		t.Fatalf("replacement mutated: %v", err)
+	}
+	currentDevice, currentInode, err := RootedFolderIdentity(root, "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateRootedInFolderExpected(root, "F", "N.md", currentDevice, currentInode, []byte("x"), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMoveRootedEmptyFolderExpectedRestoresNonemptySource(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "A", "Folder"), 0o755); err != nil {

@@ -59,5 +59,6 @@
 | [0046](adr/0046-m2-equivalent-root-note-moves.md) | Äquivalente konkurrierende Root-Note-Moves |
 | [0047](adr/0047-m2-equivalent-nonroot-note-moves.md) | Äquivalente konkurrierende Nicht-Root-Note-Moves |
 | [0048](adr/0048-m2-authenticated-post-adr44-convergence.md) | Authentifizierte Konvergenz der Strukturzellen nach ADR 0044 |
+| [0049](adr/0049-m2-divergent-same-parent-note-moves.md) | Divergente Nicht-Root-Note-Moves innerhalb derselben Parent-ID |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

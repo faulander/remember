@@ -106,9 +106,14 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 			continue
 		}
 		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable")) || ((m.Kind == clientsync.Update || m.Kind == clientsync.Move) && conflict.Code == "object_missing"))
-		revisionMoveCollision := m.Kind == clientsync.Move && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size && conflict.Canonical.Revision > m.BaseRevision && conflict.Canonical.ParentID == nil && m.ParentID == nil && conflict.Canonical.Name != m.Name
+		revisionMoveCollision := m.Kind == clientsync.Move && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size && conflict.Canonical.Revision > m.BaseRevision && conflict.Canonical.Name != m.Name && (conflict.Canonical.ParentID == nil && m.ParentID == nil || conflict.Canonical.ParentID != nil && m.ParentID != nil && *conflict.Canonical.ParentID == *m.ParentID)
 		moveCollision := m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size || revisionMoveCollision
 		if m.ObjectType == clientsync.Note && (canonicalAbsent || moveCollision) {
+			if revisionMoveCollision && m.ParentID != nil {
+				if err := c.validateDivergentNestedNoteMove(ctx, store, m); err != nil {
+					return err
+				}
+			}
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
 			}
@@ -188,6 +193,48 @@ func (c *LocalCore) resolveEquivalentNoteMove(ctx context.Context, store *client
 		return errors.New("equivalent note move file identity mismatch")
 	}
 	return store.ResolveEquivalentNoteMove(ctx, m.OperationID)
+}
+
+func (c *LocalCore) validateDivergentNestedNoteMove(ctx context.Context, store *clientsync.Store, m clientsync.Mutation) error {
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects[object.ID] = object
+	}
+	parent, ok := objects[*m.ParentID]
+	if !ok || parent.Type != localindex.ObjectFolder || parent.IdentityState != localindex.IdentityKnown || parent.FolderDevice == 0 || parent.FolderInode == 0 {
+		return errors.New("divergent nested note move parent identity unavailable")
+	}
+	unresolved, err := store.HasUnresolvedLocalIntent(ctx, *m.ParentID)
+	if err != nil {
+		return err
+	}
+	if unresolved {
+		return errors.New("divergent nested note move parent has unresolved local intent")
+	}
+	if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
+		return err
+	}
+	target, err := remoteNotePath(objects, m.ParentID, m.Name)
+	if err != nil {
+		return err
+	}
+	object, ok := objects[m.ObjectID]
+	if !ok || object.Type != localindex.ObjectNote || object.IdentityState != localindex.IdentityKnown || object.RelativePath != target {
+		return errors.New("divergent nested note move local target mismatch")
+	}
+	content, err := repository.ReadRooted(c.root, target, clientsync.MaxBlobBytes)
+	if err != nil {
+		return err
+	}
+	inspection, err := frontmatter.Inspect(content)
+	if err != nil || inspection.NoteID != m.ObjectID {
+		return errors.New("divergent nested note move file identity mismatch")
+	}
+	return nil
 }
 
 func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
@@ -923,6 +970,12 @@ func (c *LocalCore) stageNoteMovePathCollision(ctx context.Context, store *clien
 		return err
 	}
 	if materialization == nil {
+		m := conflict.Outbox.Mutation
+		if conflict.Code == "base_revision_mismatch" && m.ParentID != nil {
+			if err := c.validateDivergentNestedNoteMove(ctx, store, m); err != nil {
+				return err
+			}
+		}
 		snapshot, err := c.index.ReadSnapshot(ctx)
 		if err != nil {
 			return err
@@ -938,13 +991,35 @@ func (c *LocalCore) stageNoteMovePathCollision(ctx context.Context, store *clien
 		if !found {
 			return errors.New("path-colliding moved note unavailable")
 		}
+		if conflict.Code == "base_revision_mismatch" && m.ParentID != nil {
+			objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+			for _, candidate := range snapshot.Objects {
+				objects[candidate.ID] = candidate
+			}
+			expected, expectedErr := remoteNotePath(objects, m.ParentID, m.Name)
+			if expectedErr != nil {
+				return expectedErr
+			}
+			if object.RelativePath != expected {
+				return errors.New("divergent nested note move staging path mismatch")
+			}
+		}
 		content, err := repository.ReadRooted(c.root, object.RelativePath, clientsync.MaxBlobBytes)
 		if err != nil {
 			return err
 		}
+		inspection, err := frontmatter.Inspect(content)
+		if err != nil || inspection.NoteID != object.ID {
+			return errors.New("path-colliding moved note identity changed")
+		}
 		sourceHash := sha256.Sum256(content)
 		if err := clientsync.StageNote(c.root, object.RelativePath, sourceHash); err != nil {
 			return err
+		}
+		if conflict.Code == "base_revision_mismatch" && m.ParentID != nil {
+			if err := c.validateDivergentNestedNoteMove(ctx, store, m); err != nil {
+				return err
+			}
 		}
 		conflictID, err := uuid.NewV7()
 		if err != nil {
@@ -1251,18 +1326,45 @@ func (c *LocalCore) ensureMoveCollisionCanonical(ctx context.Context, store *cli
 		return false, err
 	}
 	directory := ""
+	var parent *localindex.Object
 	if canonical.ParentID != nil {
-		found := false
-		for _, object := range snapshot.Objects {
-			if object.ID == *canonical.ParentID && object.Type == localindex.ObjectFolder && object.IdentityState == localindex.IdentityKnown {
+		for i := range snapshot.Objects {
+			object := &snapshot.Objects[i]
+			if object.ID == *canonical.ParentID && object.Type == localindex.ObjectFolder && object.IdentityState == localindex.IdentityKnown && object.FolderDevice > 0 && object.FolderInode > 0 {
 				directory = object.RelativePath
-				found = true
+				parent = object
 				break
 			}
 		}
-		if !found {
+		if parent == nil {
 			return false, nil
 		}
+		unresolved, err := store.HasUnresolvedLocalIntent(ctx, *canonical.ParentID)
+		if err != nil {
+			return false, err
+		}
+		if unresolved {
+			return false, errors.New("move collision canonical parent has unresolved local intent")
+		}
+		if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
+			return false, err
+		}
+	}
+	verifyParent := func() error {
+		if parent == nil {
+			return nil
+		}
+		if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
+			return err
+		}
+		unresolved, err := store.HasUnresolvedLocalIntent(ctx, *canonical.ParentID)
+		if err != nil {
+			return err
+		}
+		if unresolved {
+			return errors.New("move collision canonical parent changed")
+		}
+		return nil
 	}
 	target := canonical.Name
 	if directory != "" {
@@ -1289,9 +1391,16 @@ func (c *LocalCore) ensureMoveCollisionCanonical(ctx context.Context, store *cli
 		if int64(len(content)) > clientsync.MaxBlobBytes || sha256.Sum256(content) != hash {
 			return false, errors.New("move collision canonical blob invalid")
 		}
-		if err := repository.CreateRooted(c.root, target, content, validateAppliedNote(item.SourceObjectID)); err != nil {
+		if parent != nil {
+			if err := repository.CreateRootedInFolderExpected(c.root, parent.RelativePath, canonical.Name, parent.FolderDevice, parent.FolderInode, content, validateAppliedNote(item.SourceObjectID)); err != nil {
+				return false, err
+			}
+		} else if err := repository.CreateRooted(c.root, target, content, validateAppliedNote(item.SourceObjectID)); err != nil {
 			return false, err
 		}
+	}
+	if err := verifyParent(); err != nil {
+		return false, err
 	}
 	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: map[uuid.UUID][32]byte{item.SourceObjectID: hash}}); err != nil {
 		return false, err

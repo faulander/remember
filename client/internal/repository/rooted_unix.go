@@ -116,6 +116,48 @@ func CreateRootedPrivate(root, relative string, content []byte) error {
 	return unix.Fsync(parent)
 }
 
+// CreateRootedInFolderExpected publishes a note through one retained parent
+// descriptor after binding that descriptor to the indexed folder identity.
+func CreateRootedInFolderExpected(root, parentRelative, name string, device, inode uint64, content []byte, validate Validator) error {
+	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
+		return errors.New("invalid rooted child name")
+	}
+	if validate != nil {
+		if err := validate(content); err != nil {
+			return fmt.Errorf("validate staged note: %w", err)
+		}
+	}
+	parentOfFolder, folderName, err := openRootedParent(root, parentRelative)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parentOfFolder)
+	parent, err := unix.Openat(parentOfFolder, folderName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open expected rooted folder: %w", err)
+	}
+	defer unix.Close(parent)
+	var stat unix.Stat_t
+	if err := unix.Fstat(parent, &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || uint64(stat.Dev) != device || uint64(stat.Ino) != inode {
+		return errors.New("rooted folder identity changed")
+	}
+	temp, file, err := createTempAt(parent, ".remember-create-", 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { file.Close(); _ = unix.Unlinkat(parent, temp, 0) }()
+	if err := writeAndSync(file, content); err != nil {
+		return err
+	}
+	if err := unix.Linkat(parent, temp, parent, name, 0); err != nil {
+		return fmt.Errorf("publish note in expected folder exclusively: %w", err)
+	}
+	return unix.Fsync(parent)
+}
+
 func CreateRooted(root, relative string, content []byte, validate Validator) error {
 	if validate != nil {
 		if err := validate(content); err != nil {
