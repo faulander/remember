@@ -596,6 +596,225 @@ func runEditAgainstRemoteDelete(t *testing.T, maxPull int, crash bool) {
 	}
 }
 
+func TestSyncOnceRecoversLocalMoveAgainstRemoteDelete(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "move survives delete\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, err := a.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DeleteNote(ctx, "N.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, err := b.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.MoveNote(ctx, "N.md", "Locally Moved.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictEvacuation = func() { testHookAfterConflictEvacuation = nil; panic("simulated move-delete evacuation crash") }
+	defer func() { testHookAfterConflictEvacuation = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected move-delete crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, relative := range []string{"N.md", "Locally Moved.md"} {
+		if _, err := b.ReadNote(ctx, relative); !errors.Is(err, ErrNoteNotFound) {
+			t.Fatalf("deleted identity visible at %s: %v", relative, err)
+		}
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(matches) != 1 {
+		t.Fatalf("move-delete copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("move survives delete")) || !bytes.Contains(copyBytes, []byte("object_deleted")) {
+		t.Fatalf("move-delete copy=%q err=%v", copyBytes, err)
+	}
+	evacuations, _ := filepath.Glob(filepath.Join(rootB, ".remember", "trash", "conflicts", "*.md"))
+	if len(evacuations) != 0 {
+		t.Fatalf("completed move-delete evacuation remains: %v", evacuations)
+	}
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.NoteID == doc.ID {
+		t.Fatal("recovered move reused tombstoned id")
+	}
+	if state := server.states[inspection.NoteID]; state.ObjectType != clientsync.Note || state.Deleted {
+		t.Fatalf("recovered move state=%#v", state)
+	}
+	if state := server.states[doc.ID]; !state.Deleted {
+		t.Fatalf("canonical delete lost: %#v", state)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aMatches, _ := filepath.Glob(filepath.Join(rootA, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(aMatches) != 1 {
+		t.Fatalf("recovered move did not converge: %v", aMatches)
+	}
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ReadNote(ctx, "Locally Moved.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("cold client revived moved identity: %v", err)
+	}
+	cMatches, _ := filepath.Glob(filepath.Join(rootC, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(cMatches) != 1 {
+		t.Fatalf("cold move-delete copies=%v", cMatches)
+	}
+}
+
+func TestSyncOnceRebasesLocalDeleteAgainstRemoteMove(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "remote move survives as copy\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, err := b.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DeleteNote(ctx, "N.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, err := a.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "N.md", "Remotely Moved.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	testHookBeforeConflictCompletion = func() { testHookBeforeConflictCompletion = nil; panic("simulated delete-move rebase crash") }
+	defer func() { testHookBeforeConflictCompletion = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected delete-move crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, relative := range []string{"N.md", "Remotely Moved.md"} {
+		if _, err := b.ReadNote(ctx, relative); !errors.Is(err, ErrNoteNotFound) {
+			t.Fatalf("local delete undone at %s: %v", relative, err)
+		}
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(matches) != 1 {
+		t.Fatalf("delete-move copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("remote move survives as copy")) || !bytes.Contains(copyBytes, []byte("base_revision_mismatch")) {
+		t.Fatalf("delete-move copy=%q err=%v", copyBytes, err)
+	}
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.NoteID == doc.ID {
+		t.Fatal("delete-move copy reused deleted id")
+	}
+	if state := server.states[doc.ID]; !state.Deleted || state.Revision != 3 {
+		t.Fatalf("rebased move tombstone=%#v", state)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.Deleted || rescued.ObjectType != clientsync.Note {
+		t.Fatalf("rescued move state=%#v", rescued)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ReadNote(ctx, "Remotely Moved.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("remote mover retained original: %v", err)
+	}
+}
+
 func TestSyncOnceRebasesLocalDeleteAgainstRemoteEdit(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}

@@ -294,10 +294,18 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 			step.trash = ".remember/trash/" + change.ObjectID.String() + "-" + change.OperationID.String() + ".md"
 		}
 		var exactDeleteConflict *clientsync.ConflictMaterialization
+		evacuatedDeleteConflict := false
 		if change.Mutation == clientsync.Delete {
 			exactDeleteConflict, err = stagedRemoteDeleteConflict(ctx, store, change)
 			if err != nil {
 				return nil, err
+			}
+			if exactDeleteConflict != nil {
+				kind, kindErr := store.ConflictMutationKind(ctx, exactDeleteConflict.OperationID)
+				if kindErr != nil {
+					return nil, kindErr
+				}
+				evacuatedDeleteConflict = kind == clientsync.Move
 			}
 		}
 		prior, hadPrior := virtual[change.ObjectID]
@@ -439,19 +447,28 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 						return nil, errors.New("remote delete source bytes differ")
 					}
 				} else {
-					trashed, trashErr := repository.ReadRooted(c.root, step.trash, clientsync.MaxBlobBytes)
-					if trashErr == nil && bytes.Equal(trashed, deleteExpected) {
-						step.exists, step.expected = true, trashed
+					if deleteConflict != nil && evacuatedDeleteConflict {
+						evacuated := ".remember/trash/conflicts/" + deleteConflict.OperationID.String() + ".md"
+						content, evacuationErr := repository.ReadRooted(c.root, evacuated, clientsync.MaxBlobBytes)
+						if evacuationErr != nil || !bytes.Equal(content, deleteExpected) {
+							return nil, errors.New("remote delete conflict evacuation unavailable")
+						}
+						step.exists, step.locallyApplied, step.expected = true, true, deleteExpected
 					} else {
-						staged, stagedErr := repository.RootedStagedMoveExists(c.root, target, deleteExpected)
-						if stagedErr == nil && staged {
-							step.expected = deleteExpected
+						trashed, trashErr := repository.ReadRooted(c.root, step.trash, clientsync.MaxBlobBytes)
+						if trashErr == nil && bytes.Equal(trashed, deleteExpected) {
+							step.exists, step.expected = true, trashed
 						} else {
-							matches, matchErr := store.BaselineMatchesOperation(ctx, change.ObjectID, change.Revision, change.OperationID)
-							if matchErr != nil || change.State != "applied" || !matches {
-								return nil, errors.New("remote delete lacks recoverable trash")
+							staged, stagedErr := repository.RootedStagedMoveExists(c.root, target, deleteExpected)
+							if stagedErr == nil && staged {
+								step.expected = deleteExpected
+							} else {
+								matches, matchErr := store.BaselineMatchesOperation(ctx, change.ObjectID, change.Revision, change.OperationID)
+								if matchErr != nil || change.State != "applied" || !matches {
+									return nil, errors.New("remote delete lacks recoverable trash")
+								}
+								step.exists, step.locallyApplied, step.expected = true, true, deleteExpected
 							}
-							step.exists, step.locallyApplied, step.expected = true, true, deleteExpected
 						}
 					}
 				}

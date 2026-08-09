@@ -9,7 +9,7 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - lokaler macOS-Desktop-Client mit Wails, Go, Svelte 5 und TypeScript
 - echte Markdown-Dateien mit versioniertem YAML-Frontmatter
 - verschachtelte Ordner, Tags, Vorschau, Themes und recoverbares Löschen
-- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete-, fehlende Remote-Objekt-, fehlende Parent- und Note-Create/-Move-Pfadkonfliktkopien; leere Folder-Create-Pfadkollisionen werden sichtbar gerettet, Folder-Move-Pfad-/Parent-/Cycle-Konflikte inode-gebunden zurückgesetzt und äquivalente konkurrierende Moves ohne Pfadraten aufgelöst, bereits remote fehlende Deletes konvergieren ohne neue Kopie, nichtleere Remote-Ordner werden sicher bewahrt und beschädigte Note-/Folder-Typzuordnungen bleiben ohne lokale Mutation fail-closed
+- lokaler SQLite-Index, Reconcile, Watcher sowie sichtbare Update/Update-, bidirektionale Edit/Delete-, bidirektionale Note-Move/Delete-, fehlende Remote-Objekt-, fehlende Parent- und Note-Create/-Move-Pfadkonfliktkopien; leere Folder-Create-Pfadkollisionen werden sichtbar gerettet, Folder-Move-Pfad-/Parent-/Cycle-Konflikte inode-gebunden zurückgesetzt und äquivalente konkurrierende Moves ohne Pfadraten aufgelöst, bereits remote fehlende Deletes konvergieren ohne neue Kopie, nichtleere Remote-Ordner werden sicher bewahrt und beschädigte Note-/Folder-Typzuordnungen bleiben ohne lokale Mutation fail-closed
 - modularer Go-Server mit SQLite/WAL und sicherem Blob-Repository
 - interner Identity-, Sync-, Sessions- und Devices-Core mit server-provisioniertem Konfliktbereich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync

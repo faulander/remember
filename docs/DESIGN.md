@@ -710,7 +710,9 @@ Umsetzung von `SYNC-008`:
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.
 - Die konkurrierend verschobene Fassung wird unter Wiederhergestellt gerettet.
-- Bei Ordnern wird der gesamte erhaltene Teilbaum materialisiert, ohne bereits unabhängig gelöschte Nachfahren wiederzubeleben.
+- Für Notes sind beide Reihenfolgen crash-resumierbar umgesetzt: Ein lokaler Move gegen den Remote-Tombstone evakuiert exakte Bytes vor dem Delete-Apply; ein lokaler Delete gegen den Remote-Move rettet den kanonischen Blob und wird anschließend auf die höhere Revision rebased.
+- Technische Evakuierungen werden erst nach verifizierter sichtbarer und synchronisierter Konfliktkopie hashgebunden entfernt.
+- Bei Ordnern muss der gesamte erhaltene Teilbaum materialisiert werden, ohne bereits unabhängig gelöschte Nachfahren wiederzubeleben; diese Matrixzelle bleibt separat.
 
 ## 14.4 Umbenennen oder Verschieben gegen Umbenennen oder Verschieben
 

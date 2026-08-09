@@ -102,9 +102,9 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		if conflict.Canonical == nil || m.ObjectType != clientsync.Note || conflict.Canonical.ObjectType != clientsync.Note || len(conflict.Canonical.BlobHash) != sha256.Size || conflict.Canonical.Revision <= m.BaseRevision {
 			continue
 		}
-		localUpdate := m.Kind == clientsync.Update && ((conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted) || (conflict.Code == "object_deleted" && conflict.Canonical.Deleted))
+		localWrite := (m.Kind == clientsync.Update && ((conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted) || (conflict.Code == "object_deleted" && conflict.Canonical.Deleted))) || (m.Kind == clientsync.Move && conflict.Code == "object_deleted" && conflict.Canonical.Deleted)
 		localDelete := m.Kind == clientsync.Delete && conflict.Code == "base_revision_mismatch" && !conflict.Canonical.Deleted
-		if !localUpdate && !localDelete {
+		if !localWrite && !localDelete {
 			continue
 		}
 		if localDelete && resolver == nil {
@@ -113,7 +113,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 			return err
 		}
-		if localUpdate {
+		if localWrite {
 			if err := c.stageNoteUpdateConflict(ctx, store, conflict); err != nil {
 				return err
 			}
@@ -1180,7 +1180,7 @@ func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *c
 		if err != nil {
 			return err
 		}
-		if (kind == clientsync.Create || kind == clientsync.Move) && (code == "path_collision" || code == "parent_unavailable") || (kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing" {
+		if ((kind == clientsync.Create || kind == clientsync.Move) && (code == "path_collision" || code == "parent_unavailable")) || ((kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing") || (kind == clientsync.Move && code == "object_deleted") {
 			evacuated := ".remember/trash/conflicts/" + item.OperationID.String() + ".md"
 			if err := repository.RemoveRootedConflictEvacuationExpected(c.root, evacuated, item.SourceHash); err != nil {
 				return err
