@@ -2,7 +2,7 @@
 
 Remember ist eine plattformübergreifende Local-first-Anwendung für persönliche Markdown-Notizen, Ordner und Erinnerungen. Normale `.md`-Dateien bleiben die kanonische lokale Datenquelle; ein zentraler Server synchronisiert mehrere eigene Geräte.
 
-> **Status:** frühe Entwicklung, noch kein produktionsreifes Release. Builds sind derzeit unsigniert und werden manuell aktualisiert.
+> **Status:** frühe Entwicklung, noch kein produktionsreifes Release. Builds sind derzeit unsigniert und werden manuell aktualisiert. Der aktuelle M2-Abdeckungsstand ist in der [expliziten Konfliktmatrix](docs/M2_CONFLICT_MATRIX.md) abgegrenzt; M2 ist noch nicht vollständig abgenommen.
 
 ## Aktueller Stand
 

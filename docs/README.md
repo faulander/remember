@@ -4,6 +4,7 @@
 
 - [`PRD.md`](PRD.md) – verbindliche Produktanforderungen und Abnahmekriterien
 - [`DESIGN.md`](DESIGN.md) – technisches Gesamtdesign
+- [`M2_CONFLICT_MATRIX.md`](M2_CONFLICT_MATRIX.md) – expliziter Audit der konvergierenden, fail-closed und protokoll-blockierten M2-Zellen
 - [`MANUAL_TESTS_M1.md`](MANUAL_TESTS_M1.md) – manuelle Tests des lokalen Datenkerns
 - [`MANUAL_TESTS_MAC_CLIENT.md`](MANUAL_TESTS_MAC_CLIENT.md) – abgenommene macOS-Clienttests
 

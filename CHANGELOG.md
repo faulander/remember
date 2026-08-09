@@ -28,7 +28,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Expliziter Bootstrap für bestehende v1-Roots und UUIDv4-kompatible Sync-Objektidentitäten.
 - Mindest-Rate-Limits, strikte Requestgrenzen und begrenzte Argon2-Parallelität für öffentliche Login-/Refresh-Routen.
 - Automatisierter Mehrgeräte-Konvergenztest über den vollständigen produktionsnahen Login-, Blob- und Sync-HTTP-Stack einschließlich Serverneustart, kaltem History-Bootstrap, unterbrochener Pull-Seiten-Wiederaufnahme sowie Note-/Folder-Move/-Delete.
-- PRD, technisches Design, Architekturentscheidungen und manuelle Testpläne.
+- PRD, technisches Design, Architekturentscheidungen, manuelle Testpläne und ein expliziter M2-Konfliktmatrix-Audit mit konvergierenden, fail-closed und protokoll-blockierten Zellen.
 
 ### Security
 

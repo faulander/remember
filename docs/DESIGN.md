@@ -628,6 +628,8 @@ Zeitstempel entscheiden nicht, welche Fassung fachlich gewinnt.
 
 ## 14. Konfliktmatrix
 
+Der normative Implementierungs-Audit steht in [`M2_CONFLICT_MATRIX.md`](M2_CONFLICT_MATRIX.md). Er trennt nach aktuellem HEAD automatisiert konvergierende Zellen von bewussten Fail-closed-Grenzen und protokoll-blockierten Fällen; M2 gilt dadurch ausdrücklich noch nicht als vollständig abgenommen.
+
 ## 14.1 Bearbeiten gegen Bearbeiten
 
 Umsetzung von `SYNC-006` und `SYNC-007`:
