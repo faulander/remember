@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path"
 	"strconv"
 	"time"
 
@@ -621,7 +622,7 @@ func (s *Store) ProjectionTx(ctx context.Context, tx *sql.Tx, objectID uuid.UUID
 func (s *Store) HasUnresolvedOutbox(ctx context.Context) (bool, error) {
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed'))) )`).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_recoveries f WHERE f.operation_id=o.operation_id AND f.state IN ('moved','completed'))) )`).Scan(&exists)
 	})
 	return exists != 0, err
 }
@@ -632,7 +633,7 @@ func (s *Store) HasUnresolvedLocalIntent(ctx context.Context, objectID uuid.UUID
 	}
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE object_id=? AND (status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')))))`, objectID.String()).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE object_id=? AND (status IN ('pending','attempted','replay_mismatch') OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_recoveries f WHERE f.operation_id=o.operation_id AND f.state IN ('moved','completed')))))`, objectID.String()).Scan(&exists)
 	})
 	return exists != 0, err
 }
@@ -951,16 +952,19 @@ func (s *Store) PutFolderPublication(ctx context.Context, publication FolderPubl
 		zeroNonce = zeroNonce && value == 0
 	}
 	expectedStage := fmt.Sprintf(".remember/apply/folders/%s/%d", publication.PlanID.String(), publication.StepIndex)
-	validTarget := naming.ValidateUserRelativePath(publication.TargetRelative) == nil || (publication.FolderID == ConflictRootID && publication.TargetRelative == ConflictRootName) || (publication.FolderID == ConflictRecoveredID && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName)
+	recoveredBase := path.Base(publication.TargetRelative)
+	recoveredTarget := !IsReservedConflictFolder(publication.FolderID) && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName+"/"+recoveredBase && naming.ValidateComponent(recoveredBase) == nil
+	validTarget := naming.ValidateUserRelativePath(publication.TargetRelative) == nil || (publication.FolderID == ConflictRootID && publication.TargetRelative == ConflictRootName) || (publication.FolderID == ConflictRecoveredID && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName) || recoveredTarget
 	if !validOperationID(publication.PlanID) || publication.StepIndex < 0 || !validObjectID(publication.FolderID) || !validTarget || publication.StageRelative != expectedStage || zeroNonce || publication.Device > math.MaxInt64 || publication.Inode > math.MaxInt64 {
 		return errors.New("invalid folder publication")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var objectID, mutation, objectType, state string
-		if err := tx.QueryRowContext(ctx, `SELECT object_id,mutation,object_type,state FROM apply_steps WHERE plan_id=? AND step_index=?`, publication.PlanID.String(), publication.StepIndex).Scan(&objectID, &mutation, &objectType, &state); err != nil {
+		var parent sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT object_id,mutation,object_type,state,parent_id FROM apply_steps WHERE plan_id=? AND step_index=?`, publication.PlanID.String(), publication.StepIndex).Scan(&objectID, &mutation, &objectType, &state, &parent); err != nil {
 			return err
 		}
-		if objectID != publication.FolderID.String() || mutation != string(Create) || objectType != string(Folder) || state != "pending" {
+		if objectID != publication.FolderID.String() || mutation != string(Create) || objectType != string(Folder) || state != "pending" || recoveredTarget && (!parent.Valid || parent.String != ConflictRecoveredID.String()) {
 			return errors.New("folder publication does not match pending create")
 		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_publications(plan_id,step_index,folder_id,target_relative,stage_relative,nonce,device,inode,cleanup_authorized) VALUES(?,?,?,?,?,?,?,?,0)`, publication.PlanID.String(), publication.StepIndex, publication.FolderID.String(), publication.TargetRelative, publication.StageRelative, publication.Nonce[:], publication.Device, publication.Inode)

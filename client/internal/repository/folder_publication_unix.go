@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"strings"
@@ -101,6 +102,40 @@ func RootedFolderIdentity(root, relative string) (uint64, uint64, error) {
 		return 0, 0, errors.New("folder identity exceeds SQLite range")
 	}
 	return uint64(stat.Dev), stat.Ino, nil
+}
+
+func VerifyRootedEmptyFolderIdentity(root, relative string, device, inode uint64) error {
+	parent, base, err := openRootedParent(root, relative)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	fd, err := unix.Openat(parent, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if uint64(stat.Dev) != device || stat.Ino != inode {
+		return errors.New("empty folder identity mismatch")
+	}
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(dup), base)
+	entries, err := directory.ReadDir(1)
+	directory.Close()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if len(entries) != 0 {
+		return errors.New("folder is not empty")
+	}
+	return nil
 }
 
 func VerifyRootedFolderIdentity(root, relative string, device, inode uint64) error {

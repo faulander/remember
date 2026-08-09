@@ -28,6 +28,20 @@ func ConflictFileName(original string, operationID uuid.UUID) string {
 	return stem + suffix
 }
 
+func ConflictFolderName(original string, operationID uuid.UUID) string {
+	stem := original
+	suffix := " (Konflikt - " + operationID.String() + ")"
+	limit := naming.MaxComponentBytes - len(suffix)
+	for len(stem) > limit {
+		_, size := utf8.DecodeLastRuneInString(stem)
+		stem = stem[:len(stem)-size]
+	}
+	if stem == "" {
+		stem = "Ordner"
+	}
+	return stem + suffix
+}
+
 func IsReservedConflictFolder(id uuid.UUID) bool {
 	return id == ConflictRootID || id == ConflictRecoveredID
 }

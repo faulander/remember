@@ -9,6 +9,10 @@ var errFolderPublicationUnsupported = errors.New("handle-safe folder publication
 func RootedFolderIdentity(string, string) (uint64, uint64, error) {
 	return 0, 0, errFolderPublicationUnsupported
 }
+func VerifyRootedEmptyFolderIdentity(string, string, uint64, uint64) error {
+	return errors.New("handle-safe empty folder verification is not yet supported on Windows")
+}
+
 func VerifyRootedFolderIdentity(string, string, uint64, uint64) error {
 	return errFolderPublicationUnsupported
 }
@@ -25,6 +29,10 @@ func CleanupRootedFolderPublication(string, string, [32]byte, uint64, uint64) er
 	return errFolderPublicationUnsupported
 }
 func RemoveRootedFolderPublicationStage(string, string) error { return errFolderPublicationUnsupported }
+func MoveRootedEmptyFolderExpected(string, string, string, uint64, uint64) error {
+	return errors.New("handle-safe empty folder move is not yet supported on Windows")
+}
+
 func MoveRootedFolderExpected(string, string, string, uint64, uint64) error {
 	return errFolderPublicationUnsupported
 }

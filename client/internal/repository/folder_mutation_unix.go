@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -20,8 +21,23 @@ var testHookBeforeRootedFolderDelete func()
 // MoveRootedFolderExpected moves only the directory identified by device/inode.
 // A crash after source staging is resumed by finding the hidden staged inode.
 func MoveRootedFolderExpected(root, sourceRelative, destinationRelative string, device, inode uint64) error {
+	return moveRootedFolderExpected(root, sourceRelative, destinationRelative, device, inode, false)
+}
+func MoveRootedEmptyFolderExpected(root, sourceRelative, destinationRelative string, device, inode uint64) error {
+	return moveRootedFolderExpected(root, sourceRelative, destinationRelative, device, inode, true)
+}
+func moveRootedFolderExpected(root, sourceRelative, destinationRelative string, device, inode uint64, requireEmpty bool) error {
 	if err := VerifyRootedFolderIdentity(root, destinationRelative, device, inode); err == nil {
-		return nil
+		if !requireEmpty {
+			return nil
+		}
+		if emptyErr := VerifyRootedEmptyFolderIdentity(root, destinationRelative, device, inode); emptyErr == nil {
+			return nil
+		}
+		if restoreErr := moveRootedFolderExpected(root, destinationRelative, sourceRelative, device, inode, false); restoreErr != nil {
+			return fmt.Errorf("restore nonempty moved folder: %w", restoreErr)
+		}
+		return errors.New("folder became nonempty during move")
 	}
 	sourceParent, sourceBase, err := openRootedParent(root, sourceRelative)
 	if err != nil {
@@ -54,6 +70,16 @@ func MoveRootedFolderExpected(root, sourceRelative, destinationRelative string, 
 		_ = renameFolderNoReplace(sourceParent, staged, sourceParent, sourceBase)
 		return fmt.Errorf("folder move source changed: %w", err)
 	}
+	if requireEmpty {
+		empty, err := folderAtEmpty(sourceParent, staged, device, inode)
+		if err != nil || !empty {
+			_ = renameFolderNoReplace(sourceParent, staged, sourceParent, sourceBase)
+			if err != nil {
+				return err
+			}
+			return errors.New("folder is not empty")
+		}
+	}
 	destinationParent, destinationBase, err := openRootedParent(root, destinationRelative)
 	if err != nil {
 		return err
@@ -70,7 +96,44 @@ func MoveRootedFolderExpected(root, sourceRelative, destinationRelative string, 
 			return err
 		}
 	}
-	return VerifyRootedFolderIdentity(root, destinationRelative, device, inode)
+	if err := VerifyRootedFolderIdentity(root, destinationRelative, device, inode); err != nil {
+		return err
+	}
+	if requireEmpty {
+		if err := VerifyRootedEmptyFolderIdentity(root, destinationRelative, device, inode); err != nil {
+			if restoreErr := moveRootedFolderExpected(root, destinationRelative, sourceRelative, device, inode, false); restoreErr != nil {
+				return fmt.Errorf("restore folder after concurrent content: %v / %w", err, restoreErr)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func folderAtEmpty(parent int, name string, device, inode uint64) (bool, error) {
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, err
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return false, err
+	}
+	if uint64(stat.Dev) != device || stat.Ino != inode {
+		return false, errors.New("empty folder identity mismatch")
+	}
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return false, err
+	}
+	directory := os.NewFile(uintptr(dup), name)
+	entries, readErr := directory.ReadDir(1)
+	directory.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return false, readErr
+	}
+	return len(entries) == 0, nil
 }
 
 // DeleteRootedFolderExpected atomically removes only an empty, inode-bound

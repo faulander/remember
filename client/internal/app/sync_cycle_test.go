@@ -13,6 +13,7 @@ import (
 
 	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/frontmatter"
+	"github.com/faulander/remember/client/internal/localindex"
 	"github.com/faulander/remember/client/internal/remotehttp"
 	"github.com/google/uuid"
 )
@@ -860,6 +861,138 @@ func TestSyncOnceTreatsMissingRemoteDeleteAsSatisfied(t *testing.T) {
 	}
 	if err := store.ResolveMissingDelete(ctx, uuid.Must(uuid.NewV7())); err == nil {
 		t.Fatal("unauthorized missing delete resolution accepted")
+	}
+}
+
+func TestSyncOnceRecoversEmptyFolderCreatePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	aSnapshot, _ := a.index.ReadSnapshot(ctx)
+	var winnerID uuid.UUID
+	for _, object := range aSnapshot.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "Same" {
+			winnerID = object.ID
+		}
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderCreateMove = func() { testHookAfterConflictFolderCreateMove = nil; panic("simulated folder create recovery crash") }
+	defer func() { testHookAfterConflictFolderCreateMove = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected folder create recovery crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original, recovered localindex.Object
+	for _, object := range snapshot.Objects {
+		if object.RelativePath == "Same" {
+			original = object
+		}
+		if strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Same (Konflikt - ") {
+			recovered = object
+		}
+	}
+	if original.ID != winnerID || recovered.ID == uuid.Nil || recovered.ID == winnerID || recovered.Type != localindex.ObjectFolder {
+		t.Fatalf("folder collision original=%#v recovered=%#v", original, recovered)
+	}
+	state, ok := server.states[recovered.ID]
+	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID || state.ObjectType != clientsync.Folder {
+		t.Fatalf("recovered folder not synchronized: %#v", state)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("folder create collision unresolved=%t err=%v", unresolved, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aRecovered := false
+	aFinal, _ := a.index.ReadSnapshot(ctx)
+	for _, object := range aFinal.Objects {
+		if object.ID == recovered.ID {
+			aRecovered = true
+		}
+	}
+	if !aRecovered {
+		t.Fatal("recovered folder did not converge to other client")
+	}
+}
+
+func TestSyncOnceRejectsNonemptyFolderCreatePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	a, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	rootB := t.TempDir()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.CreateNote(ctx, "Same/Child.md", "must remain\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil || !strings.Contains(err.Error(), "subtree recovery") {
+		t.Fatalf("nonempty folder collision err=%v", err)
+	}
+	note, err := b.ReadNote(ctx, "Same/Child.md")
+	if err != nil || !strings.Contains(note.Body, "must remain") {
+		t.Fatalf("nonempty collision child=%#v err=%v", note, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName)); err != nil {
+		t.Fatalf("conflict namespace missing: %v", err)
 	}
 }
 

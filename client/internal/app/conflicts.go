@@ -25,6 +25,7 @@ var testHookAfterConflictEvacuation func()
 var testHookAfterConflictFolderPublication func()
 var testHookAfterConflictFolderMoveRevert func()
 var testHookAfterConflictFolderMoveReconcile func()
+var testHookAfterConflictFolderCreateMove func()
 
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
@@ -50,6 +51,15 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Create && conflict.Code == "path_collision" && conflict.Canonical == nil {
+			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
+				return err
+			}
+			if err := c.recoverEmptyFolderCreateCollision(ctx, store, conflict); err != nil {
+				return err
+			}
+			continue
+		}
 		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable" || conflict.Code == "folder_cycle" || conflict.Code == "base_revision_mismatch") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
 			if err := c.revertFolderMoveConflict(ctx, store, conflict); err != nil {
 				return err
@@ -112,6 +122,96 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		}
 	}
 	return nil
+}
+
+func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+	m := conflict.Outbox.Mutation
+	recovery, err := store.ConflictFolderCreateRecovery(ctx, m.OperationID)
+	if err != nil {
+		return err
+	}
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects[object.ID] = object
+	}
+	source, exists := objects[m.ObjectID]
+	if recovery == nil {
+		if !exists || source.Type != localindex.ObjectFolder || source.IdentityState != localindex.IdentityKnown || source.FolderDevice == 0 || source.FolderInode == 0 {
+			return errors.New("folder create collision source identity unavailable")
+		}
+		prefix := source.RelativePath + "/"
+		for _, object := range snapshot.Objects {
+			if object.ID != source.ID && strings.HasPrefix(object.RelativePath, prefix) {
+				return errors.New("nonempty folder create collision requires subtree recovery")
+			}
+		}
+		if err := repository.VerifyRootedEmptyFolderIdentity(c.root, source.RelativePath, source.FolderDevice, source.FolderInode); err != nil {
+			return err
+		}
+		recoveredID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName(path.Base(source.RelativePath), m.OperationID)
+		recovery = &clientsync.ConflictFolderCreateRecovery{OperationID: m.OperationID, SourceFolderID: m.ObjectID, RecoveredFolderID: recoveredID, SourceRelative: source.RelativePath, TargetRelative: target, Device: source.FolderDevice, Inode: source.FolderInode, State: "prepared"}
+		if err := store.PutConflictFolderCreateRecovery(ctx, *recovery); err != nil {
+			return err
+		}
+	}
+	recoveredParent, ok := objects[clientsync.ConflictRecoveredID]
+	if !ok || recoveredParent.Type != localindex.ObjectFolder || recoveredParent.IdentityState != localindex.IdentityKnown || recoveredParent.FolderDevice == 0 || recoveredParent.FolderInode == 0 {
+		return errors.New("recovered conflict parent identity unavailable")
+	}
+	verify := func() error {
+		if err := repository.VerifyRootedFolderIdentity(c.root, recoveredParent.RelativePath, recoveredParent.FolderDevice, recoveredParent.FolderInode); err != nil {
+			return err
+		}
+		return repository.VerifyRootedEmptyFolderIdentity(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode)
+	}
+	if recovery.State == "prepared" {
+		if verify() != nil {
+			if err := repository.VerifyRootedEmptyFolderIdentity(c.root, recovery.SourceRelative, recovery.Device, recovery.Inode); err != nil {
+				return err
+			}
+			if err := repository.MoveRootedEmptyFolderExpected(c.root, recovery.SourceRelative, recovery.TargetRelative, recovery.Device, recovery.Inode); err != nil {
+				return err
+			}
+		}
+		if testHookAfterConflictFolderCreateMove != nil {
+			testHookAfterConflictFolderCreateMove()
+		}
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.SourceFolderID: true}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+			return err
+		}
+		if err := verify(); err != nil {
+			return err
+		}
+		if err := store.MarkConflictFolderCreateMoved(ctx, m.OperationID); err != nil {
+			return err
+		}
+		recovery.State = "moved"
+	}
+	if recovery.State == "moved" {
+		if err := verify(); err != nil {
+			return err
+		}
+		_, _, durable, err := store.Projection(ctx, clientsync.ConflictRecoveredID)
+		if err != nil {
+			return err
+		}
+		if !durable {
+			return nil
+		}
+		if err := store.CompleteConflictFolderCreateRecovery(ctx, *recovery); err != nil {
+			return err
+		}
+		recovery.State = "completed"
+	}
+	return verify()
 }
 
 func (c *LocalCore) revertFolderMoveConflict(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {

@@ -145,6 +145,44 @@ func TestRemoveRootedConflictStageExpectedIsResumableAndPreservesReplacement(t *
 	}
 }
 
+func TestMoveRootedEmptyFolderExpectedRestoresNonemptySource(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "A", "Folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "B"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "A", "Folder", "child"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "A/Folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveRootedEmptyFolderExpected(root, "A/Folder", "B/Folder", device, inode); err == nil {
+		t.Fatal("nonempty folder moved")
+	}
+	if err := VerifyRootedFolderIdentity(root, "A/Folder", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "A", "Folder", "child")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "B", "Folder")); !os.IsNotExist(err) {
+		t.Fatalf("nonempty destination=%v", err)
+	}
+	if err := os.Remove(filepath.Join(root, "A", "Folder", "child")); err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveRootedEmptyFolderExpected(root, "A/Folder", "B/Folder", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRootedEmptyFolderIdentity(root, "B/Folder", device, inode); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMoveRootedFolderExpectedBindsInodeAndResumes(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "A", "Folder"), 0o755); err != nil {

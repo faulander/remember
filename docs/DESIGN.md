@@ -667,6 +667,13 @@ Umsetzung von `SYNC-008`:
 - Der fehlende Parent-Ordner wird ausschließlich aus kanonischem Zustand und über ein Nonce-/Inode-Journal wiederhergestellt.
 - Erst nach identitätsgebundener Restaurierung und dauerhafter Konfliktauflösung werden die Remote-Kinder angewendet.
 
+## 14.2.2.1 Leere Folder-Create-Pfadkollision
+
+- Der Server-Gewinner behält den ursprünglichen Pfad.
+- Ein nachweislich leerer lokaler Verlierer ohne abhängige Intents wird inode-gebunden unter neuer UUID direkt in `_Konflikte/Wiederhergestellt` verschoben und dort neu angelegt.
+- Die Leere wird nach verborgenem Inode-Staging und nach Veröffentlichung geprüft; konkurrierende Inhalte stellen den Quellfolder wieder her und lassen den Konflikt fail-closed.
+- Nichtleere Folder benötigen ein separates transaktionales Subtree-Rekeying.
+
 ## 14.2.3.1 Lokale Folder-Mutations-Echos
 
 - Reconcile bindet bekannte lokale Folder-Moves und -Deletes bereits beim Outbox-Enqueue an Quellpfad sowie Device/Inode.

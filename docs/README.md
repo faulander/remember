@@ -46,5 +46,6 @@
 | [0033](adr/0033-m2-folder-move-conflict-revert.md) | Identitätsgebundener Revert von Folder-Move-Konflikten |
 | [0034](adr/0034-m2-folder-cycle-conflict-revert.md) | Folder-Cycle-Konflikte als identitätsgebundener Move-Revert |
 | [0035](adr/0035-m2-equivalent-folder-move-resolution.md) | Äquivalente konkurrierende Folder-Moves |
+| [0036](adr/0036-m2-empty-folder-create-collision-recovery.md) | Wiederherstellung leerer Folder-Create-Pfadkollisionen |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
