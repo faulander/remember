@@ -51,7 +51,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	}
 	for _, conflict := range conflicts {
 		m := conflict.Outbox.Mutation
-		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Create && conflict.Code == "path_collision" && conflict.Canonical == nil {
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Create && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable") && conflict.Canonical == nil {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
 			}
@@ -184,7 +184,7 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 		if testHookAfterConflictFolderCreateMove != nil {
 			testHookAfterConflictFolderCreateMove()
 		}
-		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.SourceFolderID: true}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.SourceFolderID: true}, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.SourceRelative: recovery.SourceFolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
 			return err
 		}
 		if err := verify(); err != nil {

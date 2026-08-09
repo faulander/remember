@@ -21,7 +21,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen, paginierten Cursor-Pull und wiederholbare kanonische Konfliktzustände.
-- Lokaler Index v16 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
+- Lokaler Index v17 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
 - Crash-resumierbarer Remote-Apply für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen ohne permanente Marker.
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
@@ -52,7 +52,8 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Finale content-addressed Outbox-Blobs werden nur ohne aktive Replay-/Konfliktreferenz und pro Hash-Wiederverwendung in einer eigenen Sequenzgeneration bereinigt.
 - Lokal gelöschte, serverseitig nichtleere Ordner werden nonce-/inode-gebunden restauriert, bevor ihre Remote-Kinder gepullt werden.
 - Note-Create/-Move unter einem bereits remote gelöschten Parent retten lokale Bytes crash-sicher als sichtbare synchronisierte Konfliktkopie.
-- Leere Folder-Create-Pfadkollisionen werden unter neuer UUID sichtbar und synchronisiert in `_Konflikte/Wiederhergestellt` gerettet; nichtleere Varianten bleiben fail-closed.
+- Leere Folder-Creates mit Pfadkollision oder inzwischen gelöschtem Zielparent werden unter neuer UUID sichtbar und synchronisiert in `_Konflikte/Wiederhergestellt` gerettet; nichtleere Varianten bleiben fail-closed.
+- Folder-Moves in einen gelöschten Parent sind mit Absturz nach Inode-Revert und anschließend synchronisiertem abhängigem Kind-Edit verifiziert.
 - Folder-Moves gegen belegte Pfade, gelöschte Remote-Parents oder eine inzwischen divergierte zyklische Ancestry werden auf den authentifizierten kanonischen Pfad inode-gebunden zurückgesetzt; äquivalente konkurrierende Moves werden ohne Dateisystemänderung aufgelöst und abhängige Kindänderungen bleiben sendbar. Divergente Move-Ziele bleiben fail-closed.
 - Note-/Folder-`type_mismatch` wird in beiden Richtungen explizit vor Pull und Apply blockiert; lokale Bytes, Inodes und Unterbäume bleiben unverändert und der kanonische Konfliktzustand ist replay-stabil.
 - Konkurrierende Note-Moves und -Deletes konvergieren in beiden Reihenfolgen: Der Tombstone bleibt wirksam, die Move-Fassung wird unter neuer UUID sichtbar gerettet und technische Evakuierungsbytes werden erst danach hashgebunden bereinigt.

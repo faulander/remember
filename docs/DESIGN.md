@@ -674,6 +674,12 @@ Umsetzung von `SYNC-008`:
 - Die Leere wird nach verborgenem Inode-Staging und nach Veröffentlichung geprüft; konkurrierende Inhalte stellen den Quellfolder wieder her und lassen den Konflikt fail-closed.
 - Nichtleere Folder benötigen ein separates transaktionales Subtree-Rekeying.
 
+## 14.2.2.2 Folder-Create gegen gelöschten Parent
+
+- Ein nachweislich leerer lokaler Create-Verlierer wird wie bei einer Pfadkollision Inode-gebunden unter neuer UUID direkt in `_Konflikte/Wiederhergestellt` gerettet.
+- Trusted Reconcile entfernt die alte, nie serverseitig angelegte ID über eine exakte Quellpfad-/ID-Bindung, bevor der Remote-Parent-Delete angewendet wird.
+- Nichtleere Folder bleiben bis zum vollständigen Subtree-Rekeying fail-closed.
+
 ## 14.2.3.1 Lokale Folder-Mutations-Echos
 
 - Reconcile bindet bekannte lokale Folder-Moves und -Deletes bereits beim Outbox-Enqueue an Quellpfad sowie Device/Inode.

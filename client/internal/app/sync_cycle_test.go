@@ -1325,6 +1325,89 @@ func TestSyncOnceRecoversEmptyFolderCreatePathCollision(t *testing.T) {
 	}
 }
 
+func TestSyncOnceRecoversEmptyFolderCreateFromUnavailableParent(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Parent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(rootA, "Parent")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Parent/Local"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("sync %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Parent")); !os.IsNotExist(err) {
+		t.Fatalf("deleted parent remains: %v", err)
+	}
+	snapshot, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recovered localindex.Object
+	for _, object := range snapshot.Objects {
+		if strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Local (Konflikt - ") {
+			recovered = object
+		}
+	}
+	if recovered.ID == uuid.Nil || recovered.Type != localindex.ObjectFolder {
+		t.Fatalf("unavailable-parent recovery=%#v", recovered)
+	}
+	state, ok := server.states[recovered.ID]
+	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID || state.ObjectType != clientsync.Folder {
+		t.Fatalf("unavailable-parent server recovery=%#v", state)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("unavailable-parent create unresolved=%t err=%v", unresolved, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aSnapshot, err := a.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, object := range aSnapshot.Objects {
+		if object.ID == recovered.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unavailable-parent folder did not converge")
+	}
+}
+
 func TestSyncOnceRejectsNonemptyFolderCreatePathCollision(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
@@ -1455,6 +1538,104 @@ func TestSyncOnceRevertsFolderMovePathCollisionAndKeepsChildEdit(t *testing.T) {
 	remoteEdit, err := a.ReadNote(ctx, "Source/N.md")
 	if err != nil || !strings.Contains(remoteEdit.Body, "edited after move") {
 		t.Fatalf("remote child edit=%#v err=%v", remoteEdit, err)
+	}
+}
+
+func TestSyncOnceRevertsFolderMoveFromDeletedParentAndKeepsChildEdit(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, folder := range []string{"Source", "Target"} {
+		if _, err := a.CreateFolder(ctx, folder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	note, _, err := a.CreateNote(ctx, "Source/N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(rootA, "Target")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "Source"), filepath.Join(rootB, "Target", "Source")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := b.ReadNote(ctx, "Target/Source/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Target/Source/N.md", doc.Revision, "edited under stale parent\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderMoveRevert = func() {
+		testHookAfterConflictFolderMoveRevert = nil
+		panic("simulated unavailable-parent folder revert crash")
+	}
+	defer func() { testHookAfterConflictFolderMoveRevert = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected unavailable-parent revert crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restored, err := b.ReadNote(ctx, "Source/N.md")
+	if err != nil || restored.ID != note.ID || !strings.Contains(restored.Body, "edited under stale parent") {
+		t.Fatalf("restored stale-parent child=%#v err=%v", restored, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Target")); !os.IsNotExist(err) {
+		t.Fatalf("deleted parent remains: %v", err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("parent move conflict unresolved=%t err=%v", unresolved, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	remoteEdit, err := a.ReadNote(ctx, "Source/N.md")
+	if err != nil || !strings.Contains(remoteEdit.Body, "edited under stale parent") {
+		t.Fatalf("remote stale-parent child=%#v err=%v", remoteEdit, err)
 	}
 }
 
