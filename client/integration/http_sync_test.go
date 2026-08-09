@@ -13,8 +13,10 @@ import (
 	"testing"
 
 	clientapp "github.com/faulander/remember/client/internal/app"
+	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/remotehttp"
 	"github.com/faulander/remember/server/integrationtest"
+	"github.com/google/uuid"
 )
 
 func login(t *testing.T, base, email, password, device string) string {
@@ -85,6 +87,216 @@ func syncTimes(t *testing.T, ctx context.Context, core *clientapp.LocalCore, rem
 			t.Fatalf("sync %d/%d: %v", i+1, count, err)
 		}
 	}
+}
+
+func TestAuthenticatedStructuralConflictsConverge(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "matrix@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Matrix A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Matrix B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	moveDelete, _, err := a.CreateNote(ctx, "MoveDelete.md", "local move must survive delete\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	aNote, err := a.ReadNote(ctx, "MoveDelete.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DeleteNote(ctx, "MoveDelete.md", aNote.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	bNote, err := b.ReadNote(ctx, "MoveDelete.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.MoveNote(ctx, "MoveDelete.md", "LocallyMoved.md", bNote.Revision); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := b.ReadNote(ctx, "LocallyMoved.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "LocallyMoved.md", moved.Revision, "edited local move must survive delete\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, b, remoteB, 3)
+	syncTimes(t, ctx, a, remoteA, 2)
+	for label, core := range map[string]*clientapp.LocalCore{"A": a, "B": b} {
+		for _, name := range []string{"MoveDelete.md", "LocallyMoved.md"} {
+			if _, err := core.ReadNote(ctx, name); err == nil {
+				t.Fatalf("%s retained tombstoned move at %s", label, name)
+			}
+		}
+	}
+	assertConflictContent(t, rootA, "edited local move must survive delete")
+	assertConflictContent(t, rootB, "edited local move must survive delete")
+	deleteMove, _, err := a.CreateNote(ctx, "DeleteMove.md", "remote move must survive local delete\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	bDelete, err := b.ReadNote(ctx, "DeleteMove.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DeleteNote(ctx, "DeleteMove.md", bDelete.Revision); err != nil {
+		t.Fatal(err)
+	}
+	aMove, err := a.ReadNote(ctx, "DeleteMove.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "DeleteMove.md", "RemotelyMoved.md", aMove.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 3)
+	syncTimes(t, ctx, a, remoteA, 2)
+	for label, core := range map[string]*clientapp.LocalCore{"A": a, "B": b} {
+		for _, name := range []string{"DeleteMove.md", "RemotelyMoved.md"} {
+			if _, err := core.ReadNote(ctx, name); err == nil {
+				t.Fatalf("%s retained delete/move identity at %s", label, name)
+			}
+		}
+	}
+	assertConflictContent(t, rootA, "remote move must survive local delete")
+	assertConflictContent(t, rootB, "remote move must survive local delete")
+	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	direct, _, err := b.CreateNote(ctx, "Same/Child.md", "direct subtree bytes\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, b, remoteB, 4)
+	syncTimes(t, ctx, a, remoteA, 2)
+	recoveredA := findNoteByContent(t, rootA, "direct subtree bytes")
+	recoveredB := findNoteByContent(t, rootB, "direct subtree bytes")
+	relativeA := relativeTestPath(t, rootA, recoveredA)
+	relativeB := relativeTestPath(t, rootB, recoveredB)
+	if filepath.Base(recoveredA) != "Child.md" || relativeA != relativeB {
+		t.Fatalf("direct subtree paths A=%s B=%s", relativeA, relativeB)
+	}
+	if id := inspectTestNoteID(t, recoveredA); id != direct.ID {
+		t.Fatalf("direct A id=%s want=%s", id, direct.ID)
+	}
+	if id := inspectTestNoteID(t, recoveredB); id != direct.ID {
+		t.Fatalf("direct B id=%s want=%s", id, direct.ID)
+	}
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Matrix C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	for _, name := range []string{"MoveDelete.md", "LocallyMoved.md", "DeleteMove.md", "RemotelyMoved.md"} {
+		if _, err := c.ReadNote(ctx, name); err == nil {
+			t.Fatalf("cold client revived tombstoned identity at %s", name)
+		}
+	}
+	assertConflictContent(t, rootC, "edited local move must survive delete")
+	assertConflictContent(t, rootC, "remote move must survive local delete")
+	recoveredC := findNoteByContent(t, rootC, "direct subtree bytes")
+	relativeC := relativeTestPath(t, rootC, recoveredC)
+	if relativeC != relativeA {
+		t.Fatalf("cold direct subtree path=%s want=%s", relativeC, relativeA)
+	}
+	if id := inspectTestNoteID(t, recoveredC); id != direct.ID {
+		t.Fatalf("direct C id=%s want=%s", id, direct.ID)
+	}
+	_ = moveDelete
+	_ = deleteMove
+}
+
+func assertConflictContent(t *testing.T, root, needle string) {
+	t.Helper()
+	matches, _ := filepath.Glob(filepath.Join(root, "_Konflikte", "Wiederhergestellt", "*.md"))
+	for _, match := range matches {
+		content, err := os.ReadFile(match)
+		if err == nil && bytes.Contains(content, []byte(needle)) {
+			return
+		}
+	}
+	t.Fatalf("conflict content %q absent in %v", needle, matches)
+}
+func relativeTestPath(t *testing.T, root, absolute string) string {
+	t.Helper()
+	relative, err := filepath.Rel(root, absolute)
+	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		t.Fatalf("invalid test path %s: %v", absolute, err)
+	}
+	return filepath.ToSlash(relative)
+}
+func inspectTestNoteID(t *testing.T, absolute string) uuid.UUID {
+	t.Helper()
+	content, err := os.ReadFile(absolute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := frontmatter.Inspect(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inspection.NoteID
+}
+
+func findNoteByContent(t *testing.T, root, needle string) string {
+	t.Helper()
+	var found string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() && entry.Name() == ".remember" {
+			return filepath.SkipDir
+		}
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			if bytes.Contains(content, []byte(needle)) {
+				if found != "" {
+					return fmt.Errorf("duplicate content")
+				}
+				found = path
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found
 }
 
 func TestTwoClientsConvergeThroughAuthenticatedHTTP(t *testing.T) {

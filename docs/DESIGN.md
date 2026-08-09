@@ -682,6 +682,11 @@ Umsetzung von `SYNC-008`:
 - Trusted Reconcile entfernt die alte, nie serverseitig angelegte ID über eine exakte Quellpfad-/ID-Bindung, bevor der Remote-Parent-Delete angewendet wird.
 - Direkte, nie versuchte Note-Creates können über das unveränderliche v19-Member-Manifest erhalten werden; Nested Folder und spätere Edits bleiben bis zum vollständigen Subtree-Rekeying fail-closed.
 
+## 14.2.2.3 Authentifizierte Strukturkonflikt-Abnahme
+
+- Drei unabhängige Geräte durchlaufen über echte Login-, Blob- und Sync-HTTP-Routen beide Note-Move/Delete-Reihenfolgen sowie eine Direct-Note-Folder-Pfadkollision.
+- Ein kaltes Drittgerät muss ausschließlich aus Cursor-Historie dieselben Konfliktkopien, Tombstones, Recovery-Pfade und Note-UUIDs herstellen.
+
 ## 14.2.3.1 Lokale Folder-Mutations-Echos
 
 - Reconcile bindet bekannte lokale Folder-Moves und -Deletes bereits beim Outbox-Enqueue an Quellpfad sowie Device/Inode.
