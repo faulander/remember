@@ -22,7 +22,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen, paginierten Cursor-Pull und wiederholbare kanonische Konfliktzustände.
 - Lokaler Index v25 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
-- Dauerhafte Sync-Inbox mit atomarer Pull-Seitenaufnahme, exaktem Replay-Schutz, monotonem Apply-Zustand und getrenntem Download-/Confirmed-Cursor als noch nicht in `SyncOnce` verdrahtete Grundlage für `SYNC-012`.
+- Dauerhafte Sync-Inbox mit atomarer Pull-Seitenaufnahme, exaktem Replay-Schutz, monotonem Apply-Zustand und getrenntem Download-/Confirmed-Cursor; `SyncOnce` spiegelt nun den bestehenden cursor-geordneten Apply-Pfad crash-fortsetzbar in die Inbox, während objektbezogene Isolation für `SYNC-012` noch offen bleibt.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
 - Descriptor-rekursive, nicht mutierende Subtree-Verifikation auf Darwin/Linux mit exaktem Manifest, Folder-Inode-Bindung, `O_NOFOLLOW` und Datei-SHA-256 als Grundlage für spätere Nested-Folder-Recovery.
 - Crash-resumierbarer Remote-Apply für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen ohne permanente Marker.

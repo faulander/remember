@@ -14,6 +14,8 @@ import (
 
 const maxForegroundPullPages = 32
 
+var testHookAfterInboxIngest func() error
+
 var (
 	ErrUnresolvedOutbound  = errors.New("local sync operations require resolution")
 	ErrUnsupportedPullPage = errors.New("pull page contains unsupported changes")
@@ -44,6 +46,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err != nil {
 		return err
 	}
+	if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
+		return err
+	}
 	if err := c.stageSupportedConflicts(ctx, store, remote); err != nil {
 		return err
 	}
@@ -62,7 +67,18 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if active, err := store.ActiveApplyPlan(ctx); err != nil {
 		return err
 	} else if active != nil {
+		steps := make([]clientsync.Change, len(active.Steps))
+		copy(steps, active.Steps)
+		for i := range steps {
+			steps[i].State = ""
+		}
+		if err := store.IngestPullPage(ctx, active.FromCursor, active.ThroughCursor, steps); err != nil {
+			return err
+		}
 		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
+			return err
+		}
+		if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
 			return err
 		}
 		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
@@ -157,6 +173,14 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		if page.NextCursor != expected || page.NextCursor <= after {
 			return remotehttp.ErrInvalidResponse
 		}
+		if err := store.IngestPullPage(ctx, after, page.NextCursor, page.Changes); err != nil {
+			return err
+		}
+		if testHookAfterInboxIngest != nil {
+			if err := testHookAfterInboxIngest(); err != nil {
+				return err
+			}
+		}
 		planID, err := uuid.NewV7()
 		if err != nil {
 			return fmt.Errorf("generate apply plan id: %w", err)
@@ -165,6 +189,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			return err
 		}
 		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
+			return err
+		}
+		if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
 			return err
 		}
 		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {

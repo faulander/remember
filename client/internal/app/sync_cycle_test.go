@@ -4373,7 +4373,147 @@ func TestSyncOnceDoesNotAdvanceCursorWhenRemoteApplyFails(t *testing.T) {
 	if active, err := store.ActiveApplyPlan(ctx); err != nil || active == nil {
 		t.Fatalf("active=%#v err=%v", active, err)
 	}
+	if downloaded, err := store.DownloadedCursor(ctx); err != nil || downloaded != 1 {
+		t.Fatalf("downloaded=%d err=%v", downloaded, err)
+	}
+	if inbox, found, err := store.InboxChange(ctx, 1); err != nil || !found || inbox.State != "pending" {
+		t.Fatalf("inbox=%#v found=%t err=%v", inbox, found, err)
+	}
 	if _, err := os.Stat(filepath.Join(root, "Remote.md")); !os.IsNotExist(err) {
 		t.Fatalf("remote file=%v", err)
+	}
+}
+
+func remoteFolderChanges(t *testing.T, names ...string) []clientsync.Change {
+	t.Helper()
+	changes := make([]clientsync.Change, len(names))
+	for i, name := range names {
+		changes[i] = clientsync.Change{Cursor: uint64(i + 1), Mutation: clientsync.Create, OperationID: uuid.Must(uuid.NewV7()), ObjectID: uuid.New(), ObjectType: clientsync.Folder, Revision: 1, Name: name}
+	}
+	return changes
+}
+
+func TestSyncOnceMirrorsPaginatedPullIntoAppliedInbox(t *testing.T) {
+	ctx := context.Background()
+	core, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	changes := remoteFolderChanges(t, "One", "Two", "Three")
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}, changes: changes, maxPull: 1}
+	for _, change := range changes {
+		server.states[change.ObjectID] = change
+	}
+	if err := core.SyncOnce(ctx, &memoryRemote{server: server}); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	confirmed, err := store.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloaded, err := store.DownloadedCursor(ctx)
+	if err != nil || confirmed != 3 || downloaded != confirmed {
+		t.Fatalf("confirmed=%d downloaded=%d err=%v", confirmed, downloaded, err)
+	}
+	for cursor := uint64(1); cursor <= 3; cursor++ {
+		item, found, err := store.InboxChange(ctx, cursor)
+		if err != nil || !found || item.State != "applied" || item.ApplyingAt == nil || item.AppliedAt == nil {
+			t.Fatalf("cursor=%d item=%#v found=%t err=%v", cursor, item, found, err)
+		}
+	}
+}
+
+func TestSyncOnceReplaysInboxExactlyAfterFailureBeforeApply(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	changes := remoteFolderChanges(t, "Remote")
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}, changes: changes}
+	server.states[changes[0].ObjectID] = changes[0]
+	injected := errors.New("stop after inbox ingest")
+	testHookAfterInboxIngest = func() error { testHookAfterInboxIngest = nil; return injected }
+	defer func() { testHookAfterInboxIngest = nil }()
+	if err := core.SyncOnce(ctx, &memoryRemote{server: server}); !errors.Is(err, injected) {
+		t.Fatalf("first sync=%v", err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != 0 {
+		t.Fatalf("confirmed=%d", confirmed)
+	}
+	if downloaded, _ := store.DownloadedCursor(ctx); downloaded != 1 {
+		t.Fatalf("downloaded=%d", downloaded)
+	}
+	if err := core.SyncOnce(ctx, &memoryRemote{server: server}); err != nil {
+		t.Fatal(err)
+	}
+	item, found, err := store.InboxChange(ctx, 1)
+	if err != nil || !found || item.State != "applied" {
+		t.Fatalf("item=%#v found=%t err=%v", item, found, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "Remote"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+}
+
+func TestSyncOnceRejectsMismatchedInboxReplay(t *testing.T) {
+	ctx := context.Background()
+	core, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	changes := remoteFolderChanges(t, "Original")
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}, changes: changes}
+	server.states[changes[0].ObjectID] = changes[0]
+	injected := errors.New("stop after inbox ingest")
+	testHookAfterInboxIngest = func() error { testHookAfterInboxIngest = nil; return injected }
+	defer func() { testHookAfterInboxIngest = nil }()
+	if err := core.SyncOnce(ctx, &memoryRemote{server: server}); !errors.Is(err, injected) {
+		t.Fatalf("first sync=%v", err)
+	}
+	server.changes[0].Name = "Changed"
+	if err := core.SyncOnce(ctx, &memoryRemote{server: server}); err == nil || !strings.Contains(err.Error(), "payload mismatch") {
+		t.Fatalf("mismatch err=%v", err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	if active, err := store.ActiveApplyPlan(ctx); err != nil || active != nil {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+}
+
+func TestSyncOnceReconcilesInboxAfterExistingApplyPlanCompletes(t *testing.T) {
+	ctx := context.Background()
+	core, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	changes := remoteFolderChanges(t, "ExistingPlan")
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}, changes: changes}
+	server.states[changes[0].ObjectID] = changes[0]
+	remote := &memoryRemote{server: server}
+	store, _ := clientsync.NewStore(core.index)
+	if err := store.CreateApplyPlan(ctx, clientsync.ApplyPlan{ID: uuid.Must(uuid.NewV7()), FromCursor: 0, ThroughCursor: 1, Steps: changes}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.InboxChange(ctx, 1); err != nil || found {
+		t.Fatalf("inbox unexpectedly present found=%t err=%v", found, err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	item, found, err := store.InboxChange(ctx, 1)
+	if err != nil || !found || item.State != "applied" {
+		t.Fatalf("item=%#v found=%t err=%v", item, found, err)
+	}
+	if active, err := store.ActiveApplyPlan(ctx); err != nil || active != nil {
+		t.Fatalf("active=%#v err=%v", active, err)
 	}
 }

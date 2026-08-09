@@ -279,6 +279,85 @@ func (s *Store) MarkInboxApplied(ctx context.Context, cursor uint64) error {
 	return s.transitionInbox(ctx, cursor, "applying", "applied")
 }
 
+// ReconcileInboxAppliedThroughConfirmed mirrors the legacy apply frontier into
+// inbox state. It never advances confirmed_cursor. For a database with no inbox
+// history, it may seed downloaded_cursor from a newer legacy confirmed cursor.
+func (s *Store) ReconcileInboxAppliedThroughConfirmed(ctx context.Context) error {
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		confirmed, err := readSyncCursor(ctx, tx, "confirmed_cursor", "confirmed")
+		if errors.Is(err, sql.ErrNoRows) {
+			confirmed, err = 0, nil
+		}
+		if err != nil {
+			return err
+		}
+		downloaded, err := readSyncCursor(ctx, tx, "downloaded_cursor", "downloaded")
+		if err != nil {
+			return err
+		}
+		var first, last, count sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT min(cursor),max(cursor),count(*) FROM sync_inbox_changes`).Scan(&first, &last, &count); err != nil {
+			return err
+		}
+		if !first.Valid {
+			if downloaded > confirmed {
+				return errors.New("downloaded inbox range is missing")
+			}
+			if downloaded < confirmed {
+				result, err := tx.ExecContext(ctx, `UPDATE sync_state SET value=? WHERE key='downloaded_cursor' AND value=?`, strconv.FormatUint(confirmed, 10), strconv.FormatUint(downloaded, 10))
+				if err != nil {
+					return err
+				}
+				if count, err := result.RowsAffected(); err != nil || count != 1 {
+					return errors.New("downloaded cursor seed lost")
+				}
+			}
+			return nil
+		}
+		if downloaded < confirmed {
+			return errors.New("downloaded cursor is behind confirmed cursor")
+		}
+		if !last.Valid || !count.Valid || last.Int64 != int64(downloaded) || count.Int64 != last.Int64-first.Int64+1 {
+			return errors.New("downloaded inbox range is incomplete")
+		}
+
+		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes WHERE cursor<=? ORDER BY cursor`, confirmed)
+		if err != nil {
+			return err
+		}
+		expected := uint64(first.Int64)
+		for rows.Next() {
+			item, err := scanInboxItem(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			if item.Change.Cursor != expected {
+				rows.Close()
+				return errors.New("confirmed inbox range is incomplete")
+			}
+			expected++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if uint64(first.Int64) <= confirmed && expected != confirmed+1 {
+			return errors.New("confirmed inbox range is incomplete")
+		}
+
+		now := s.clock().UTC().UnixMilli()
+		if _, err := tx.ExecContext(ctx, `UPDATE sync_inbox_changes SET state='applying',applying_at_ms=max(?,ingested_at_ms) WHERE cursor<=? AND state='pending'`, now, confirmed); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE sync_inbox_changes SET state='applied',applied_at_ms=max(?,applying_at_ms) WHERE cursor<=? AND state='applying'`, now, confirmed)
+		return err
+	})
+}
+
 // AdvanceConfirmedInboxCursor advances the legacy confirmed frontier only over
 // a contiguous prefix of applied inbox rows.
 func (s *Store) AdvanceConfirmedInboxCursor(ctx context.Context) (uint64, error) {

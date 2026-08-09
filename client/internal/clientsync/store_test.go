@@ -909,6 +909,95 @@ func TestInboxSQLGuardsPayloadStateAndDelete(t *testing.T) {
 	}
 }
 
+func TestReconcileInboxAppliedThroughConfirmedIsPartialIdempotentAndResumable(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	first := inboxFolderChange(t, 1, 1, uuid.New(), Create, "One")
+	second := inboxFolderChange(t, 2, 1, uuid.New(), Create, "Two")
+	if err := store.IngestPullPage(ctx, 0, 2, []Change{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInboxApplying(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetConfirmedCursor(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	one, _, err := store.InboxChange(ctx, 1)
+	if err != nil || one.State != "applied" || one.ApplyingAt == nil || one.AppliedAt == nil {
+		t.Fatalf("one=%#v err=%v", one, err)
+	}
+	two, _, err := store.InboxChange(ctx, 2)
+	if err != nil || two.State != "pending" {
+		t.Fatalf("two=%#v err=%v", two, err)
+	}
+	if err := store.SetConfirmedCursor(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
+		t.Fatal(err)
+	}
+	two, _, err = store.InboxChange(ctx, 2)
+	if err != nil || two.State != "applied" || two.ApplyingAt == nil || two.AppliedAt == nil {
+		t.Fatalf("two=%#v err=%v", two, err)
+	}
+}
+
+func TestReconcileInboxAppliedThroughConfirmedSeedsLegacyCursorWithoutRows(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	if err := store.SetConfirmedCursor(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if downloaded, err := store.DownloadedCursor(ctx); err != nil || downloaded != 42 {
+		t.Fatalf("downloaded=%d err=%v", downloaded, err)
+	}
+}
+
+func TestReconcileInboxAppliedThroughConfirmedRejectsMissingDownloadedRow(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	changes := []Change{inboxFolderChange(t, 1, 1, uuid.New(), Create, "One"), inboxFolderChange(t, 2, 1, uuid.New(), Create, "Two")}
+	if err := store.IngestPullPage(ctx, 0, 2, changes); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DROP TRIGGER sync_inbox_no_delete`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`DELETE FROM sync_inbox_changes WHERE cursor=2`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err == nil {
+		t.Fatal("missing downloaded row accepted")
+	}
+}
+
 func TestInboxScanAndFrontierRejectCorruptStoredPayload(t *testing.T) {
 	ctx := context.Background()
 	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
