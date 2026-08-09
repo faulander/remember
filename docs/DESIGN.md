@@ -676,7 +676,7 @@ Umsetzung von `SYNC-008`:
 - Ein nachweislich leerer lokaler Verlierer ohne abhängige Intents wird inode-gebunden unter neuer UUID direkt in `_Konflikte/Wiederhergestellt` verschoben und dort neu angelegt.
 - Die Leere wird nach verborgenem Inode-Staging und nach Veröffentlichung geprüft; konkurrierende Inhalte stellen den Quellfolder wieder her und lassen den Konflikt fail-closed.
 - Ein streng manifestierter Unterbaum ausschließlich aus direkten Note-Creates mit linearer, nie versuchter Create→Update-Historie wird transaktional auf eine neue Root-UUID umgebunden; Note-UUIDs und Bytes bleiben erhalten.
-- Nested Folder, nichtlineare/versuchte Note-Historien und allgemeinere nichtleere Folder benötigen weiterhin das vollständige rekursive Subtree-Rekeying.
+- Nested Folder, nichtlineare/versuchte Note-Historien und allgemeinere nichtleere Folder benötigen weiterhin das vollständige rekursive Subtree-Rekeying. Als Sicherheitsprimitiv verifiziert `VerifyRootedSubtreeExpected` einen vollständigen manifestierten Baum über einen gehaltenen Root-Descriptor, descriptor-relative `openat(..., O_NOFOLLOW)`-Traversal, exakte Namen/Typen, Folder-Device/Inode und Datei-SHA-256; Recovery-Planung oder Rekeying ist damit noch nicht implementiert.
 
 ## 14.2.2.2 Folder-Create gegen gelöschten Parent
 

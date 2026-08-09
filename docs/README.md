@@ -64,5 +64,6 @@
 | [0050](adr/0050-m2-direct-note-update-chain-folder-recovery.md) | Folder-Create-Recovery mit linearen direkten Note-Updates |
 | [0051](adr/0051-m2-direct-note-folder-move-delete-recovery.md) | Folder-Move/Remote-Delete-Recovery mit direkten Note-Updates |
 | [0052](adr/0052-m2-authenticated-adr49-51-convergence.md) | Authentifizierte Konvergenz für ADR 0049 bis 0051 |
+| [0053](adr/0053-m2-descriptor-recursive-subtree-verification.md) | Descriptor-rekursive exakte Subtree-Verifikation |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
