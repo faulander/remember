@@ -93,6 +93,215 @@ func syncTimes(t *testing.T, ctx context.Context, core *clientapp.LocalCore, rem
 	}
 }
 
+func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "isolation@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Isolation A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Isolation B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "FolderX"); err != nil {
+		t.Fatal(err)
+	}
+	y, _, err := a.CreateNote(ctx, "Y.md", "initial Y\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, _, err := a.CreateNote(ctx, "Z.md", "initial Z\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	folderID := localFolderIDAtPath(t, ctx, rootA, "FolderX")
+	if got := localFolderIDAtPath(t, ctx, rootB, "FolderX"); got != folderID {
+		t.Fatalf("folder ids A/B=%s/%s", folderID, got)
+	}
+	index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := store.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index.Close()
+	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "LocalFolder")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "FolderX")
+	localBefore, err := os.Stat(filepath.Join(rootB, "LocalFolder"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootA, "FolderX"), filepath.Join(rootA, "RemoteFolder")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootA, "FolderX")
+	yCurrent, err := a.ReadNote(ctx, "Y.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "Y.md", yCurrent.Revision, "remote exact Y\n", []string{"adr57"}); err != nil {
+		t.Fatal(err)
+	}
+	zCurrent, err := a.ReadNote(ctx, "Z.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DeleteNote(ctx, "Z.md", zCurrent.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	expectedY, err := os.ReadFile(filepath.Join(rootA, "Y.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, _, err := b.CreateNote(ctx, "Q.md", "independent outbound Q\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedQ, err := os.ReadFile(filepath.Join(rootB, "Q.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remoteB); !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+		t.Fatalf("blocked sync=%v", err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, b, "Y.md", expectedY, y.ID)
+	if _, err := b.ReadNote(ctx, "Z.md"); err == nil {
+		t.Fatal("B retained deleted Z")
+	}
+	if info, err := os.Stat(filepath.Join(rootB, "LocalFolder")); err != nil || !os.SameFile(localBefore, info) {
+		t.Fatalf("local folder inode changed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "RemoteFolder")); !os.IsNotExist(err) {
+		t.Fatalf("B materialized losing remote folder: %v", err)
+	}
+	index, err = localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloaded, err := store.DownloadedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed, err := store.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed != base || downloaded <= confirmed {
+		t.Fatalf("frontiers confirmed/downloaded/base=%d/%d/%d", confirmed, downloaded, base)
+	}
+	unresolved, err := store.HasUnresolvedLocalIntent(ctx, folderID)
+	if err != nil || !unresolved {
+		t.Fatalf("folder intent unresolved=%v err=%v", unresolved, err)
+	}
+	states := map[uuid.UUID]string{}
+	for cursor := base + 1; cursor <= downloaded; cursor++ {
+		item, found, err := store.InboxChange(ctx, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			states[item.Change.ObjectID] = item.State
+		}
+	}
+	if states[folderID] != "pending" || states[y.ID] != "applied" || states[z.ID] != "applied" {
+		t.Fatalf("inbox X/Y/Z=%q/%q/%q", states[folderID], states[y.ID], states[z.ID])
+	}
+	index.Close()
+	yBeforeRestart, err := os.Stat(filepath.Join(rootB, "Y.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = clientapp.Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	recording := &recordingRemote{Client: remoteB}
+	if err := b.SyncOnce(ctx, recording); !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+		t.Fatalf("restart sync=%v", err)
+	}
+	if len(recording.afters) == 0 || recording.afters[0] != downloaded {
+		t.Fatalf("restart pull afters=%v downloaded=%d", recording.afters, downloaded)
+	}
+	yAfterRestart, err := os.Stat(filepath.Join(rootB, "Y.md"))
+	if err != nil || !os.SameFile(yBeforeRestart, yAfterRestart) || !yBeforeRestart.ModTime().Equal(yAfterRestart.ModTime()) {
+		t.Fatalf("Y republished on restart: %v", err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	assertRememberNoteBytesAndID(t, ctx, a, "Q.md", expectedQ, q.ID)
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Isolation C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	if got := localFolderIDAtPath(t, ctx, rootC, "RemoteFolder"); got != folderID {
+		t.Fatalf("cold folder id=%s want=%s", got, folderID)
+	}
+	if _, err := os.Stat(filepath.Join(rootC, "LocalFolder")); !os.IsNotExist(err) {
+		t.Fatalf("cold retained local losing path: %v", err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, c, "Y.md", expectedY, y.ID)
+	if _, err := c.ReadNote(ctx, "Z.md"); err == nil {
+		t.Fatal("cold retained Z")
+	}
+	assertRememberNoteBytesAndID(t, ctx, c, "Q.md", expectedQ, q.ID)
+	if z.ID == uuid.Nil {
+		t.Fatal("missing Z id")
+	}
+}
+
+func assertRememberNoteBytesAndID(t *testing.T, ctx context.Context, core *clientapp.LocalCore, path string, wantBytes []byte, wantID uuid.UUID) {
+	t.Helper()
+	got, err := os.ReadFile(filepath.Join(core.Root(), filepath.FromSlash(path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, wantBytes) {
+		t.Fatalf("%s bytes differ", path)
+	}
+	note, err := core.ReadNote(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note.ID != wantID {
+		t.Fatalf("%s id=%s want=%s", path, note.ID, wantID)
+	}
+}
+
 func TestAuthenticatedStructuralConflictsConverge(t *testing.T) {
 	ctx := context.Background()
 	server, err := integrationtest.New(ctx, t.TempDir())

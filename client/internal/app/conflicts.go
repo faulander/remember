@@ -73,7 +73,8 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 			}
 			continue
 		}
-		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable" || conflict.Code == "folder_cycle" || conflict.Code == "base_revision_mismatch") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
+		equivalentFolderMoveRevisionConflict := conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.Name == m.Name && ((conflict.Canonical.ParentID == nil && m.ParentID == nil) || (conflict.Canonical.ParentID != nil && m.ParentID != nil && *conflict.Canonical.ParentID == *m.ParentID))
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable" || conflict.Code == "folder_cycle" || equivalentFolderMoveRevisionConflict) && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted {
 			if err := c.revertFolderMoveConflict(ctx, store, conflict); err != nil {
 				return err
 			}

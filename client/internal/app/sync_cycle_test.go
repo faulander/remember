@@ -3750,8 +3750,12 @@ func TestSyncOnceRejectsDivergentFolderMoveRevisionConflict(t *testing.T) {
 	if _, err := b.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SyncOnce(ctx, remote); err == nil || !strings.Contains(err.Error(), "canonical state mismatch") {
+	if err := b.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
 		t.Fatalf("divergent folder move err=%v", err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || !unresolved {
+		t.Fatalf("divergent folder move unresolved=%t err=%v", unresolved, err)
 	}
 	if _, err := b.ReadNote(ctx, "Local/F/N.md"); err != nil {
 		t.Fatalf("divergent local tree changed: %v", err)
