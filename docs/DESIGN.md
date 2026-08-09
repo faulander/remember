@@ -719,6 +719,13 @@ Umsetzung von `SYNC-008`:
 - Der Client bleibt vor Pull und Apply fail-closed; Note-Bytes, Folder-Inodes und Unterbäume bleiben unverändert.
 - Eine spätere automatische Reparatur benötigt ein vollständiges crash-resumierbares Rekey-Protokoll für Objekt und abhängige Intents.
 
+## 14.2.6 Divergente Root-Note-Moves
+
+- Bei zwei unterschiedlichen Root-Zielnamen bleibt die kanonische Note-ID am Serverziel.
+- Die verlierende lokale Fassung einschließlich abhängiger Edits wird unter neuer UUID in Wiederhergestellt materialisiert.
+- Die kanonische Revision muss strikt fortschreiten; nicht fortschreitende Antworten bleiben ohne Evakuierung fail-closed.
+- Nicht-root-basierte Moves bleiben ohne authentifizierte aktuelle Parent-Ancestry fail-closed.
+
 ## 14.3 Löschen gegen Verschieben
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.

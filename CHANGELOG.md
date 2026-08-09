@@ -59,6 +59,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Konkurrierende Note-Moves und -Deletes konvergieren in beiden Reihenfolgen: Der Tombstone bleibt wirksam, die Move-Fassung wird unter neuer UUID sichtbar gerettet und technische Evakuierungsbytes werden erst danach hashgebunden bereinigt.
 - Stale Doppel-Deletes für Notes und leere Folder werden nach exakt typ- und revisionsgebundenem kanonischem Tombstone idempotent als `already_deleted` aufgelöst.
 - Create-`object_exists` ist für Notes und nichtleere Folder-Unterbäume explizit fail-closed verifiziert; lokale und kanonische Fassungen bleiben bei Replay unverändert.
+- Divergente konkurrierende Root-Note-Moves retten die verlierende Fassung samt abhängigem Edit unter neuer UUID; nicht-root-basierte und äquivalente Varianten bleiben bis zur sicheren Ancestry-/No-op-Auflösung fail-closed.
 - Eigene akzeptierte Folder-Move/-Delete-Echos werden ausschließlich über atomar persistierte Quellpfad-/Device-/Inode-Intents als lokal ausgeführt bestätigt.
 - Mehrere Note-/Folder-Zustände derselben Pull-Seite verwenden pfadgenaue Zwischenzustände; Create→Delete-Publikationsmarker werden crash-resumierbar vom passenden Delete konsumiert.
 - Ein Netzwerkabbruch zwischen Pull-Seiten setzt nach Clientneustart nachweislich am dauerhaft bestätigten `NextCursor` statt bei Cursor null fort.

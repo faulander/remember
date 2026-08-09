@@ -702,6 +702,168 @@ func runEditAgainstRemoteDelete(t *testing.T, maxPull int, crash bool) {
 	}
 }
 
+func TestSyncOnceMaterializesDivergentRootNoteMoves(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	doc, _, err := a.CreateNote(ctx, "N.md", "base move bytes\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aDoc, err := a.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "N.md", "Remote.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	bDoc, err := b.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.MoveNote(ctx, "N.md", "Local.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	local, err := b.ReadNote(ctx, "Local.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Local.md", local.Revision, "edited after divergent move\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictEvacuation = func() { testHookAfterConflictEvacuation = nil; panic("simulated divergent note move evacuation crash") }
+	defer func() { testHookAfterConflictEvacuation = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected divergent move crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 3; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+	}
+	canonical, err := b.ReadNote(ctx, "Remote.md")
+	if err != nil || canonical.ID != doc.ID || !strings.Contains(canonical.Body, "base move bytes") {
+		t.Fatalf("divergent move canonical=%#v err=%v", canonical, err)
+	}
+	if _, err := b.ReadNote(ctx, "Local.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("losing move remains at target: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(matches) != 1 {
+		t.Fatalf("divergent move copies=%v", matches)
+	}
+	copyBytes, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(copyBytes, []byte("edited after divergent move")) || !bytes.Contains(copyBytes, []byte("base_revision_mismatch")) {
+		t.Fatalf("divergent move copy=%q err=%v", copyBytes, err)
+	}
+	inspection, err := frontmatter.Inspect(copyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.NoteID == doc.ID {
+		t.Fatal("divergent move copy reused canonical id")
+	}
+	if state := server.states[doc.ID]; state.Name != "Remote.md" || state.Deleted || state.Revision != 2 {
+		t.Fatalf("divergent canonical state=%#v", state)
+	}
+	if rescued := server.states[inspection.NoteID]; rescued.Deleted || rescued.ObjectType != clientsync.Note {
+		t.Fatalf("divergent rescued state=%#v", rescued)
+	}
+	evacuations, _ := filepath.Glob(filepath.Join(rootB, ".remember", "trash", "conflicts", "*.md"))
+	if len(evacuations) != 0 {
+		t.Fatalf("divergent evacuation remains=%v", evacuations)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aCopies, _ := filepath.Glob(filepath.Join(rootA, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(aCopies) != 1 {
+		t.Fatalf("divergent move did not converge=%v", aCopies)
+	}
+}
+
+func TestSyncOnceRejectsNonAdvancingRootMoveConflict(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	doc, _, err := core.CreateNote(ctx, "N.md", "must not evacuate\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	current, err := core.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.MoveNote(ctx, "N.md", "Local.md", current.Revision); err != nil {
+		t.Fatal(err)
+	}
+	var rawOperation string
+	var baseRevision uint64
+	if err := core.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT operation_id,base_revision FROM sync_outbox WHERE object_id=? AND mutation='move' AND status='pending' ORDER BY sequence DESC LIMIT 1`, doc.ID.String()).Scan(&rawOperation, &baseRevision)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	operationID := uuid.MustParse(rawOperation)
+	state := server.states[doc.ID]
+	server.results[operationID] = clientsync.Result{Conflict: "base_revision_mismatch", Canonical: &clientsync.CanonicalState{ObjectType: clientsync.Note, Revision: baseRevision, Name: "Remote.md", BlobHash: append([]byte(nil), state.BlobHash...)}}
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("nonadvancing move conflict err=%v", err)
+	}
+	local, err := core.ReadNote(ctx, "Local.md")
+	if err != nil || local.ID != doc.ID || !strings.Contains(local.Body, "must not evacuate") {
+		t.Fatalf("nonadvancing local=%#v err=%v", local, err)
+	}
+	if _, err := core.ReadNote(ctx, "Remote.md"); !errors.Is(err, ErrNoteNotFound) {
+		t.Fatalf("stale canonical was applied: %v", err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(root, ".remember", "trash", "conflicts", "*.md")); len(matches) != 0 {
+		t.Fatalf("nonadvancing conflict evacuated=%v", matches)
+	}
+}
+
 func TestSyncOnceRecoversLocalMoveAgainstRemoteDelete(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}

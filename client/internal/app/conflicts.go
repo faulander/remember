@@ -86,7 +86,8 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 			continue
 		}
 		canonicalAbsent := conflict.Canonical == nil && ((m.Kind == clientsync.Create && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable")) || ((m.Kind == clientsync.Update || m.Kind == clientsync.Move) && conflict.Code == "object_missing"))
-		moveCollision := m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size
+		revisionMoveCollision := m.Kind == clientsync.Move && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size && conflict.Canonical.Revision > m.BaseRevision && conflict.Canonical.ParentID == nil && m.ParentID == nil && conflict.Canonical.Name != m.Name
+		moveCollision := m.Kind == clientsync.Move && (conflict.Code == "path_collision" || conflict.Code == "parent_unavailable") && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && len(conflict.Canonical.BlobHash) == sha256.Size || revisionMoveCollision
 		if m.ObjectType == clientsync.Note && (canonicalAbsent || moveCollision) {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
@@ -1005,7 +1006,7 @@ func (c *LocalCore) publishStagedConflicts(ctx context.Context, store *clientsyn
 				return err
 			}
 		}
-		if kind == clientsync.Move && (code == "path_collision" || code == "parent_unavailable") {
+		if kind == clientsync.Move && (code == "path_collision" || code == "parent_unavailable" || code == "base_revision_mismatch") {
 			canonical, err := store.CanonicalConflictState(ctx, item.OperationID)
 			if err != nil {
 				return err
@@ -1181,7 +1182,7 @@ func (c *LocalCore) cleanupCompletedConflictStages(ctx context.Context, store *c
 		if err != nil {
 			return err
 		}
-		if ((kind == clientsync.Create || kind == clientsync.Move) && (code == "path_collision" || code == "parent_unavailable")) || ((kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing") || (kind == clientsync.Move && code == "object_deleted") {
+		if ((kind == clientsync.Create || kind == clientsync.Move) && (code == "path_collision" || code == "parent_unavailable" || kind == clientsync.Move && code == "base_revision_mismatch")) || ((kind == clientsync.Update || kind == clientsync.Move) && code == "object_missing") || (kind == clientsync.Move && code == "object_deleted") {
 			evacuated := ".remember/trash/conflicts/" + item.OperationID.String() + ".md"
 			if err := repository.RemoveRootedConflictEvacuationExpected(c.root, evacuated, item.SourceHash); err != nil {
 				return err

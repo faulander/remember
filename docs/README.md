@@ -52,5 +52,6 @@
 | [0039](adr/0039-m2-folder-parent-unavailable-recovery.md) | Folder-Recovery bei fehlendem Parent |
 | [0040](adr/0040-m2-idempotent-stale-deletes.md) | Idempotente stale Deletes gegen Tombstones |
 | [0041](adr/0041-m2-object-exists-fail-closed.md) | Fail-closed-Behandlung wiederverwendeter Create-UUIDs |
+| [0042](adr/0042-m2-divergent-root-note-moves.md) | Divergente konkurrierende Root-Note-Moves |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
