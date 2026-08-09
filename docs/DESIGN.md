@@ -673,14 +673,14 @@ Umsetzung von `SYNC-008`:
 - Der Server-Gewinner behält den ursprünglichen Pfad.
 - Ein nachweislich leerer lokaler Verlierer ohne abhängige Intents wird inode-gebunden unter neuer UUID direkt in `_Konflikte/Wiederhergestellt` verschoben und dort neu angelegt.
 - Die Leere wird nach verborgenem Inode-Staging und nach Veröffentlichung geprüft; konkurrierende Inhalte stellen den Quellfolder wieder her und lassen den Konflikt fail-closed.
-- Ein streng manifestierter Unterbaum ausschließlich aus direkten, nie versuchten Note-Creates wird transaktional auf eine neue Root-UUID umgebunden; Note-UUIDs und Bytes bleiben erhalten.
-- Nested Folder, spätere Edits und allgemeinere nichtleere Folder benötigen weiterhin das vollständige rekursive Subtree-Rekeying.
+- Ein streng manifestierter Unterbaum ausschließlich aus direkten Note-Creates mit linearer, nie versuchter Create→Update-Historie wird transaktional auf eine neue Root-UUID umgebunden; Note-UUIDs und Bytes bleiben erhalten.
+- Nested Folder, nichtlineare/versuchte Note-Historien und allgemeinere nichtleere Folder benötigen weiterhin das vollständige rekursive Subtree-Rekeying.
 
 ## 14.2.2.2 Folder-Create gegen gelöschten Parent
 
 - Ein nachweislich leerer lokaler Create-Verlierer wird wie bei einer Pfadkollision Inode-gebunden unter neuer UUID direkt in `_Konflikte/Wiederhergestellt` gerettet.
 - Trusted Reconcile entfernt die alte, nie serverseitig angelegte ID über eine exakte Quellpfad-/ID-Bindung, bevor der Remote-Parent-Delete angewendet wird.
-- Direkte, nie versuchte Note-Creates können über das unveränderliche v19-Member-Manifest erhalten werden; Nested Folder und spätere Edits bleiben bis zum vollständigen Subtree-Rekeying fail-closed.
+- Direkte Note-Creates mit linearer, nie versuchter Update-Kette können über das v19-Member-Manifest und das unveränderliche v23-Chain-Manifest auf genau einen finalen Replacement-Create reduziert werden; Nested Folder sowie Move/Delete-, verzweigte, externe oder versuchte Historien bleiben fail-closed.
 
 ## 14.2.2.3 Authentifizierte Strukturkonflikt-Abnahme
 

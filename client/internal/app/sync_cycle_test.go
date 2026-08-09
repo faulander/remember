@@ -2171,6 +2171,367 @@ func TestSyncOnceRecoversDirectNoteFolderCreatePathCollision(t *testing.T) {
 	}
 }
 
+func TestSyncOnceRecoversUpdatedDirectNoteFolderCreatePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Edited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Edited"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := b.CreateNote(ctx, "Edited/Child.md", "v0\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := b.ReadNote(ctx, "Edited/Child.md")
+	doc, _, err = b.SaveNote(ctx, "Edited/Child.md", doc.Revision, "v1\n", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err = b.SaveNote(ctx, "Edited/Child.md", doc.Revision, "v2 final\n", []string{"one", "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalBytes, err := os.ReadFile(filepath.Join(rootB, "Edited", "Child.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalHash := sha256.Sum256(finalBytes)
+	testHookAfterConflictFolderCreateReconcile = func() { testHookAfterConflictFolderCreateReconcile = nil; panic("updated direct-note recovery crash") }
+	defer func() { testHookAfterConflictFolderCreateReconcile = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected updated recovery crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 4; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+	}
+	snap, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveredFolder, recoveredNote localindex.Object
+	for _, object := range snap.Objects {
+		if object.Type == localindex.ObjectFolder && strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Edited (Konflikt - ") {
+			recoveredFolder = object
+		}
+		if object.ID == note.ID {
+			recoveredNote = object
+		}
+	}
+	if recoveredFolder.ID == uuid.Nil || recoveredNote.ID != note.ID || recoveredNote.ParentID != recoveredFolder.ID || !bytes.Equal(recoveredNote.ContentHash, finalHash[:]) {
+		t.Fatalf("updated recovery folder=%#v note=%#v", recoveredFolder, recoveredNote)
+	}
+	got, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil || !bytes.Equal(got, finalBytes) {
+		t.Fatalf("final bytes changed=%t err=%v", bytes.Equal(got, finalBytes), err)
+	}
+	var oldCreates, oldUpdates, replacements int
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT SUM(CASE WHEN mutation='create' AND status='superseded' THEN 1 ELSE 0 END),SUM(CASE WHEN mutation='update' AND status='superseded' THEN 1 ELSE 0 END),SUM(CASE WHEN mutation='create' AND status='accepted' AND parent_id=? AND blob_hash=? THEN 1 ELSE 0 END) FROM sync_outbox WHERE object_id=?`, recoveredFolder.ID.String(), finalHash[:], note.ID.String()).Scan(&oldCreates, &oldUpdates, &replacements)
+	}); err != nil || oldCreates != 1 || oldUpdates != 2 || replacements != 1 {
+		t.Fatalf("old creates=%d updates=%d replacements=%d err=%v", oldCreates, oldUpdates, replacements, err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for label, core := range map[string]*LocalCore{"A": a, "B": b, "C": c} {
+		content, err := os.ReadFile(filepath.Join(core.Root(), filepath.FromSlash(recoveredNote.RelativePath)))
+		if err != nil || !bytes.Equal(content, finalBytes) {
+			t.Fatalf("%s final bytes changed=%t err=%v", label, bytes.Equal(content, finalBytes), err)
+		}
+		inspection, err := frontmatter.Inspect(content)
+		if err != nil || inspection.NoteID != note.ID {
+			t.Fatalf("%s identity=%#v err=%v", label, inspection, err)
+		}
+	}
+}
+
+func TestSyncOnceRejectsAttemptedDirectNoteUpdateFolderRecovery(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	a, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	root := t.TempDir()
+	b, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Attempted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Attempted"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := b.CreateNote(ctx, "Attempted/N.md", "base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := b.ReadNote(ctx, "Attempted/N.md")
+	if _, _, err := b.SaveNote(ctx, "Attempted/N.md", doc.Revision, "attempted final\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(root, "Attempted", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_outbox SET status='attempted',attempted_at_ms=1 WHERE object_id=? AND mutation='update' AND status='pending'`, note.ID.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("attempted update recovered")
+	}
+	after, err := os.ReadFile(filepath.Join(root, "Attempted", "N.md"))
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("attempted bytes changed=%t err=%v", bytes.Equal(after, before), err)
+	}
+	targets, _ := filepath.Glob(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "Attempted (Konflikt - *)"))
+	if len(targets) != 0 {
+		t.Fatalf("attempted update moved source: %v", targets)
+	}
+}
+
+func TestSyncOnceRejectsDependentAddedAfterDirectNoteRecoveryPrepare(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	a, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	root := t.TempDir()
+	b, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "LateDependent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "LateDependent"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := b.CreateNote(ctx, "LateDependent/N.md", "v0\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := b.ReadNote(ctx, "LateDependent/N.md")
+	if _, _, err := b.SaveNote(ctx, "LateDependent/N.md", doc.Revision, "final preserved\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderCreateReconcile = func() { testHookAfterConflictFolderCreateReconcile = nil; panic("prepared recovery") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected prepared crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	var finalOperation string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT operation_id FROM sync_outbox WHERE object_id=? AND mutation='update' ORDER BY sequence DESC LIMIT 1`, note.ID.String()).Scan(&finalOperation)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	extra, _ := uuid.NewV7()
+	h := sha256.Sum256([]byte("late dependent"))
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,dependency_operation_id,status,created_at_ms) VALUES(?,'update',?,'note',2,NULL,'',?,?,'pending',1)`, extra.String(), note.ID.String(), h[:], finalOperation); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO sync_outbox_dependencies(operation_id,dependency_operation_id) VALUES(?,?)`, extra.String(), finalOperation)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("post-prepare dependent accepted")
+	}
+	var resolutions int
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM sync_conflict_resolutions r JOIN sync_outbox o ON o.operation_id=r.operation_id WHERE o.object_type='folder' AND r.resolution='folder_create_collision_recovered'`).Scan(&resolutions)
+	}); err != nil || resolutions != 0 {
+		t.Fatalf("unsafe resolution=%d err=%v", resolutions, err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "LateDependent (Konflikt - *)", "N.md"))
+	if len(matches) != 1 {
+		t.Fatalf("prepared bytes not preserved: %v", matches)
+	}
+	content, err := os.ReadFile(matches[0])
+	if err != nil || !bytes.Contains(content, []byte("final preserved")) {
+		t.Fatalf("preserved content=%q err=%v", content, err)
+	}
+}
+
+func TestSyncOnceRejectsNonlinearDirectNoteFolderRecovery(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*testing.T, context.Context, *LocalCore, string, NoteDocument)
+	}{
+		{"move", func(t *testing.T, ctx context.Context, c *LocalCore, root string, n NoteDocument) {
+			if _, _, err := c.MoveNote(ctx, "Unsafe/N.md", "Unsafe/Moved.md", n.Revision); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"delete", func(t *testing.T, ctx context.Context, c *LocalCore, root string, n NoteDocument) {
+			if _, err := c.DeleteNote(ctx, "Unsafe/N.md", n.Revision); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"branch", func(t *testing.T, ctx context.Context, c *LocalCore, root string, n NoteDocument) {
+			if _, _, err := c.SaveNote(ctx, "Unsafe/N.md", n.Revision, "linear first\n", nil); err != nil {
+				t.Fatal(err)
+			}
+			var createRaw string
+			if err := c.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				return tx.QueryRow(`SELECT operation_id FROM sync_outbox WHERE object_id=? AND mutation='create'`, n.ID.String()).Scan(&createRaw)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			createID, err := uuid.Parse(createRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := sha256.Sum256([]byte("branch"))
+			op, _ := uuid.NewV7()
+			if err := c.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				if _, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,dependency_operation_id,status,created_at_ms) VALUES(?,'update',?,'note',1,NULL,'',?,?,'pending',1)`, op.String(), n.ID.String(), h[:], createID.String()); err != nil {
+					return err
+				}
+				_, err := tx.Exec(`INSERT INTO sync_outbox_dependencies(operation_id,dependency_operation_id) VALUES(?,?)`, op.String(), createID.String())
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"disconnected same-object update", func(t *testing.T, ctx context.Context, c *LocalCore, root string, n NoteDocument) {
+			if _, _, err := c.SaveNote(ctx, "Unsafe/N.md", n.Revision, "linear final\n", nil); err != nil {
+				t.Fatal(err)
+			}
+			h := sha256.Sum256([]byte("disconnected"))
+			op, _ := uuid.NewV7()
+			if err := c.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,dependency_operation_id,status,created_at_ms) VALUES(?,'update',?,'note',99,NULL,'',?,NULL,'pending',1)`, op.String(), n.ID.String(), h[:])
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unexpected entry", func(t *testing.T, ctx context.Context, c *LocalCore, root string, n NoteDocument) {
+			if err := os.WriteFile(filepath.Join(root, "Unsafe", "extra.bin"), []byte("unexpected"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+			remote := &memoryRemote{server: server}
+			a, _, err := Initialize(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
+			root := t.TempDir()
+			b, _, err := Initialize(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.Close()
+			if _, err := a.CreateFolder(ctx, "Unsafe"); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.SyncOnce(ctx, remote); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.CreateFolder(ctx, "Unsafe"); err != nil {
+				t.Fatal(err)
+			}
+			created, _, err := b.CreateNote(ctx, "Unsafe/N.md", "preserve me\n", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			note, err := b.ReadNote(ctx, "Unsafe/N.md")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if note.ID != created.ID {
+				t.Fatal("note identity changed")
+			}
+			tc.mutate(t, ctx, b, root, note)
+			if err := b.SyncOnce(ctx, remote); err == nil {
+				t.Fatal("nonlinear recovery accepted")
+			}
+			targets, _ := filepath.Glob(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "Unsafe (Konflikt - *)"))
+			if len(targets) != 0 {
+				t.Fatalf("unsafe subtree moved: %v", targets)
+			}
+			var superseded int
+			if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				return tx.QueryRow(`SELECT COUNT(*) FROM sync_outbox WHERE object_id=? AND mutation='update' AND status='superseded'`, created.ID.String()).Scan(&superseded)
+			}); err != nil || superseded != 0 {
+				t.Fatalf("partial update supersede=%d err=%v", superseded, err)
+			}
+		})
+	}
+}
+
 func TestSyncOnceRestoresChangedDirectNoteRecoveryTarget(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
@@ -2251,14 +2612,6 @@ func TestSyncOnceRejectsUnsupportedNonemptyFolderCreateRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, _, err := c.CreateNote(context.Background(), "Same/Nested/N.md", "nested\n", nil); err != nil {
-			t.Fatal(err)
-		}
-	}}, {"later note edit", func(t *testing.T, c *LocalCore) {
-		note, _, err := c.CreateNote(context.Background(), "Same/N.md", "first\n", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := c.SaveNote(context.Background(), "Same/N.md", note.Revision, "later\n", nil); err != nil {
 			t.Fatal(err)
 		}
 	}}} {
@@ -2434,10 +2787,24 @@ func TestSyncOnceRecoversDirectNoteFolderCreateFromUnavailableParent(t *testing.
 	if _, err := b.CreateFolder(ctx, "Parent/Local"); err != nil {
 		t.Fatal(err)
 	}
-	note, _, err := b.CreateNote(ctx, "Parent/Local/N.md", "parent recovery bytes\n", nil)
+	note, _, err := b.CreateNote(ctx, "Parent/Local/N.md", "parent recovery v0\n", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	doc, _ := b.ReadNote(ctx, "Parent/Local/N.md")
+	doc, _, err = b.SaveNote(ctx, "Parent/Local/N.md", doc.Revision, "parent recovery v1\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err = b.SaveNote(ctx, "Parent/Local/N.md", doc.Revision, "parent recovery final\n", []string{"final"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalBytes, err := os.ReadFile(filepath.Join(rootB, "Parent", "Local", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalHash := sha256.Sum256(finalBytes)
 	for i := 0; i < 4; i++ {
 		if err := b.SyncOnce(ctx, remote); err != nil {
 			t.Fatalf("sync %d: %v", i, err)
@@ -2464,7 +2831,7 @@ func TestSyncOnceRecoversDirectNoteFolderCreateFromUnavailableParent(t *testing.
 	}
 	state, ok := server.states[recovered.ID]
 	noteState := server.states[note.ID]
-	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID || state.ObjectType != clientsync.Folder || noteState.ParentID == nil || *noteState.ParentID != recovered.ID {
+	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID || state.ObjectType != clientsync.Folder || noteState.ParentID == nil || *noteState.ParentID != recovered.ID || !bytes.Equal(noteState.BlobHash, finalHash[:]) {
 		t.Fatalf("unavailable-parent server recovery=%#v note=%#v", state, noteState)
 	}
 	store, _ := clientsync.NewStore(b.index)
@@ -2486,48 +2853,9 @@ func TestSyncOnceRecoversDirectNoteFolderCreateFromUnavailableParent(t *testing.
 	if !foundFolder || !foundNote {
 		t.Fatalf("unavailable-parent subtree did not converge folder=%t note=%t", foundFolder, foundNote)
 	}
-}
-
-func TestSyncOnceRejectsNonemptyFolderCreatePathCollision(t *testing.T) {
-	ctx := context.Background()
-	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
-	remote := &memoryRemote{server: server}
-	a, _, err := Initialize(ctx, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
-	rootB := t.TempDir()
-	b, _, err := Initialize(ctx, rootB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.SyncOnce(ctx, remote); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
-		t.Fatal(err)
-	}
-	child, _, err := b.CreateNote(ctx, "Same/Child.md", "must remain\n", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := b.SaveNote(ctx, "Same/Child.md", child.Revision, "later edit must remain\n", nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.SyncOnce(ctx, remote); err == nil || !strings.Contains(err.Error(), "intent mismatch") {
-		t.Fatalf("nonempty folder collision err=%v", err)
-	}
-	note, err := b.ReadNote(ctx, "Same/Child.md")
-	if err != nil || !strings.Contains(note.Body, "later edit must remain") {
-		t.Fatalf("nonempty collision child=%#v err=%v", note, err)
-	}
-	if _, err := os.Stat(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName)); err != nil {
-		t.Fatalf("conflict namespace missing: %v", err)
+	aBytes, err := os.ReadFile(filepath.Join(rootA, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil || !bytes.Equal(aBytes, finalBytes) {
+		t.Fatalf("unavailable-parent final bytes changed=%t err=%v", bytes.Equal(aBytes, finalBytes), err)
 	}
 }
 

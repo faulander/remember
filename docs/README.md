@@ -60,5 +60,6 @@
 | [0047](adr/0047-m2-equivalent-nonroot-note-moves.md) | Äquivalente konkurrierende Nicht-Root-Note-Moves |
 | [0048](adr/0048-m2-authenticated-post-adr44-convergence.md) | Authentifizierte Konvergenz der Strukturzellen nach ADR 0044 |
 | [0049](adr/0049-m2-divergent-same-parent-note-moves.md) | Divergente Nicht-Root-Note-Moves innerhalb derselben Parent-ID |
+| [0050](adr/0050-m2-direct-note-update-chain-folder-recovery.md) | Folder-Create-Recovery mit linearen direkten Note-Updates |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
