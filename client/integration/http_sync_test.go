@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -403,6 +404,307 @@ func TestAuthenticatedPostADR44Convergence(t *testing.T) {
 	if info, err := os.Stat(filepath.Join(rootC, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, recoveredName)); err != nil || !info.IsDir() {
 		t.Fatalf("cold C recovered folder missing: %v", err)
 	}
+}
+
+func TestAuthenticatedADR49To51Convergence(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "adr49-51@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "ADR49-51 A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "ADR49-51 B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	// ADR 0049: the canonical same-parent move keeps the original identity,
+	// while B's different target and dependent edit become one visible copy.
+	if _, err := a.CreateFolder(ctx, "DivergentParent"); err != nil {
+		t.Fatal(err)
+	}
+	divergentNote, _, err := a.CreateNote(ctx, "DivergentParent/N.md", "authenticated nested winner bytes\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	winnerBytes, err := os.ReadFile(filepath.Join(rootA, "DivergentParent", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aDoc, err := a.ReadNote(ctx, "DivergentParent/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.MoveNote(ctx, "DivergentParent/N.md", "DivergentParent/Remote.md", aDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	bDoc, err := b.ReadNote(ctx, "DivergentParent/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.MoveNote(ctx, "DivergentParent/N.md", "DivergentParent/Local.md", bDoc.Revision); err != nil {
+		t.Fatal(err)
+	}
+	bLocal, err := b.ReadNote(ctx, "DivergentParent/Local.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "DivergentParent/Local.md", bLocal.Revision, "authenticated nested losing edit\n", []string{"nested"}); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, b, remoteB, 4)
+	syncTimes(t, ctx, a, remoteA, 2)
+	rootCopies, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+	if len(rootCopies) != 1 {
+		t.Fatalf("divergent recovered candidates=%v", rootCopies)
+	}
+	divergentRecoveredBytes, err := os.ReadFile(rootCopies[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	divergentRecoveredInspection, err := frontmatter.Inspect(divergentRecoveredBytes)
+	if err != nil || divergentRecoveredInspection.NoteID == divergentNote.ID {
+		t.Fatalf("divergent recovery identity=%#v err=%v", divergentRecoveredInspection, err)
+	}
+	divergentRecoveredID := divergentRecoveredInspection.NoteID
+	divergentRecoveredName := filepath.Base(rootCopies[0])
+	divergentRecoveredDoc, err := frontmatter.Read(divergentRecoveredBytes)
+	if err != nil || string(divergentRecoveredDoc.Body) != "authenticated nested losing edit\n" {
+		t.Fatalf("divergent recovered body=%q err=%v", divergentRecoveredDoc.Body, err)
+	}
+
+	// ADR 0050: a colliding Folder Create with two never-attempted Updates is
+	// rekeyed under the reserved parent, preserving the Note UUID/final bytes.
+	if _, err := a.CreateFolder(ctx, "EditedCreate"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	if _, err := b.CreateFolder(ctx, "EditedCreate"); err != nil {
+		t.Fatal(err)
+	}
+	editedCreateOriginalFolderID := localFolderIDAtPath(t, ctx, rootB, "EditedCreate")
+	editedCreateNote, _, err := b.CreateNote(ctx, "EditedCreate/Child.md", "edited create v0\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	editedDoc, err := b.ReadNote(ctx, "EditedCreate/Child.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	editedDoc, _, err = b.SaveNote(ctx, "EditedCreate/Child.md", editedDoc.Revision, "edited create v1\n", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "EditedCreate/Child.md", editedDoc.Revision, "edited create final\n", []string{"one", "two"}); err != nil {
+		t.Fatal(err)
+	}
+	editedCreateBytes, err := os.ReadFile(filepath.Join(rootB, "EditedCreate", "Child.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, b, remoteB, 4)
+	syncTimes(t, ctx, a, remoteA, 2)
+
+	// ADR 0051: A's exact tombstone wins, while B's moved Folder plus direct
+	// Note Create and two Updates are recovered under a new Folder identity.
+	if _, err := a.CreateFolder(ctx, "MoveDeleteNotes"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	states := httpSyncStates(t, ctx, remoteA)
+	moveDeleteFolderID, moveDeleteCount := uuid.Nil, 0
+	for id, state := range states {
+		if state.ObjectType == clientsync.Folder && !state.Deleted && state.ParentID == nil && state.Name == "MoveDeleteNotes" {
+			moveDeleteFolderID, moveDeleteCount = id, moveDeleteCount+1
+		}
+	}
+	if moveDeleteFolderID == uuid.Nil || moveDeleteCount != 1 {
+		t.Fatalf("move/delete source candidates=%d id=%s", moveDeleteCount, moveDeleteFolderID)
+	}
+	if err := os.Remove(filepath.Join(rootA, "MoveDeleteNotes")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	if err := os.Rename(filepath.Join(rootB, "MoveDeleteNotes"), filepath.Join(rootB, "LocallyMovedWithNotes")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "MoveDeleteNotes")
+	movedNote, _, err := b.CreateNote(ctx, "LocallyMovedWithNotes/Child.md", "move delete v0\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedDoc, err := b.ReadNote(ctx, "LocallyMovedWithNotes/Child.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedDoc, _, err = b.SaveNote(ctx, "LocallyMovedWithNotes/Child.md", movedDoc.Revision, "move delete v1\n", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "LocallyMovedWithNotes/Child.md", movedDoc.Revision, "move delete final\n", []string{"one", "two"}); err != nil {
+		t.Fatal(err)
+	}
+	moveDeleteBytes, err := os.ReadFile(filepath.Join(rootB, "LocallyMovedWithNotes", "Child.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, b, remoteB, 5)
+	syncTimes(t, ctx, a, remoteA, 2)
+
+	states = httpSyncStates(t, ctx, remoteA)
+	originalMoveDelete := states[moveDeleteFolderID]
+	if !originalMoveDelete.Deleted || originalMoveDelete.Mutation != clientsync.Delete || originalMoveDelete.Revision != 2 || originalMoveDelete.ObjectType != clientsync.Folder || originalMoveDelete.ParentID != nil || originalMoveDelete.Name != "MoveDeleteNotes" || len(originalMoveDelete.BlobHash) != 0 {
+		t.Fatalf("move/delete tombstone=%#v", originalMoveDelete)
+	}
+	findRecoveredFolder := func(prefix string) (uuid.UUID, string) {
+		t.Helper()
+		id, name, count := uuid.Nil, "", 0
+		for candidateID, state := range states {
+			if state.ObjectType == clientsync.Folder && !state.Deleted && state.ParentID != nil && *state.ParentID == clientsync.ConflictRecoveredID && strings.HasPrefix(state.Name, prefix) {
+				id, name, count = candidateID, state.Name, count+1
+			}
+		}
+		if id == uuid.Nil || count != 1 {
+			t.Fatalf("recovered folder %q candidates=%d id=%s", prefix, count, id)
+		}
+		return id, name
+	}
+	editedCreateFolderID, editedCreateFolderName := findRecoveredFolder("EditedCreate (Konflikt - ")
+	if editedCreateFolderID == editedCreateOriginalFolderID {
+		t.Fatalf("edited create recovery reused source id=%s", editedCreateOriginalFolderID)
+	}
+	moveDeleteRecoveredID, moveDeleteRecoveredName := findRecoveredFolder("LocallyMovedWithNotes (Konflikt - ")
+	if moveDeleteRecoveredID == moveDeleteFolderID {
+		t.Fatalf("move/delete recovery reused tombstoned id=%s", moveDeleteFolderID)
+	}
+	editedCreateState := states[editedCreateNote.ID]
+	if editedCreateState.Deleted || editedCreateState.ObjectType != clientsync.Note || editedCreateState.ParentID == nil || *editedCreateState.ParentID != editedCreateFolderID || !bytes.Equal(editedCreateState.BlobHash, hashBytesForTest(editedCreateBytes)) {
+		t.Fatalf("edited create state=%#v", editedCreateState)
+	}
+	movedNoteState := states[movedNote.ID]
+	if movedNoteState.Deleted || movedNoteState.ObjectType != clientsync.Note || movedNoteState.ParentID == nil || *movedNoteState.ParentID != moveDeleteRecoveredID || !bytes.Equal(movedNoteState.BlobHash, hashBytesForTest(moveDeleteBytes)) {
+		t.Fatalf("move/delete note state=%#v", movedNoteState)
+	}
+	findRootFolder := func(name string) uuid.UUID {
+		t.Helper()
+		id, count := uuid.Nil, 0
+		for candidate, state := range states {
+			if state.ObjectType == clientsync.Folder && !state.Deleted && state.ParentID == nil && state.Name == name {
+				id, count = candidate, count+1
+			}
+		}
+		if id == uuid.Nil || count != 1 {
+			t.Fatalf("root folder %q candidates=%d id=%s", name, count, id)
+		}
+		return id
+	}
+	divergentParentID := findRootFolder("DivergentParent")
+	editedCanonicalFolderID := findRootFolder("EditedCreate")
+	canonicalState := states[divergentNote.ID]
+	if canonicalState.Deleted || canonicalState.ObjectType != clientsync.Note || canonicalState.Mutation != clientsync.Move || canonicalState.ParentID == nil || *canonicalState.ParentID != divergentParentID || canonicalState.Name != "Remote.md" || canonicalState.Revision != 2 || !bytes.Equal(canonicalState.BlobHash, hashBytesForTest(winnerBytes)) {
+		t.Fatalf("divergent canonical state=%#v", canonicalState)
+	}
+	recoveredState := states[divergentRecoveredID]
+	if recoveredState.Deleted || recoveredState.ObjectType != clientsync.Note || recoveredState.Mutation != clientsync.Create || recoveredState.Revision != 1 || recoveredState.ParentID == nil || *recoveredState.ParentID != clientsync.ConflictRecoveredID || recoveredState.Name != divergentRecoveredName || !bytes.Equal(recoveredState.BlobHash, hashBytesForTest(divergentRecoveredBytes)) {
+		t.Fatalf("divergent recovered state=%#v", recoveredState)
+	}
+
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "ADR49-51 C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	for label, core := range map[string]*clientapp.LocalCore{"A": a, "B": b, "C": c} {
+		canonicalBytes, err := os.ReadFile(filepath.Join(core.Root(), "DivergentParent", "Remote.md"))
+		if err != nil || !bytes.Equal(canonicalBytes, winnerBytes) || inspectTestNoteID(t, filepath.Join(core.Root(), "DivergentParent", "Remote.md")) != divergentNote.ID {
+			t.Fatalf("%s divergent canonical exact=%t err=%v", label, bytes.Equal(canonicalBytes, winnerBytes), err)
+		}
+		recoveredPath := filepath.Join(core.Root(), clientsync.ConflictRootName, clientsync.ConflictRecoveredName, divergentRecoveredName)
+		recoveredBytes, err := os.ReadFile(recoveredPath)
+		if err != nil || !bytes.Equal(recoveredBytes, divergentRecoveredBytes) || inspectTestNoteID(t, recoveredPath) != divergentRecoveredID {
+			t.Fatalf("%s divergent recovery exact=%t err=%v", label, bytes.Equal(recoveredBytes, divergentRecoveredBytes), err)
+		}
+		rootConflictCopies, _ := filepath.Glob(filepath.Join(core.Root(), clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md"))
+		if len(rootConflictCopies) != 1 {
+			t.Fatalf("%s divergent root conflict copies=%v", label, rootConflictCopies)
+		}
+		editedPath := filepath.Join(core.Root(), clientsync.ConflictRootName, clientsync.ConflictRecoveredName, editedCreateFolderName, "Child.md")
+		editedBytes, err := os.ReadFile(editedPath)
+		if err != nil || !bytes.Equal(editedBytes, editedCreateBytes) || inspectTestNoteID(t, editedPath) != editedCreateNote.ID {
+			t.Fatalf("%s edited create exact=%t err=%v", label, bytes.Equal(editedBytes, editedCreateBytes), err)
+		}
+		movedPath := filepath.Join(core.Root(), clientsync.ConflictRootName, clientsync.ConflictRecoveredName, moveDeleteRecoveredName, "Child.md")
+		movedBytes, err := os.ReadFile(movedPath)
+		if err != nil || !bytes.Equal(movedBytes, moveDeleteBytes) || inspectTestNoteID(t, movedPath) != movedNote.ID {
+			t.Fatalf("%s move/delete exact=%t err=%v", label, bytes.Equal(movedBytes, moveDeleteBytes), err)
+		}
+		if _, err := os.Stat(filepath.Join(core.Root(), "LocallyMovedWithNotes")); !os.IsNotExist(err) {
+			t.Fatalf("%s retained losing move/delete path: %v", label, err)
+		}
+		if _, err := os.Stat(filepath.Join(core.Root(), "MoveDeleteNotes")); !os.IsNotExist(err) {
+			t.Fatalf("%s materialized tombstoned folder: %v", label, err)
+		}
+		for relative, expected := range map[string]uuid.UUID{
+			"DivergentParent": divergentParentID, "EditedCreate": editedCanonicalFolderID,
+			filepath.ToSlash(filepath.Join(clientsync.ConflictRootName, clientsync.ConflictRecoveredName, editedCreateFolderName)):  editedCreateFolderID,
+			filepath.ToSlash(filepath.Join(clientsync.ConflictRootName, clientsync.ConflictRecoveredName, moveDeleteRecoveredName)): moveDeleteRecoveredID,
+		} {
+			if got := localFolderIDAtPath(t, ctx, core.Root(), relative); got != expected {
+				t.Fatalf("%s folder %s id=%s want=%s", label, relative, got, expected)
+			}
+		}
+	}
+}
+
+func hashBytesForTest(content []byte) []byte {
+	hash := sha256.Sum256(content)
+	return hash[:]
+}
+
+func localFolderIDAtPath(t *testing.T, ctx context.Context, root, relative string) uuid.UUID {
+	t.Helper()
+	index, err := localindex.Open(ctx, filepath.Join(root, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	snapshot, err := index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, count := uuid.Nil, 0
+	for _, object := range snapshot.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == relative {
+			id, count = object.ID, count+1
+		}
+	}
+	if id == uuid.Nil || count != 1 {
+		t.Fatalf("local folder %q candidates=%d id=%s", relative, count, id)
+	}
+	return id
 }
 
 func reconcileFolderMove(t *testing.T, ctx context.Context, root, source string) {

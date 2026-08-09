@@ -57,7 +57,7 @@ Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt ke
 | Bereich | Status | Nachweis und Grenze |
 |---|---|---|
 | Outbox-Replay, idempotente Submits, Cursor und Crash-Wiederaufnahme | **Konvergiert** | ADR [0011](adr/0011-m2-client-sync-durability.md), [0031](adr/0031-m2-cold-history-apply-convergence.md), [0032](adr/0032-m2-paginated-pull-resumption.md); `LocalCore.SyncOnce`; `TestSyncOnceRetriesAmbiguousAttemptWithSameOperationAndBlobFirst`, `TestExecuteActiveApplyPlanResumesFolderMoveAfterPublicationCrash`, `TestTwoClientsConvergeThroughAuthenticatedHTTP`. |
-| Authentifizierte Mehrgeräte-Abnahme | **Konvergiert für die genannten Zellen** | ADR [0029](adr/0029-m2-authenticated-two-client-convergence.md), [0044](adr/0044-m2-authenticated-structural-conflict-convergence.md), [0048](adr/0048-m2-authenticated-post-adr44-convergence.md); `TestAuthenticatedStructuralConflictsConverge`, `TestAuthenticatedPostADR44Convergence`. ADR 0049–0051 besitzen derzeit fokussierte In-Memory-Core-Tests, aber noch keinen gemeinsamen echten HTTP-Abnahmelauf. |
+| Authentifizierte Mehrgeräte-Abnahme | **Konvergiert für die genannten Zellen** | ADR [0029](adr/0029-m2-authenticated-two-client-convergence.md), [0044](adr/0044-m2-authenticated-structural-conflict-convergence.md), [0048](adr/0048-m2-authenticated-post-adr44-convergence.md) und [0052](adr/0052-m2-authenticated-adr49-51-convergence.md); `TestAuthenticatedStructuralConflictsConverge`, `TestAuthenticatedPostADR44Convergence` und `TestAuthenticatedADR49To51Convergence` decken A/B sowie kalten C-Bootstrap über echte Login-, Blob- und Sync-Routen ab. |
 | Nicht unterstützter Konflikt neben unbeteiligten Objekten | **Fail-closed; Anforderung offen** | `LocalCore.SyncOnce` gibt bei `Store.HasUnresolvedOutbox` vor Pull `ErrUnresolvedOutbound` zurück. Das schützt den strittigen Zustand, erfüllt [SYNC-012](PRD.md#sync-012--fortsetzbarer-sync) für unbeteiligte Objekte aber noch nicht vollständig. |
 | Blob fehlt oder Hash stimmt nicht | **Fail-closed, technisch getestet** | `TestExecuteActiveApplyPlanRejectsBlobMismatchBeforeFilesystemMutation`, `TestPutLimitsAndHashMismatchLeaveNoPublishedBlob`. Kein stiller Apply/Cursorfortschritt; eine vollständige Nutzer-/Betriebsalarmierung bleibt Produktarbeit. |
 | Darwin/Linux Rooted Apply | **Konvergiert im automatisierten Umfang** | Descriptor-relative `*at`-Operationen, `O_NOFOLLOW`, Device/Inode-Prüfung; Repository- und Cross-Build-Tests. Reale Linux-Desktop-Hardware ist extern. |
@@ -80,11 +80,10 @@ Relevante Anforderungen: [SYNC-002](PRD.md#sync-002--später-abgleich), [SYNC-00
 
 Priorisiert, ohne externe Zielhardware:
 
-1. ADR 0049–0051 in den authentifizierten A/B/Cold-C-HTTP-Test aufnehmen.
-2. Objektbezogene Isolation ungelöster Konflikte implementieren, damit unbeteiligte Outbox-Operationen und Pull-Seiten gemäß `SYNC-012` fortschreiten können, ohne den Konfliktzustand zu überspringen.
-3. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
-4. Für divergente Folder Move/Move-Ziele eine explizite Produktregel plus inode-/ancestry-gebundenes Journal entwerfen; bis zur Freigabe bleibt die Zelle fail-closed.
-5. Nutzer- und Betriebsalarmierung für `SYNC-013`/M2-AC-004 vervollständigen.
-6. Für Folder-Delete/Remote-Move per ADR entscheiden, ob eine atomare Preserve-and-Delete-Serveroperation, ein revisionsgebundener Subtree-Snapshot oder ein anderer beweisbar verlustfreier Ansatz verwendet wird; der bisher untersuchte reine Clientansatz war nicht sicher.
+1. Objektbezogene Isolation ungelöster Konflikte implementieren, damit unbeteiligte Outbox-Operationen und Pull-Seiten gemäß `SYNC-012` fortschreiten können, ohne den Konfliktzustand zu überspringen.
+2. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
+3. Für divergente Folder Move/Move-Ziele eine explizite Produktregel plus inode-/ancestry-gebundenes Journal entwerfen; bis zur Freigabe bleibt die Zelle fail-closed.
+4. Nutzer- und Betriebsalarmierung für `SYNC-013`/M2-AC-004 vervollständigen.
+5. Für Folder-Delete/Remote-Move per ADR entscheiden, ob eine atomare Preserve-and-Delete-Serveroperation, ein revisionsgebundener Subtree-Snapshot oder ein anderer beweisbar verlustfreier Ansatz verwendet wird; der bisher untersuchte reine Clientansatz war nicht sicher.
 
 Nicht als lokal automatisierbar gezählt werden reale Windows-/Linux-Gerätetests, Codesigning, Reverse-Proxy-/Deployment-Abnahme und der derzeit nicht erreichbare Remote-Docker-Kontext.

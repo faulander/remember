@@ -15,7 +15,7 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
 - lokaler Index v24 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konflikt-/Rebase-/No-op-/Folder-Restore-/Folder-Move-Revert-/Folder-Intent-/Blob-Cleanup-Journalen, descriptor-gebundener Löschung technischer Bytes und resumierbarem Notiz-/Folder-Apply
 - strikter Client-HTTP-Transport und manueller Vordergrund-Sync für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen
-- automatisierter Mehrgeräte-Konvergenztest über echte Login-, Blob- und Sync-HTTP-Routen einschließlich Serverneustart, kaltem History-Bootstrap, dauerhafter Pull-Seiten-Wiederaufnahme, sichtbarer Update-Konfliktkopie, bidirektionalen Note-Move/Delete-Konflikten, Direct-Note-Folder-Recovery, leerem Folder-Move gegen Remote-Delete, äquivalenten Root-/Nested-Note-Moves sowie Note-/Folder-Move/-Delete
+- automatisierter Mehrgeräte-Konvergenztest über echte Login-, Blob- und Sync-HTTP-Routen einschließlich Serverneustart, kaltem History-Bootstrap, dauerhafter Pull-Seiten-Wiederaufnahme, sichtbarer Update-Konfliktkopie, bidirektionalen Note-Move/Delete-Konflikten, Direct-Note-Folder-Recovery mit linearen Updates, leerem beziehungsweise direct-note-haltigem Folder-Move gegen Remote-Delete, äquivalenten Root-/Nested-Note-Moves, divergentem Same-Parent-Note-Move sowie Note-/Folder-Move/-Delete
 
 Öffentliche Registrierung, Reminder, weitere Folder-/Strukturkonflikte und sichere Client-Tokenablage folgen in späteren Schnitten.
 
