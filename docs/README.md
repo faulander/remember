@@ -53,5 +53,6 @@
 | [0040](adr/0040-m2-idempotent-stale-deletes.md) | Idempotente stale Deletes gegen Tombstones |
 | [0041](adr/0041-m2-object-exists-fail-closed.md) | Fail-closed-Behandlung wiederverwendeter Create-UUIDs |
 | [0042](adr/0042-m2-divergent-root-note-moves.md) | Divergente konkurrierende Root-Note-Moves |
+| [0043](adr/0043-m2-direct-note-folder-create-recovery.md) | Recovery nichtleerer Folder-Creates mit direkten Notes |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

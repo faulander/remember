@@ -21,7 +21,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen, paginierten Cursor-Pull und wiederholbare kanonische Konfliktzustände.
-- Lokaler Index v18 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
+- Lokaler Index v19 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
 - Crash-resumierbarer Remote-Apply für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen ohne permanente Marker.
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
@@ -60,6 +60,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Stale Doppel-Deletes für Notes und leere Folder werden nach exakt typ- und revisionsgebundenem kanonischem Tombstone idempotent als `already_deleted` aufgelöst.
 - Create-`object_exists` ist für Notes und nichtleere Folder-Unterbäume explizit fail-closed verifiziert; lokale und kanonische Fassungen bleiben bei Replay unverändert.
 - Divergente konkurrierende Root-Note-Moves retten die verlierende Fassung samt abhängigem Edit unter neuer UUID; nicht-root-basierte und äquivalente Varianten bleiben bis zur sicheren Ancestry-/No-op-Auflösung fail-closed.
+- Nichtleere Folder-Create-Pfad-/Parent-Konflikte werden für streng manifestierte direkte, nie versuchte Note-Creates rekursionsfrei gerettet; Note-UUIDs und Bytes bleiben erhalten, Nested Folder und spätere Edits bleiben fail-closed.
 - Eigene akzeptierte Folder-Move/-Delete-Echos werden ausschließlich über atomar persistierte Quellpfad-/Device-/Inode-Intents als lokal ausgeführt bestätigt.
 - Mehrere Note-/Folder-Zustände derselben Pull-Seite verwenden pfadgenaue Zwischenzustände; Create→Delete-Publikationsmarker werden crash-resumierbar vom passenden Delete konsumiert.
 - Ein Netzwerkabbruch zwischen Pull-Seiten setzt nach Clientneustart nachweislich am dauerhaft bestätigten `NextCursor` statt bei Cursor null fort.

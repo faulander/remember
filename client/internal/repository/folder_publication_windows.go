@@ -9,6 +9,10 @@ var errFolderPublicationUnsupported = errors.New("handle-safe folder publication
 func RootedFolderIdentity(string, string) (uint64, uint64, error) {
 	return 0, 0, errFolderPublicationUnsupported
 }
+func VerifyRootedFolderEntriesExpected(string, string, uint64, uint64, []string) error {
+	return errors.New("handle-safe folder entry verification is not yet supported on Windows")
+}
+
 func VerifyRootedEmptyFolderIdentity(string, string, uint64, uint64) error {
 	return errors.New("handle-safe empty folder verification is not yet supported on Windows")
 }

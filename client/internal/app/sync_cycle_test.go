@@ -1608,6 +1608,242 @@ func assertAlreadyDeletedResolution(t *testing.T, ctx context.Context, core *Loc
 	}
 }
 
+func TestSyncOnceRecoversDirectNoteFolderCreatePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := b.CreateNote(ctx, "Same/Child.md", "direct child survives\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBytes, err := os.ReadFile(filepath.Join(rootB, "Same", "Child.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderCreateReconcile = func() {
+		testHookAfterConflictFolderCreateReconcile = nil
+		panic("direct-note recovery reconcile crash")
+	}
+	defer func() { testHookAfterConflictFolderCreateReconcile = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected direct-note recovery crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 4; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+	}
+	snapshot, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recovered localindex.Object
+	var recoveredNote localindex.Object
+	for _, object := range snapshot.Objects {
+		if strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Same (Konflikt - ") && object.Type == localindex.ObjectFolder {
+			recovered = object
+		}
+		if object.ID == note.ID {
+			recoveredNote = object
+		}
+	}
+	if recovered.ID == uuid.Nil || recovered.ID == note.ID || recoveredNote.ID != note.ID || recoveredNote.ParentID != recovered.ID {
+		t.Fatalf("direct-note recovery folder=%#v note=%#v", recovered, recoveredNote)
+	}
+	content, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil || !bytes.Equal(content, beforeBytes) {
+		t.Fatalf("direct-note bytes changed=%t err=%v", bytes.Equal(content, beforeBytes), err)
+	}
+	var dependencies int
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM sync_outbox note JOIN sync_outbox_dependencies d ON d.operation_id=note.operation_id JOIN sync_outbox folder ON folder.operation_id=d.dependency_operation_id WHERE note.object_id=? AND note.mutation='create' AND note.parent_id=? AND folder.object_id=? AND folder.mutation='create'`, note.ID.String(), recovered.ID.String(), recovered.ID.String()).Scan(&dependencies)
+	}); err != nil || dependencies != 1 {
+		t.Fatalf("replacement dependency=%d err=%v", dependencies, err)
+	}
+	folderState, noteState := server.states[recovered.ID], server.states[note.ID]
+	if folderState.ParentID == nil || *folderState.ParentID != clientsync.ConflictRecoveredID || noteState.ParentID == nil || *noteState.ParentID != recovered.ID || noteState.Deleted {
+		t.Fatalf("direct-note server folder=%#v note=%#v", folderState, noteState)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	aBytes, err := os.ReadFile(filepath.Join(rootA, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil || !bytes.Contains(aBytes, []byte("direct child survives")) {
+		t.Fatalf("direct-note convergence=%q err=%v", aBytes, err)
+	}
+	aInspection, err := frontmatter.Inspect(aBytes)
+	if err != nil || aInspection.NoteID != note.ID {
+		t.Fatalf("direct-note converged identity=%#v err=%v", aInspection, err)
+	}
+}
+
+func TestSyncOnceRestoresChangedDirectNoteRecoveryTarget(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	a, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	root := t.TempDir()
+	b, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.CreateNote(ctx, "Same/Child.md", "preserved\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderCreateMove = func() {
+		testHookAfterConflictFolderCreateMove = nil
+		targets, _ := filepath.Glob(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "Same (Konflikt - *)"))
+		if len(targets) != 1 {
+			panic("recovery target unavailable")
+		}
+		if err := os.WriteFile(filepath.Join(targets[0], "unexpected.txt"), []byte("concurrent bytes"), 0o600); err != nil {
+			panic(err)
+		}
+		panic("simulated changed recovery target crash")
+	}
+	defer func() { testHookAfterConflictFolderCreateMove = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected changed-target crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, root)
+	if err == nil || !strings.Contains(err.Error(), "manifest") {
+		if b != nil {
+			_ = b.Close()
+		}
+		t.Fatalf("changed target open err=%v", err)
+	}
+	child, err := os.ReadFile(filepath.Join(root, "Same", "Child.md"))
+	if err != nil || !bytes.Contains(child, []byte("preserved")) {
+		t.Fatalf("restored child=%q err=%v", child, err)
+	}
+	unexpected, err := os.ReadFile(filepath.Join(root, "Same", "unexpected.txt"))
+	if err != nil || string(unexpected) != "concurrent bytes" {
+		t.Fatalf("restored concurrent bytes=%q err=%v", unexpected, err)
+	}
+	targets, _ := filepath.Glob(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "Same (Konflikt - *)"))
+	if len(targets) != 0 {
+		t.Fatalf("changed recovery target not restored: %v", targets)
+	}
+}
+
+func TestSyncOnceRejectsUnsupportedNonemptyFolderCreateRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*testing.T, *LocalCore)
+	}{{"nested", func(t *testing.T, c *LocalCore) {
+		if _, err := c.CreateFolder(context.Background(), "Same/Nested"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := c.CreateNote(context.Background(), "Same/Nested/N.md", "nested\n", nil); err != nil {
+			t.Fatal(err)
+		}
+	}}, {"later note edit", func(t *testing.T, c *LocalCore) {
+		note, _, err := c.CreateNote(context.Background(), "Same/N.md", "first\n", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := c.SaveNote(context.Background(), "Same/N.md", note.Revision, "later\n", nil); err != nil {
+			t.Fatal(err)
+		}
+	}}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+			remote := &memoryRemote{server: server}
+			a, _, err := Initialize(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
+			root := t.TempDir()
+			b, _, err := Initialize(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.Close()
+			if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.SyncOnce(ctx, remote); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+				t.Fatal(err)
+			}
+			tc.build(t, b)
+			before, err := os.ReadDir(filepath.Join(root, "Same"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := b.SyncOnce(ctx, remote); err == nil {
+				t.Fatal("unsupported subtree recovered")
+			}
+			after, err := os.ReadDir(filepath.Join(root, "Same"))
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("unsupported subtree changed before=%d after=%d err=%v", len(before), len(after), err)
+			}
+			if _, err := os.Stat(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName)); err != nil {
+				t.Fatalf("conflict namespace unavailable: %v", err)
+			}
+		})
+	}
+}
+
 func TestSyncOnceRecoversEmptyFolderCreatePathCollision(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
@@ -1701,7 +1937,7 @@ func TestSyncOnceRecoversEmptyFolderCreatePathCollision(t *testing.T) {
 	}
 }
 
-func TestSyncOnceRecoversEmptyFolderCreateFromUnavailableParent(t *testing.T) {
+func TestSyncOnceRecoversDirectNoteFolderCreateFromUnavailableParent(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
 	remote := &memoryRemote{server: server}
@@ -1737,7 +1973,11 @@ func TestSyncOnceRecoversEmptyFolderCreateFromUnavailableParent(t *testing.T) {
 	if _, err := b.CreateFolder(ctx, "Parent/Local"); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	note, _, err := b.CreateNote(ctx, "Parent/Local/N.md", "parent recovery bytes\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
 		if err := b.SyncOnce(ctx, remote); err != nil {
 			t.Fatalf("sync %d: %v", i, err)
 		}
@@ -1749,18 +1989,22 @@ func TestSyncOnceRecoversEmptyFolderCreateFromUnavailableParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var recovered localindex.Object
+	var recovered, recoveredNote localindex.Object
 	for _, object := range snapshot.Objects {
-		if strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Local (Konflikt - ") {
+		if strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Local (Konflikt - ") && object.Type == localindex.ObjectFolder {
 			recovered = object
 		}
+		if object.ID == note.ID {
+			recoveredNote = object
+		}
 	}
-	if recovered.ID == uuid.Nil || recovered.Type != localindex.ObjectFolder {
-		t.Fatalf("unavailable-parent recovery=%#v", recovered)
+	if recovered.ID == uuid.Nil || recovered.Type != localindex.ObjectFolder || recoveredNote.ID != note.ID || recoveredNote.ParentID != recovered.ID {
+		t.Fatalf("unavailable-parent recovery=%#v note=%#v", recovered, recoveredNote)
 	}
 	state, ok := server.states[recovered.ID]
-	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID || state.ObjectType != clientsync.Folder {
-		t.Fatalf("unavailable-parent server recovery=%#v", state)
+	noteState := server.states[note.ID]
+	if !ok || state.ParentID == nil || *state.ParentID != clientsync.ConflictRecoveredID || state.ObjectType != clientsync.Folder || noteState.ParentID == nil || *noteState.ParentID != recovered.ID {
+		t.Fatalf("unavailable-parent server recovery=%#v note=%#v", state, noteState)
 	}
 	store, _ := clientsync.NewStore(b.index)
 	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
@@ -1773,14 +2017,13 @@ func TestSyncOnceRecoversEmptyFolderCreateFromUnavailableParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	foundFolder, foundNote := false, false
 	for _, object := range aSnapshot.Objects {
-		if object.ID == recovered.ID {
-			found = true
-		}
+		foundFolder = foundFolder || object.ID == recovered.ID
+		foundNote = foundNote || object.ID == note.ID
 	}
-	if !found {
-		t.Fatal("unavailable-parent folder did not converge")
+	if !foundFolder || !foundNote {
+		t.Fatalf("unavailable-parent subtree did not converge folder=%t note=%t", foundFolder, foundNote)
 	}
 }
 
@@ -1808,14 +2051,18 @@ func TestSyncOnceRejectsNonemptyFolderCreatePathCollision(t *testing.T) {
 	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := b.CreateNote(ctx, "Same/Child.md", "must remain\n", nil); err != nil {
+	child, _, err := b.CreateNote(ctx, "Same/Child.md", "must remain\n", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SyncOnce(ctx, remote); err == nil || !strings.Contains(err.Error(), "subtree recovery") {
+	if _, _, err := b.SaveNote(ctx, "Same/Child.md", child.Revision, "later edit must remain\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil || !strings.Contains(err.Error(), "intent mismatch") {
 		t.Fatalf("nonempty folder collision err=%v", err)
 	}
 	note, err := b.ReadNote(ctx, "Same/Child.md")
-	if err != nil || !strings.Contains(note.Body, "must remain") {
+	if err != nil || !strings.Contains(note.Body, "later edit must remain") {
 		t.Fatalf("nonempty collision child=%#v err=%v", note, err)
 	}
 	if _, err := os.Stat(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName)); err != nil {

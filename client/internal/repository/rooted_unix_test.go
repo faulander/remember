@@ -145,6 +145,32 @@ func TestRemoveRootedConflictStageExpectedIsResumableAndPreservesReplacement(t *
 	}
 }
 
+func TestVerifyRootedFolderEntriesExpectedRejectsSymlink(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "F"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "F", "N.md"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRootedFolderEntriesExpected(root, "F", device, inode, []string{"N.md"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "F", "N.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "outside"), filepath.Join(root, "F", "N.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRootedFolderEntriesExpected(root, "F", device, inode, []string{"N.md"}); err == nil {
+		t.Fatal("symlink accepted as regular manifest entry")
+	}
+}
+
 func TestMoveRootedEmptyFolderExpectedRestoresNonemptySource(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "A", "Folder"), 0o755); err != nil {

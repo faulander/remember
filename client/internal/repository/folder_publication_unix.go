@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/faulander/remember/client/internal/naming"
 	"golang.org/x/sys/unix"
 )
 
@@ -102,6 +103,69 @@ func RootedFolderIdentity(root, relative string) (uint64, uint64, error) {
 		return 0, 0, errors.New("folder identity exceeds SQLite range")
 	}
 	return uint64(stat.Dev), stat.Ino, nil
+}
+
+func VerifyRootedFolderEntriesExpected(root, relative string, device, inode uint64, names []string) error {
+	parent, base, err := openRootedParent(root, relative)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	fd, err := unix.Openat(parent, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if uint64(stat.Dev) != device || stat.Ino != inode {
+		return errors.New("folder entry verification identity mismatch")
+	}
+	expected := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if naming.ValidateComponent(name) != nil {
+			return errors.New("invalid expected folder entry")
+		}
+		if _, exists := expected[name]; exists {
+			return errors.New("duplicate expected folder entry")
+		}
+		expected[name] = struct{}{}
+	}
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(dup), base)
+	entries, readErr := directory.ReadDir(-1)
+	directory.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if len(entries) != len(expected) {
+		return errors.New("folder entry manifest mismatch")
+	}
+	for _, entry := range entries {
+		if _, ok := expected[entry.Name()]; !ok {
+			return errors.New("folder entry manifest mismatch")
+		}
+		entryFD, openErr := unix.Openat(fd, entry.Name(), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+		if openErr != nil {
+			return errors.New("folder entry manifest type mismatch")
+		}
+		var entryStat unix.Stat_t
+		statErr := unix.Fstat(entryFD, &entryStat)
+		unix.Close(entryFD)
+		if statErr != nil || entryStat.Mode&unix.S_IFMT != unix.S_IFREG {
+			return errors.New("folder entry manifest type mismatch")
+		}
+		delete(expected, entry.Name())
+	}
+	if len(expected) != 0 {
+		return errors.New("folder entry manifest incomplete")
+	}
+	return nil
 }
 
 func VerifyRootedEmptyFolderIdentity(root, relative string, device, inode uint64) error {
