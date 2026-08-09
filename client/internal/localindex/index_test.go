@@ -230,7 +230,7 @@ func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
 	}
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 25 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 26 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
@@ -246,7 +246,7 @@ func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
 		if _, err := tx.Exec(`INSERT INTO sync_state(key,value) VALUES('confirmed_cursor','42') ON CONFLICT(key) DO UPDATE SET value='42'`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
+		if _, err := tx.Exec(`DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
 			return err
 		}
 		return nil
@@ -269,13 +269,48 @@ func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
 	}
 }
 
+func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v25.db")
+	index, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; PRAGMA user_version=25`); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	index, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	var version int
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 26 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var name string
+		return tx.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='sync_inbox_apply_plans'`).Scan(&name)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "newer.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=26`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=27`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

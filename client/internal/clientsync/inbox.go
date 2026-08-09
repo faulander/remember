@@ -254,9 +254,9 @@ func (s *Store) transitionInbox(ctx context.Context, cursor uint64, from, to str
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		now := s.clock().UTC().UnixMilli()
-		query := `UPDATE sync_inbox_changes SET state='applying',applying_at_ms=max(?,ingested_at_ms) WHERE cursor=? AND state='pending'`
+		query := `UPDATE sync_inbox_changes SET state='applying',applying_at_ms=max(?,ingested_at_ms) WHERE cursor=? AND state='pending' AND NOT EXISTS(SELECT 1 FROM sync_inbox_apply_plans linked WHERE linked.cursor=sync_inbox_changes.cursor)`
 		if from == "applying" && to == "applied" {
-			query = `UPDATE sync_inbox_changes SET state='applied',applied_at_ms=max(?,applying_at_ms) WHERE cursor=? AND state='applying'`
+			query = `UPDATE sync_inbox_changes SET state='applied',applied_at_ms=max(?,applying_at_ms) WHERE cursor=? AND state='applying' AND NOT EXISTS(SELECT 1 FROM sync_inbox_apply_plans linked WHERE linked.cursor=sync_inbox_changes.cursor)`
 		} else if from != "pending" || to != "applying" {
 			return errors.New("invalid inbox transition")
 		}
@@ -277,6 +277,95 @@ func (s *Store) MarkInboxApplying(ctx context.Context, cursor uint64) error {
 
 func (s *Store) MarkInboxApplied(ctx context.Context, cursor uint64) error {
 	return s.transitionInbox(ctx, cursor, "applying", "applied")
+}
+
+// CreateInboxApplyPlan creates one persisted apply plan for an independent
+// out-of-order root-note update or delete. It does not advance either cursor.
+func (s *Store) CreateInboxApplyPlan(ctx context.Context, cursor uint64, planID uuid.UUID) error {
+	if cursor == 0 || cursor > math.MaxInt64 || !validOperationID(planID) {
+		return errors.New("invalid inbox apply plan")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		item, found, err := inboxItemTx(ctx, tx, cursor)
+		if err != nil {
+			return err
+		}
+		if !found || item.State != "pending" || item.Change.ObjectType != Note || item.Change.ParentID != nil || (item.Change.Mutation != Update && item.Change.Mutation != Delete) {
+			return errors.New("inbox change is not eligible for independent apply")
+		}
+		var active int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM apply_plans WHERE status IN ('prepared','applying'))`).Scan(&active); err != nil {
+			return err
+		}
+		if active != 0 {
+			return errors.New("another apply plan is active")
+		}
+		var earlier int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_inbox_changes WHERE object_id=? AND cursor<? AND state<>'applied')`, item.Change.ObjectID.String(), cursor).Scan(&earlier); err != nil {
+			return err
+		}
+		if earlier != 0 {
+			return errors.New("earlier inbox change for object is not applied")
+		}
+		var baseline uint64
+		if err := tx.QueryRowContext(ctx, `SELECT revision FROM sync_baselines WHERE object_id=?`, item.Change.ObjectID.String()).Scan(&baseline); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return errors.New("inbox object baseline is missing")
+			}
+			return err
+		}
+		if baseline == math.MaxInt64 || item.Change.Revision != baseline+1 {
+			return errors.New("inbox object baseline is not the exact predecessor")
+		}
+		now := s.clock().UTC().UnixMilli()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,?,?,'prepared',?)`, planID.String(), cursor-1, cursor, now); err != nil {
+			return err
+		}
+		var blob any
+		if len(item.Change.BlobHash) != 0 {
+			blob = item.Change.BlobHash
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,0,?,?,?,?,?,?,?,?,?,'pending')`, planID.String(), item.Change.Cursor, item.Change.OperationID.String(), item.Change.ObjectID.String(), item.Change.Mutation, item.Change.ObjectType, item.Change.Revision, nil, item.Change.Name, blob); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO sync_inbox_apply_plans(plan_id,cursor) VALUES(?,?)`, planID.String(), cursor)
+		return err
+	})
+}
+
+// AbandonPreparedInboxPlan durably fails a pristine prepared linked plan. The
+// immutable link remains as history, so the same plan cannot be silently reused.
+func (s *Store) AbandonPreparedInboxPlan(ctx context.Context, planID uuid.UUID) error {
+	if !validOperationID(planID) {
+		return errors.New("invalid apply plan id")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var pristine int
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM sync_inbox_apply_plans l
+			JOIN apply_plans p ON p.plan_id=l.plan_id
+			JOIN apply_steps s ON s.plan_id=p.plan_id AND s.step_index=0
+			JOIN sync_inbox_changes i ON i.cursor=l.cursor
+			WHERE l.plan_id=? AND p.status='prepared' AND s.state='pending' AND i.state='pending'
+			AND (SELECT count(*) FROM apply_steps x WHERE x.plan_id=p.plan_id)=1
+			AND NOT EXISTS(SELECT 1 FROM apply_folder_publications f WHERE f.plan_id=p.plan_id)
+			AND NOT EXISTS(SELECT 1 FROM apply_folder_mutations m WHERE m.plan_id=p.plan_id)
+		)`, planID.String()).Scan(&pristine)
+		if err != nil {
+			return err
+		}
+		if pristine == 0 {
+			return errors.New("inbox apply plan is not pristine and prepared")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='failed',completed_at_ms=? WHERE plan_id=? AND status='prepared'`, s.clock().UTC().UnixMilli(), planID.String())
+		if err != nil {
+			return err
+		}
+		if count, err := result.RowsAffected(); err != nil || count != 1 {
+			return errors.New("inbox apply plan abandonment race")
+		}
+		return nil
+	})
 }
 
 // ReconcileInboxAppliedThroughConfirmed mirrors the legacy apply frontier into
@@ -358,52 +447,96 @@ func (s *Store) ReconcileInboxAppliedThroughConfirmed(ctx context.Context) error
 	})
 }
 
+func (s *Store) completeInboxApplyPlanTx(ctx context.Context, tx *sql.Tx, planID uuid.UUID, cursor uint64) error {
+	var status, stepState, inboxState, objectID, operationID string
+	var stepCursor, revision uint64
+	var stepCount int
+	if err := tx.QueryRowContext(ctx, `SELECT p.status,s.state,i.state,s.cursor,s.object_id,s.revision,s.operation_id,(SELECT count(*) FROM apply_steps x WHERE x.plan_id=p.plan_id)
+		FROM apply_plans p JOIN sync_inbox_apply_plans l ON l.plan_id=p.plan_id JOIN apply_steps s ON s.plan_id=p.plan_id AND s.step_index=0 JOIN sync_inbox_changes i ON i.cursor=l.cursor
+		WHERE p.plan_id=? AND l.cursor=?`, planID.String(), cursor).Scan(&status, &stepState, &inboxState, &stepCursor, &objectID, &revision, &operationID, &stepCount); err != nil {
+		return err
+	}
+	if status != "applying" || stepState != "applied" || inboxState != "applying" || stepCount != 1 || stepCursor != cursor || revision < 2 {
+		return errors.New("linked inbox apply plan is not completable")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE sync_baselines SET revision=?,operation_id=? WHERE object_id=? AND revision=?`, revision, operationID, objectID, revision-1)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return errors.New("linked inbox baseline predecessor changed")
+	}
+	now := s.clock().UTC().UnixMilli()
+	result, err = tx.ExecContext(ctx, `UPDATE sync_inbox_changes SET state='applied',applied_at_ms=max(?,applying_at_ms) WHERE cursor=? AND state='applying'`, now, cursor)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return errors.New("linked inbox completion race")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE apply_plans SET status='completed',completed_at_ms=? WHERE plan_id=? AND status='applying'`, now, planID.String())
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return errors.New("linked apply plan completion race")
+	}
+	_, err = advanceConfirmedInboxCursorTx(ctx, tx)
+	return err
+}
+
+func advanceConfirmedInboxCursorTx(ctx context.Context, tx *sql.Tx) (uint64, error) {
+	confirmed, err := readSyncCursor(ctx, tx, "confirmed_cursor", "confirmed")
+	if errors.Is(err, sql.ErrNoRows) {
+		confirmed = 0
+		err = nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	downloaded, err := readSyncCursor(ctx, tx, "downloaded_cursor", "downloaded")
+	if err != nil {
+		return 0, err
+	}
+	if downloaded < confirmed {
+		return 0, errors.New("downloaded cursor is behind confirmed cursor")
+	}
+	frontier := confirmed
+	rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes WHERE cursor>? AND cursor<=? ORDER BY cursor`, confirmed, downloaded)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		item, err := scanInboxItem(rows)
+		if err != nil {
+			return 0, err
+		}
+		if frontier == math.MaxInt64 || item.Change.Cursor != frontier+1 || item.State != "applied" {
+			break
+		}
+		frontier = item.Change.Cursor
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if frontier == confirmed {
+		return frontier, nil
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO sync_state(key,value) VALUES('confirmed_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatUint(frontier, 10))
+	return frontier, err
+}
+
 // AdvanceConfirmedInboxCursor advances the legacy confirmed frontier only over
 // a contiguous prefix of applied inbox rows.
 func (s *Store) AdvanceConfirmedInboxCursor(ctx context.Context) (uint64, error) {
 	var frontier uint64
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		confirmed, err := readSyncCursor(ctx, tx, "confirmed_cursor", "confirmed")
-		if errors.Is(err, sql.ErrNoRows) {
-			confirmed = 0
-			err = nil
-		}
-		if err != nil {
-			return err
-		}
-		downloaded, err := readSyncCursor(ctx, tx, "downloaded_cursor", "downloaded")
-		if err != nil {
-			return err
-		}
-		if downloaded < confirmed {
-			return errors.New("downloaded cursor is behind confirmed cursor")
-		}
-		frontier = confirmed
-		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes WHERE cursor>? AND cursor<=? ORDER BY cursor`, confirmed, downloaded)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			item, err := scanInboxItem(rows)
-			if err != nil {
-				return err
-			}
-			if frontier == math.MaxInt64 || item.Change.Cursor != frontier+1 || item.State != "applied" {
-				break
-			}
-			frontier = item.Change.Cursor
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		if frontier == confirmed {
-			return nil
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO sync_state(key,value) VALUES('confirmed_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatUint(frontier, 10))
+		var err error
+		frontier, err = advanceConfirmedInboxCursorTx(ctx, tx)
 		return err
 	})
 	return frontier, err

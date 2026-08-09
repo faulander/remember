@@ -1033,6 +1033,417 @@ func TestInboxScanAndFrontierRejectCorruptStoredPayload(t *testing.T) {
 	}
 }
 
+func inboxNoteChange(t *testing.T, cursor, revision uint64, object uuid.UUID, mutation MutationKind, parent *uuid.UUID, name string) Change {
+	t.Helper()
+	op, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", name, cursor)))
+	return Change{Cursor: cursor, OperationID: op, ObjectID: object, Mutation: mutation, ObjectType: Note, Revision: revision, ParentID: parent, Name: name, BlobHash: hash[:], Deleted: mutation == Delete}
+}
+
+func putInboxBaseline(t *testing.T, index *localindex.Index, object uuid.UUID, revision uint64) {
+	t.Helper()
+	if err := index.WithTransaction(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO sync_baselines(object_id,revision) VALUES(?,?)`, object.String(), revision)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func applyInboxPlan(t *testing.T, store *Store, planID uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.BeginApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, planID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteApplyPlan(ctx, planID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInboxApplyPlanCompletesOutOfOrderWithoutSkippingFrontier(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox-plan.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	x, y := uuid.New(), uuid.New()
+	changes := []Change{inboxNoteChange(t, 1, 2, x, Update, nil, "X.md"), inboxNoteChange(t, 2, 2, y, Delete, nil, "Y.md")}
+	if err := store.IngestPullPage(ctx, 0, 2, changes); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, x, 1)
+	putInboxBaseline(t, index, y, 1)
+	yPlan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 2, yPlan); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || len(active.Steps) != 1 {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+	copied := active.Steps[0]
+	copied.State = ""
+	if !sameChangePayload(copied, changes[1]) {
+		t.Fatalf("copied=%#v want=%#v", copied, changes[1])
+	}
+	applyInboxPlan(t, store, yPlan)
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != 0 {
+		t.Fatalf("confirmed skipped X: %d", confirmed)
+	}
+	if rev, found, err := store.Baseline(ctx, y); err != nil || !found || rev != 2 {
+		t.Fatalf("Y baseline=%d/%t err=%v", rev, found, err)
+	}
+	xPlan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, xPlan); err != nil {
+		t.Fatal(err)
+	}
+	applyInboxPlan(t, store, xPlan)
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != 2 {
+		t.Fatalf("confirmed=%d", confirmed)
+	}
+	for cursor := uint64(1); cursor <= 2; cursor++ {
+		item, found, err := store.InboxChange(ctx, cursor)
+		if err != nil || !found || item.State != "applied" {
+			t.Fatalf("cursor %d item=%#v found=%t err=%v", cursor, item, found, err)
+		}
+	}
+}
+
+func TestInboxApplyPlanRejectsAnotherActivePlan(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	id := uuid.New()
+	change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, id, 1)
+	legacy := ApplyPlan{ID: uuid.Must(uuid.NewV7()), FromCursor: 0, ThroughCursor: 1, Steps: []Change{change}}
+	if err := store.CreateApplyPlan(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateInboxApplyPlan(ctx, 1, uuid.Must(uuid.NewV7())); err == nil {
+		t.Fatal("second active plan accepted")
+	}
+}
+
+func TestInboxApplyPlanBlocksSameObjectOvertake(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox-plan.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	object := uuid.New()
+	changes := []Change{inboxNoteChange(t, 1, 2, object, Update, nil, "N.md"), inboxNoteChange(t, 2, 3, object, Update, nil, "N.md")}
+	if err := store.IngestPullPage(ctx, 0, 2, changes); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, object, 2)
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 2, plan); err == nil {
+		t.Fatal("overtake behind pending predecessor accepted")
+	}
+	if err := store.MarkInboxApplying(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateInboxApplyPlan(ctx, 2, plan); err == nil {
+		t.Fatal("overtake behind applying predecessor accepted")
+	}
+}
+
+func TestInboxApplyPlanCompletionRequiresUnchangedPredecessor(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	id := uuid.New()
+	change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, id, 1)
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_baselines SET revision=3 WHERE object_id=?`, id.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteApplyPlan(ctx, plan); err == nil {
+		t.Fatal("changed predecessor accepted")
+	}
+	item, _, _ := store.InboxChange(ctx, 1)
+	if item.State != "applying" {
+		t.Fatalf("inbox=%s", item.State)
+	}
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != 0 {
+		t.Fatalf("confirmed=%d", confirmed)
+	}
+}
+
+func TestInboxApplyPlanResumesAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "inbox-plan.db")
+	index, err := localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewStore(index)
+	object := uuid.New()
+	change := inboxNoteChange(t, 1, 2, object, Update, nil, "N.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, object, 1)
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	index, err = localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ = NewStore(index)
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || active.ID != plan || active.Status != "applying" {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("idempotent begin: %v", err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != 1 {
+		t.Fatalf("confirmed=%d", confirmed)
+	}
+}
+
+func TestInboxApplyPlanRejectsIneligibleShapesAndMissingPredecessor(t *testing.T) {
+	cases := []struct {
+		name     string
+		change   func(*testing.T, uuid.UUID) Change
+		baseline bool
+	}{
+		{"create", func(t *testing.T, id uuid.UUID) Change { return inboxNoteChange(t, 1, 1, id, Create, nil, "N.md") }, true},
+		{"move", func(t *testing.T, id uuid.UUID) Change { return inboxNoteChange(t, 1, 2, id, Move, nil, "N.md") }, true},
+		{"nested", func(t *testing.T, id uuid.UUID) Change {
+			parent := uuid.New()
+			return inboxNoteChange(t, 1, 2, id, Update, &parent, "N.md")
+		}, true},
+		{"folder", func(t *testing.T, id uuid.UUID) Change { return inboxFolderChange(t, 1, 2, id, Update, "Folder") }, true},
+		{"missing baseline", func(t *testing.T, id uuid.UUID) Change { return inboxNoteChange(t, 1, 2, id, Update, nil, "N.md") }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer index.Close()
+			store, _ := NewStore(index)
+			id := uuid.New()
+			change := tc.change(t, id)
+			if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.baseline {
+				putInboxBaseline(t, index, id, change.Revision-1)
+			}
+			if err := store.CreateInboxApplyPlan(ctx, 1, uuid.Must(uuid.NewV7())); err == nil {
+				t.Fatal("ineligible change accepted")
+			}
+		})
+	}
+}
+
+func TestInboxApplyPlanSQLGuardsExactPayloadAndLink(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	id := uuid.New()
+	change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, id, 1)
+	spoofPlan := uuid.Must(uuid.NewV7())
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,0,1,'prepared',0)`, spoofPlan.String()); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,0,1,?,?,'update','note',2,NULL,'Spoof.md',?,'pending')`, spoofPlan.String(), change.OperationID.String(), id.String(), change.BlobHash); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO sync_inbox_apply_plans(plan_id,cursor) VALUES(?,1)`, spoofPlan.String())
+		return err
+	}); err == nil {
+		t.Fatal("mismatched link inserted")
+	}
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInboxApplying(ctx, 1); err == nil {
+		t.Fatal("linked inbox bypassed plan begin")
+	}
+	statements := []string{`UPDATE apply_plans SET status='completed',completed_at_ms=1 WHERE plan_id='` + plan.String() + `'`, `UPDATE apply_steps SET state='applied' WHERE plan_id='` + plan.String() + `'`, `INSERT OR REPLACE INTO sync_inbox_apply_plans(plan_id,cursor) VALUES('` + plan.String() + `',1)`, `UPDATE apply_plans SET through_cursor=2 WHERE plan_id='` + plan.String() + `'`, `INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) SELECT plan_id,1,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state FROM apply_steps WHERE plan_id='` + plan.String() + `'`, `UPDATE apply_steps SET name='Spoof.md' WHERE plan_id='` + plan.String() + `'`, `UPDATE sync_inbox_apply_plans SET cursor=2 WHERE plan_id='` + plan.String() + `'`, `DELETE FROM sync_inbox_apply_plans WHERE plan_id='` + plan.String() + `'`, `DELETE FROM apply_steps WHERE plan_id='` + plan.String() + `'`}
+	for _, statement := range statements {
+		if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { _, err := tx.Exec(statement); return err }); err == nil {
+			t.Fatalf("SQL spoof accepted: %s", statement)
+		}
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_inbox_changes SET state='applying',applying_at_ms=ingested_at_ms WHERE cursor=1`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("partial begin recovery: %v", err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_inbox_changes SET state='applied',applied_at_ms=applying_at_ms WHERE cursor=1`)
+		return err
+	}); err == nil {
+		t.Fatal("inbox completed before baseline")
+	}
+	if err := store.CompleteApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAbandonPreparedInboxPlanRequiresPristineState(t *testing.T) {
+	t.Run("pristine", func(t *testing.T) {
+		ctx := context.Background()
+		index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer index.Close()
+		store, _ := NewStore(index)
+		id := uuid.New()
+		change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+		if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+			t.Fatal(err)
+		}
+		putInboxBaseline(t, index, id, 1)
+		plan := uuid.Must(uuid.NewV7())
+		if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AbandonPreparedInboxPlan(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+		if active, err := store.ActiveApplyPlan(ctx); err != nil || active != nil {
+			t.Fatalf("active=%#v err=%v", active, err)
+		}
+		item, _, _ := store.InboxChange(ctx, 1)
+		if item.State != "pending" {
+			t.Fatalf("inbox=%s", item.State)
+		}
+	})
+	t.Run("applying", func(t *testing.T) {
+		ctx := context.Background()
+		index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer index.Close()
+		store, _ := NewStore(index)
+		id := uuid.New()
+		change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+		if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+			t.Fatal(err)
+		}
+		putInboxBaseline(t, index, id, 1)
+		plan := uuid.Must(uuid.NewV7())
+		if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BeginApplyPlan(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AbandonPreparedInboxPlan(ctx, plan); err == nil {
+			t.Fatal("applying plan abandoned")
+		}
+	})
+	t.Run("side journal", func(t *testing.T) {
+		ctx := context.Background()
+		index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer index.Close()
+		store, _ := NewStore(index)
+		id := uuid.New()
+		change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+		if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+			t.Fatal(err)
+		}
+		putInboxBaseline(t, index, id, 1)
+		plan := uuid.Must(uuid.NewV7())
+		if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+			t.Fatal(err)
+		}
+		if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`INSERT INTO apply_folder_mutations(plan_id,step_index,folder_id,mutation_kind,source_relative,target_relative,device,inode) VALUES(?,0,?,'delete','X','X',1,1)`, plan.String(), id.String())
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AbandonPreparedInboxPlan(ctx, plan); err == nil {
+			t.Fatal("plan with side journal abandoned")
+		}
+	})
+}
+
 func TestApplyPlanRejectsCursorGaps(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

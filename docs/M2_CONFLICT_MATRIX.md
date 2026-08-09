@@ -1,6 +1,6 @@
 # M2-Konfliktmatrix – Audit nach ADR 0051
 
-Stand: Client-Schema v25, einschließlich der in den cursor-geordneten Legacy-Apply-Pfad gespiegelten Sync-Inbox aus ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md) und [0055](adr/0055-m2-sync-inbox-mirror.md).
+Stand: Client-Schema v26, einschließlich der in den cursor-geordneten Legacy-Apply-Pfad gespiegelten Sync-Inbox aus ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md)/[0055](adr/0055-m2-sync-inbox-mirror.md) und der noch nicht geschedulten out-of-order Root-Note-Einzelpläne aus ADR [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md).
 
 Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt keine ADR-Entscheidung und erklärt M2 **nicht** für abgeschlossen.
 
@@ -58,7 +58,7 @@ Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt ke
 |---|---|---|
 | Outbox-Replay, idempotente Submits, Cursor und Crash-Wiederaufnahme | **Konvergiert** | ADR [0011](adr/0011-m2-client-sync-durability.md), [0031](adr/0031-m2-cold-history-apply-convergence.md), [0032](adr/0032-m2-paginated-pull-resumption.md); `LocalCore.SyncOnce`; `TestSyncOnceRetriesAmbiguousAttemptWithSameOperationAndBlobFirst`, `TestExecuteActiveApplyPlanResumesFolderMoveAfterPublicationCrash`, `TestTwoClientsConvergeThroughAuthenticatedHTTP`. |
 | Authentifizierte Mehrgeräte-Abnahme | **Konvergiert für die genannten Zellen** | ADR [0029](adr/0029-m2-authenticated-two-client-convergence.md), [0044](adr/0044-m2-authenticated-structural-conflict-convergence.md), [0048](adr/0048-m2-authenticated-post-adr44-convergence.md) und [0052](adr/0052-m2-authenticated-adr49-51-convergence.md); `TestAuthenticatedStructuralConflictsConverge`, `TestAuthenticatedPostADR44Convergence` und `TestAuthenticatedADR49To51Convergence` decken A/B sowie kalten C-Bootstrap über echte Login-, Blob- und Sync-Routen ab. |
-| Nicht unterstützter Konflikt neben unbeteiligten Objekten | **Fail-closed; Anforderung offen** | ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md) und [0055](adr/0055-m2-sync-inbox-mirror.md) ergänzen eine dauerhafte Inbox mit getrenntem Download-/Confirmed-Frontier und spiegeln den cursor-geordneten Apply-Pfad. `LocalCore.SyncOnce` gibt bei `Store.HasUnresolvedOutbox` aber weiterhin vor Pull `ErrUnresolvedOutbound` zurück; objektbezogene Isolation fehlt und [SYNC-012](PRD.md#sync-012--fortsetzbarer-sync) bleibt offen. |
+| Nicht unterstützter Konflikt neben unbeteiligten Objekten | **Fail-closed; Anforderung offen** | ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md), [0055](adr/0055-m2-sync-inbox-mirror.md) und [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) ergänzen eine dauerhafte Inbox, getrennte Frontiers und persistente Einzelpläne für unabhängige Root-Note-Updates/-Deletes; Scheduling und Dateisystem-Integration fehlen noch. `LocalCore.SyncOnce` gibt bei `Store.HasUnresolvedOutbox` aber weiterhin vor Pull `ErrUnresolvedOutbound` zurück; objektbezogene Isolation fehlt und [SYNC-012](PRD.md#sync-012--fortsetzbarer-sync) bleibt offen. |
 | Blob fehlt oder Hash stimmt nicht | **Fail-closed, technisch getestet** | `TestExecuteActiveApplyPlanRejectsBlobMismatchBeforeFilesystemMutation`, `TestPutLimitsAndHashMismatchLeaveNoPublishedBlob`. Kein stiller Apply/Cursorfortschritt; eine vollständige Nutzer-/Betriebsalarmierung bleibt Produktarbeit. |
 | Darwin/Linux Rooted Apply | **Konvergiert im automatisierten Umfang** | Descriptor-relative `*at`-Operationen, `O_NOFOLLOW`, Device/Inode-Prüfung; Repository- und Cross-Build-Tests. Reale Linux-Desktop-Hardware ist extern. |
 | Windows Rooted Apply/Staging/Cleanup | **Fail-closed** | `client/internal/repository/rooted_windows.go` verweigert sicherheitskritische Syncpfade, bis Reparse-Point-Schutz handle-basiert implementiert und real getestet ist. |
@@ -80,7 +80,7 @@ Relevante Anforderungen: [SYNC-002](PRD.md#sync-002--später-abgleich), [SYNC-00
 
 Priorisiert, ohne externe Zielhardware:
 
-1. Auf der in `SyncOnce` gespiegelten Schema-v25-Inbox aus ADR 0054/0055 objektbezogenes Apply-Scheduling und Isolation ungelöster Konflikte implementieren, damit unbeteiligte Änderungen gemäß `SYNC-012` fortschreiten können, ohne den Konfliktzustand zu überspringen.
+1. Auf der in `SyncOnce` gespiegelten Schema-v26-Inbox aus ADR 0054–0056 objektbezogenes Apply-Scheduling und Isolation ungelöster Konflikte implementieren, damit unbeteiligte Änderungen gemäß `SYNC-012` fortschreiten können, ohne den Konfliktzustand zu überspringen.
 2. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
 3. Für divergente Folder Move/Move-Ziele eine explizite Produktregel plus inode-/ancestry-gebundenes Journal entwerfen; bis zur Freigabe bleibt die Zelle fail-closed.
 4. Nutzer- und Betriebsalarmierung für `SYNC-013`/M2-AC-004 vervollständigen.

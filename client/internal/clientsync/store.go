@@ -869,6 +869,49 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 		return errors.New("invalid apply plan id")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var linkedCursor uint64
+		linkErr := tx.QueryRowContext(ctx, `SELECT cursor FROM sync_inbox_apply_plans WHERE plan_id=?`, planID.String()).Scan(&linkedCursor)
+		if linkErr != nil && !errors.Is(linkErr, sql.ErrNoRows) {
+			return linkErr
+		}
+		if linkErr == nil {
+			var planStatus, inboxState string
+			if err := tx.QueryRowContext(ctx, `SELECT p.status,i.state FROM apply_plans p JOIN sync_inbox_apply_plans l ON l.plan_id=p.plan_id JOIN sync_inbox_changes i ON i.cursor=l.cursor WHERE p.plan_id=?`, planID.String()).Scan(&planStatus, &inboxState); err != nil {
+				return err
+			}
+			if planStatus == "applying" && inboxState == "applying" {
+				return nil
+			}
+			if planStatus == "prepared" && inboxState == "applying" {
+				result, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='applying' WHERE plan_id=? AND status='prepared'`, planID.String())
+				if err != nil {
+					return err
+				}
+				if count, err := result.RowsAffected(); err != nil || count != 1 {
+					return errors.New("linked apply plan begin recovery race")
+				}
+				return nil
+			}
+			if planStatus != "prepared" || inboxState != "pending" {
+				return errors.New("linked inbox apply plan is not prepared")
+			}
+			now := s.clock().UTC().UnixMilli()
+			result, err := tx.ExecContext(ctx, `UPDATE sync_inbox_changes SET state='applying',applying_at_ms=max(?,ingested_at_ms) WHERE cursor=? AND state='pending'`, now, linkedCursor)
+			if err != nil {
+				return err
+			}
+			if count, err := result.RowsAffected(); err != nil || count != 1 {
+				return errors.New("linked inbox begin race")
+			}
+			result, err = tx.ExecContext(ctx, `UPDATE apply_plans SET status='applying' WHERE plan_id=? AND status='prepared'`, planID.String())
+			if err != nil {
+				return err
+			}
+			if count, err := result.RowsAffected(); err != nil || count != 1 {
+				return errors.New("linked apply plan begin race")
+			}
+			return nil
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='applying' WHERE plan_id=? AND status='prepared'`, planID.String())
 		if err != nil {
 			return err
@@ -1179,6 +1222,14 @@ func (s *Store) CompleteApplyPlan(ctx context.Context, planID uuid.UUID) error {
 		return errors.New("invalid apply plan id")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var linkedCursor uint64
+		linkErr := tx.QueryRowContext(ctx, `SELECT cursor FROM sync_inbox_apply_plans WHERE plan_id=?`, planID.String()).Scan(&linkedCursor)
+		if linkErr == nil {
+			return s.completeInboxApplyPlanTx(ctx, tx, planID, linkedCursor)
+		}
+		if !errors.Is(linkErr, sql.ErrNoRows) {
+			return linkErr
+		}
 		var from, through uint64
 		if err := tx.QueryRowContext(ctx, `SELECT from_cursor,through_cursor FROM apply_plans WHERE plan_id=? AND status='applying'`, planID.String()).Scan(&from, &through); err != nil {
 			return err
