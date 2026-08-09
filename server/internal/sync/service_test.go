@@ -178,6 +178,15 @@ func TestAllPersistedConflictPaths(t *testing.T) {
 			if err != nil || result.Accepted || result.Conflict != tc.code {
 				t.Fatalf("result=%#v err=%v", result, err)
 			}
+			if tc.code == ConflictTypeMismatch {
+				if result.Canonical == nil || result.Canonical.ObjectType != ObjectFolder || result.Canonical.Revision != 1 || result.Canonical.Name != "B" {
+					t.Fatalf("type mismatch canonical=%#v", result.Canonical)
+				}
+				replayed, replayErr := actor.Submit(ctx, tc.request)
+				if replayErr != nil || replayed.Canonical == nil || replayed.Canonical.ObjectType != result.Canonical.ObjectType || replayed.Canonical.Revision != result.Canonical.Revision || replayed.Canonical.Name != result.Canonical.Name || replayed.Canonical.Deleted != result.Canonical.Deleted || ((replayed.Canonical.ParentID == nil) != (result.Canonical.ParentID == nil)) || (replayed.Canonical.ParentID != nil && *replayed.Canonical.ParentID != *result.Canonical.ParentID) || len(replayed.Canonical.BlobHash) != 0 || replayed.Conflict != ConflictTypeMismatch {
+					t.Fatalf("type mismatch replay=%#v err=%v", replayed, replayErr)
+				}
+			}
 		})
 	}
 	deleted := mustAccepted(t, actor, deleteObject(note, ObjectNote, 1))

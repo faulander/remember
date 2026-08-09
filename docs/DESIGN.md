@@ -699,6 +699,13 @@ Umsetzung von `SYNC-008`:
 - Note-Move rettet die lokale Zielfassung und stellt zusätzlich die authentifizierte kanonische Serverfassung an ihrem bisherigen Pfad wieder her.
 - Während der Evakuierung bleibt allgemeines Reconcile auch über Neustarts gesperrt.
 
+## 14.2.5 Typkonflikte
+
+- `type_mismatch` zeigt eine beschädigte oder falsch zugeordnete lokale UUID an, nicht einen regulären konkurrierenden Edit.
+- Der kanonische Serverzustand wird authentifiziert und replay-stabil gespeichert, aber nicht über das lokale Objekt anderen Typs angewendet.
+- Der Client bleibt vor Pull und Apply fail-closed; Note-Bytes, Folder-Inodes und Unterbäume bleiben unverändert.
+- Eine spätere automatische Reparatur benötigt ein vollständiges crash-resumierbares Rekey-Protokoll für Objekt und abhängige Intents.
+
 ## 14.3 Löschen gegen Verschieben
 
 - Die Löschung des ursprünglichen Objekts bleibt wirksam.

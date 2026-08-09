@@ -15,6 +15,7 @@ import (
 	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/localindex"
 	"github.com/faulander/remember/client/internal/remotehttp"
+	"github.com/faulander/remember/client/internal/repository"
 	"github.com/google/uuid"
 )
 
@@ -90,6 +91,13 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 				return result, nil
 			}
 		}
+	}
+	if m.Kind != clientsync.Create && state.ObjectType != m.ObjectType {
+		r.server.ensureConflictNamespace()
+		canonical := &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
+		result := clientsync.Result{Conflict: "type_mismatch", Canonical: canonical}
+		r.server.results[m.OperationID] = result
+		return result, nil
 	}
 	if m.Kind != clientsync.Create && state.Revision != m.BaseRevision {
 		r.server.ensureConflictNamespace()
@@ -182,6 +190,147 @@ func (r *memoryRemote) Pull(_ context.Context, after uint64, limit int) (remoteh
 	}
 	page.HasMore = int(page.NextCursor) < len(r.server.changes)
 	return page, nil
+}
+
+func TestSyncOnceFailsClosedForNoteToFolderTypeMismatch(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	created, _, err := core.CreateNote(ctx, "N.md", "original\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	note, err := core.ReadNote(ctx, "N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.SaveNote(ctx, "N.md", note.Revision, "local bytes survive\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(root, "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := server.states[created.ID]
+	state.ObjectType = clientsync.Folder
+	state.Name = "CanonicalFolder"
+	state.BlobHash = nil
+	server.states[created.ID] = state
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("type mismatch sync err=%v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(root, "N.md"))
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("note bytes changed=%t err=%v", bytes.Equal(after, before), err)
+	}
+	snapshot, err := core.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, object := range snapshot.Objects {
+		if object.ID == created.ID {
+			found = object.Type == localindex.ObjectNote && object.RelativePath == "N.md"
+		}
+	}
+	if !found {
+		t.Fatal("note identity changed during type mismatch")
+	}
+	store, _ := clientsync.NewStore(core.index)
+	conflicts, err := store.ListConflicts(ctx, 10)
+	if err != nil || len(conflicts) != 1 || conflicts[0].Code != "type_mismatch" || conflicts[0].Canonical == nil || conflicts[0].Canonical.ObjectType != clientsync.Folder {
+		t.Fatalf("type mismatch conflict=%#v err=%v", conflicts, err)
+	}
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("replayed type mismatch err=%v", err)
+	}
+	again, _ := os.ReadFile(filepath.Join(root, "N.md"))
+	if !bytes.Equal(again, before) {
+		t.Fatal("replayed type mismatch changed note")
+	}
+}
+
+func TestSyncOnceFailsClosedForFolderToNoteTypeMismatch(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	if _, err := core.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	folderSnapshot, err := core.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var folderID uuid.UUID
+	for _, object := range folderSnapshot.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "F" {
+			folderID = object.ID
+		}
+	}
+	if folderID == uuid.Nil {
+		t.Fatal("folder id missing")
+	}
+	if _, _, err := core.CreateNote(ctx, "F/Child.md", "child survives\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := repository.RootedFolderIdentity(root, "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "F"), filepath.Join(root, "Moved")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	childBefore, err := os.ReadFile(filepath.Join(root, "Moved", "Child.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalBytes := []byte("canonical note bytes")
+	canonicalHash := sha256.Sum256(canonicalBytes)
+	server.blobs[canonicalHash] = canonicalBytes
+	state := server.states[folderID]
+	state.ObjectType = clientsync.Note
+	state.Name = "Canonical.md"
+	state.BlobHash = canonicalHash[:]
+	server.states[folderID] = state
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("folder type mismatch sync err=%v", err)
+	}
+	if err := repository.VerifyRootedFolderIdentity(root, "Moved", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	childAfter, err := os.ReadFile(filepath.Join(root, "Moved", "Child.md"))
+	if err != nil || !bytes.Equal(childAfter, childBefore) {
+		t.Fatalf("folder child changed=%t err=%v", bytes.Equal(childAfter, childBefore), err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Canonical.md")); !os.IsNotExist(err) {
+		t.Fatalf("canonical note applied across unresolved mismatch: %v", err)
+	}
+	store, _ := clientsync.NewStore(core.index)
+	conflicts, err := store.ListConflicts(ctx, 10)
+	if err != nil || len(conflicts) != 1 || conflicts[0].Code != "type_mismatch" || conflicts[0].Canonical == nil || conflicts[0].Canonical.ObjectType != clientsync.Note {
+		t.Fatalf("folder mismatch conflict=%#v err=%v", conflicts, err)
+	}
 }
 
 func TestSyncOnceConvergesTwoRootsForRootNoteCreateUpdate(t *testing.T) {

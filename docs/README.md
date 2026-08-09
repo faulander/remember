@@ -47,5 +47,6 @@
 | [0034](adr/0034-m2-folder-cycle-conflict-revert.md) | Folder-Cycle-Konflikte als identitätsgebundener Move-Revert |
 | [0035](adr/0035-m2-equivalent-folder-move-resolution.md) | Äquivalente konkurrierende Folder-Moves |
 | [0036](adr/0036-m2-empty-folder-create-collision-recovery.md) | Wiederherstellung leerer Folder-Create-Pfadkollisionen |
+| [0037](adr/0037-m2-type-mismatch-fail-closed.md) | Fail-closed-Behandlung von Typkonflikten |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
