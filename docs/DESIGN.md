@@ -660,6 +660,7 @@ Umsetzung von `SYNC-008`:
 - Die lokalen Bytes werden mit neuer UUID unter Wiederhergestellt gerettet und die alte Quellidentität nur als Konfliktherkunft bewahrt.
 - Die Evakuierung von Update oder Move unterdrückt einen falschen lokalen Folge-Delete auch über Absturz und Neustart hinweg.
 - Ein lokaler Delete gegen `object_missing` ist semantisch bereits erfüllt und wird unveränderlich als `already_deleted` journalisiert, ohne ein neues Serverobjekt zu erzeugen.
+- Dasselbe gilt für `object_deleted`, jedoch nur bei gleichem Objekttyp, kanonischem Tombstone und strikt höherer Revision; Pull und Baseline werden zusätzlich an die exakte Tombstone-Revision gebunden.
 
 ## 14.2.3 Leeren Ordner löschen gegen neue Remote-Kinder
 

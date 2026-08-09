@@ -230,7 +230,7 @@ func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
 	}
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 17 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 18 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
@@ -241,7 +241,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=18`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=19`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

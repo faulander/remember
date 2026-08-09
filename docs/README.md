@@ -50,5 +50,6 @@
 | [0037](adr/0037-m2-type-mismatch-fail-closed.md) | Fail-closed-Behandlung von Typkonflikten |
 | [0038](adr/0038-m2-note-move-delete-convergence.md) | Konvergenz konkurrierender Note-Moves und -Deletes |
 | [0039](adr/0039-m2-folder-parent-unavailable-recovery.md) | Folder-Recovery bei fehlendem Parent |
+| [0040](adr/0040-m2-idempotent-stale-deletes.md) | Idempotente stale Deletes gegen Tombstones |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -447,7 +447,13 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 						return nil, errors.New("remote delete source bytes differ")
 					}
 				} else {
-					if deleteConflict != nil && evacuatedDeleteConflict {
+					resolvedDelete, resolveErr := store.AlreadyDeletedResolutionMatches(ctx, change)
+					if resolveErr != nil {
+						return nil, resolveErr
+					}
+					if resolvedDelete {
+						step.exists, step.locallyApplied, step.expected = true, true, deleteExpected
+					} else if deleteConflict != nil && evacuatedDeleteConflict {
 						evacuated := ".remember/trash/conflicts/" + deleteConflict.OperationID.String() + ".md"
 						content, evacuationErr := repository.ReadRooted(c.root, evacuated, clientsync.MaxBlobBytes)
 						if evacuationErr != nil || !bytes.Equal(content, deleteExpected) {
@@ -631,6 +637,16 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 		return step, err
 	}
 	object, exists := objects[change.ObjectID]
+	if change.Mutation == clientsync.Delete && !exists {
+		resolved, resolveErr := store.AlreadyDeletedResolutionMatches(ctx, change)
+		if resolveErr != nil {
+			return step, resolveErr
+		}
+		if resolved {
+			step.deleted, step.locallyApplied, step.conflictDeferred = true, true, true
+			return step, nil
+		}
+	}
 	if binding == nil {
 		intent, err := store.AcceptedFolderIntent(ctx, change)
 		if err != nil {

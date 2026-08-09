@@ -75,7 +75,8 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 			}
 			continue
 		}
-		if m.Kind == clientsync.Delete && conflict.Code == "object_missing" && conflict.Canonical == nil {
+		alreadyDeleted := m.Kind == clientsync.Delete && ((conflict.Code == "object_missing" && conflict.Canonical == nil) || (conflict.Code == "object_deleted" && conflict.Canonical != nil && conflict.Canonical.ObjectType == m.ObjectType && conflict.Canonical.Deleted && conflict.Canonical.Revision > m.BaseRevision))
+		if alreadyDeleted {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
 			}

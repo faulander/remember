@@ -13,17 +13,23 @@ import (
 
 func (s *Store) ResolveMissingDelete(ctx context.Context, operationID uuid.UUID) error {
 	if !validOperationID(operationID) {
-		return errors.New("invalid missing delete resolution")
+		return errors.New("invalid delete resolution")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `INSERT INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms) SELECT operation_id,'already_deleted',? FROM sync_outbox WHERE operation_id=? AND mutation='delete' AND status='conflict' AND conflict_code='object_missing' AND NOT EXISTS(SELECT 1 FROM sync_conflict_states c WHERE c.operation_id=sync_outbox.operation_id) ON CONFLICT(operation_id) DO NOTHING`, s.clock().UTC().UnixMilli(), operationID.String())
+		res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms)
+SELECT o.operation_id,'already_deleted',? FROM sync_outbox o
+WHERE o.operation_id=? AND o.mutation='delete' AND o.status='conflict' AND (
+ (o.conflict_code='object_missing' AND NOT EXISTS(SELECT 1 FROM sync_conflict_states c WHERE c.operation_id=o.operation_id))
+ OR
+ (o.conflict_code='object_deleted' AND EXISTS(SELECT 1 FROM sync_conflict_states c WHERE c.operation_id=o.operation_id AND c.object_type=o.object_type AND c.deleted=1 AND c.revision>o.base_revision))
+)`, s.clock().UTC().UnixMilli(), operationID.String())
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			var exists int
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_conflict_resolutions WHERE operation_id=? AND resolution='already_deleted')`, operationID.String()).Scan(&exists); err != nil || exists == 0 {
-				return errors.New("missing delete conflict unavailable")
+				return errors.New("delete conflict unavailable")
 			}
 		}
 		_, err = tx.ExecContext(ctx, `WITH RECURSIVE doomed(operation_id) AS (SELECT d.operation_id FROM sync_outbox_dependencies d WHERE d.dependency_operation_id=? UNION SELECT d.operation_id FROM sync_outbox_dependencies d JOIN doomed ON d.dependency_operation_id=doomed.operation_id) UPDATE sync_outbox SET status='superseded' WHERE operation_id IN (SELECT operation_id FROM doomed) AND status IN ('pending','attempted')`, operationID.String())

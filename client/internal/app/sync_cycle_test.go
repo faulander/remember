@@ -1232,6 +1232,114 @@ func TestSyncOnceTreatsMissingRemoteDeleteAsSatisfied(t *testing.T) {
 	}
 }
 
+func TestSyncOnceTreatsAlreadyDeletedObjectsAsSatisfied(t *testing.T) {
+	t.Run("note", func(t *testing.T) {
+		ctx := context.Background()
+		server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+		remote := &memoryRemote{server: server}
+		a, _, err := Initialize(ctx, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.Close()
+		b, _, err := Initialize(ctx, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Close()
+		doc, _, err := a.CreateNote(ctx, "N.md", "body\n", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		aDoc, _ := a.ReadNote(ctx, "N.md")
+		if _, err := a.DeleteNote(ctx, "N.md", aDoc.Revision); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		bDoc, _ := b.ReadNote(ctx, "N.md")
+		if _, err := b.DeleteNote(ctx, "N.md", bDoc.Revision); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		assertAlreadyDeletedResolution(t, ctx, b, doc.ID)
+	})
+	t.Run("folder", func(t *testing.T) {
+		ctx := context.Background()
+		server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+		remote := &memoryRemote{server: server}
+		rootA, rootB := t.TempDir(), t.TempDir()
+		a, _, err := Initialize(ctx, rootA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.Close()
+		b, _, err := Initialize(ctx, rootB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Close()
+		if _, err := a.CreateFolder(ctx, "F"); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, _ := a.index.ReadSnapshot(ctx)
+		var folderID uuid.UUID
+		for _, object := range snapshot.Objects {
+			if object.RelativePath == "F" && object.Type == localindex.ObjectFolder {
+				folderID = object.ID
+			}
+		}
+		if err := a.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(rootA, "F")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(rootB, "F")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatal(err)
+		}
+		assertAlreadyDeletedResolution(t, ctx, b, folderID)
+	})
+}
+
+func assertAlreadyDeletedResolution(t *testing.T, ctx context.Context, core *LocalCore, objectID uuid.UUID) {
+	t.Helper()
+	store, _ := clientsync.NewStore(core.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("already-deleted unresolved=%t err=%v", unresolved, err)
+	}
+	var conflict, resolution string
+	if err := core.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT o.conflict_code,r.resolution FROM sync_outbox o JOIN sync_conflict_resolutions r ON r.operation_id=o.operation_id WHERE o.object_id=? AND o.mutation='delete' ORDER BY o.sequence DESC LIMIT 1`, objectID.String()).Scan(&conflict, &resolution)
+	}); err != nil || conflict != "object_deleted" || resolution != "already_deleted" {
+		t.Fatalf("already-deleted history=%s/%s err=%v", conflict, resolution, err)
+	}
+}
+
 func TestSyncOnceRecoversEmptyFolderCreatePathCollision(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
