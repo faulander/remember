@@ -61,5 +61,6 @@
 | [0048](adr/0048-m2-authenticated-post-adr44-convergence.md) | Authentifizierte Konvergenz der Strukturzellen nach ADR 0044 |
 | [0049](adr/0049-m2-divergent-same-parent-note-moves.md) | Divergente Nicht-Root-Note-Moves innerhalb derselben Parent-ID |
 | [0050](adr/0050-m2-direct-note-update-chain-folder-recovery.md) | Folder-Create-Recovery mit linearen direkten Note-Updates |
+| [0051](adr/0051-m2-direct-note-folder-move-delete-recovery.md) | Folder-Move/Remote-Delete-Recovery mit direkten Note-Updates |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

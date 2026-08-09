@@ -62,6 +62,13 @@ func (s *Store) PutConflictFolderMoveDeleteRecovery(ctx context.Context, r Confl
 		return errors.New("invalid folder move/delete recovery")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var dependents int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_outbox_dependencies d JOIN sync_outbox o ON o.operation_id=d.operation_id WHERE d.dependency_operation_id=? AND o.status IN ('pending','attempted','replay_mismatch','conflict')`, r.OperationID.String()).Scan(&dependents); err != nil {
+			return err
+		}
+		if dependents != 0 {
+			return errors.New("folder move/delete recovery has active dependents")
+		}
 		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_move_delete_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,target_relative,device,inode,canonical_revision,state) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.TargetRelative, r.Device, r.Inode, r.CanonicalRevision, r.State)
 		if err != nil {
 			return err
@@ -72,6 +79,107 @@ func (s *Store) PutConflictFolderMoveDeleteRecovery(ctx context.Context, r Confl
 		return nil
 	})
 }
+func (s *Store) PutConflictFolderMoveDeleteRecoveryWithNotes(ctx context.Context, r ConflictFolderMoveDeleteRecovery, members []ConflictFolderCreateNoteMember) error {
+	if !validFolderMoveDeleteRecovery(r) || r.State != "prepared" || len(members) == 0 {
+		return errors.New("invalid folder move/delete note recovery")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		seen := map[uuid.UUID]bool{}
+		for _, m := range members {
+			if !validObjectID(m.NoteID) || !validOperationID(m.OldOperationID) || !validOperationID(m.NewOperationID) || seen[m.NoteID] || naming.ValidateComponent(m.Name) != nil {
+				return errors.New("invalid folder move/delete note member")
+			}
+			seen[m.NoteID] = true
+			previous := m.OldOperationID
+			for i, chain := range m.Chain {
+				if !validOperationID(chain.OperationID) || chain.PreviousOperationID != previous {
+					return errors.New("invalid folder move/delete note chain")
+				}
+				var children int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_outbox_dependencies WHERE dependency_operation_id=?`, previous.String()).Scan(&children); err != nil || children != 1 {
+					return errors.New("folder move/delete note chain branches")
+				}
+				res, err := tx.ExecContext(ctx, `UPDATE sync_outbox SET status='superseded' WHERE operation_id=? AND object_id=? AND mutation='update' AND object_type='note' AND status='pending' AND blob_hash=? AND EXISTS(SELECT 1 FROM sync_outbox_dependencies d WHERE d.operation_id=sync_outbox.operation_id AND d.dependency_operation_id=?) AND NOT EXISTS(SELECT 1 FROM sync_outbox_dependencies x WHERE x.operation_id=sync_outbox.operation_id AND x.dependency_operation_id<>?)`, chain.OperationID.String(), m.NoteID.String(), chain.BlobHash[:], previous.String(), previous.String())
+				if err != nil {
+					return err
+				}
+				if n, _ := res.RowsAffected(); n != 1 {
+					return errors.New("folder move/delete note chain changed")
+				}
+				if i == len(m.Chain)-1 {
+					var descendants int
+					if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_outbox_dependencies WHERE dependency_operation_id=?`, chain.OperationID.String()).Scan(&descendants); err != nil || descendants != 0 {
+						return errors.New("folder move/delete final update has dependents")
+					}
+				}
+				previous = chain.OperationID
+			}
+		}
+		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_move_delete_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,target_relative,device,inode,canonical_revision,state) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.TargetRelative, r.Device, r.Inode, r.CanonicalRevision, r.State)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("folder move/delete note recovery unavailable")
+		}
+		for _, m := range members {
+			res, err = tx.ExecContext(ctx, `INSERT INTO conflict_folder_move_delete_note_members(operation_id,note_id,old_operation_id,new_operation_id,name,blob_hash,create_blob_hash) VALUES(?,?,?,?,?,?,?)`, r.OperationID.String(), m.NoteID.String(), m.OldOperationID.String(), m.NewOperationID.String(), m.Name, m.BlobHash[:], m.CreateBlobHash[:])
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errors.New("folder move/delete note member unavailable")
+			}
+			for ordinal, chain := range m.Chain {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_move_delete_note_chains(operation_id,note_id,ordinal,old_operation_id,previous_operation_id,blob_hash) VALUES(?,?,?,?,?,?)`, r.OperationID.String(), m.NoteID.String(), ordinal+1, chain.OperationID.String(), chain.PreviousOperationID.String(), chain.BlobHash[:]); err != nil {
+					return err
+				}
+			}
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_outbox_dependencies d JOIN sync_outbox n ON n.operation_id=d.operation_id WHERE d.dependency_operation_id=? AND n.status IN ('pending','attempted','replay_mismatch','conflict')`, r.OperationID.String()).Scan(&count); err != nil {
+			return err
+		}
+		if count != len(members) {
+			return errors.New("folder move/delete note manifest incomplete")
+		}
+		return nil
+	})
+}
+func (s *Store) ConflictFolderMoveDeleteNoteMembers(ctx context.Context, operationID uuid.UUID) ([]ConflictFolderCreateNoteMember, error) {
+	var out []ConflictFolderCreateNoteMember
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT note_id,old_operation_id,new_operation_id,name,blob_hash,create_blob_hash FROM conflict_folder_move_delete_note_members WHERE operation_id=? ORDER BY note_id`, operationID.String())
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m ConflictFolderCreateNoteMember
+			var note, old, newID string
+			var blob, createBlob []byte
+			if err := rows.Scan(&note, &old, &newID, &m.Name, &blob, &createBlob); err != nil {
+				return err
+			}
+			m.NoteID, err = uuid.Parse(note)
+			if err == nil {
+				m.OldOperationID, err = uuid.Parse(old)
+			}
+			if err == nil {
+				m.NewOperationID, err = uuid.Parse(newID)
+			}
+			if err != nil || len(blob) != 32 || len(createBlob) != 32 {
+				return errors.New("corrupt folder move/delete note member")
+			}
+			copy(m.BlobHash[:], blob)
+			copy(m.CreateBlobHash[:], createBlob)
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 func (s *Store) MarkConflictFolderMoveDeleteMoved(ctx context.Context, operationID uuid.UUID) error {
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE conflict_folder_move_delete_recoveries SET state='moved' WHERE operation_id=? AND state IN ('prepared','moved')`, operationID.String())
@@ -105,7 +213,46 @@ func (s *Store) CompleteConflictFolderMoveDeleteRecovery(ctx context.Context, r 
 			return errors.New("folder move/delete completion unavailable")
 		}
 		parent := ConflictRecoveredID
-		if err := s.enqueueTx(ctx, tx, []Mutation{{OperationID: r.NewOperationID, Kind: Create, ObjectID: r.RecoveredFolderID, ObjectType: Folder, ParentID: &parent, Name: path.Base(r.TargetRelative)}}); err != nil {
+		mutations := []Mutation{{OperationID: r.NewOperationID, Kind: Create, ObjectID: r.RecoveredFolderID, ObjectType: Folder, ParentID: &parent, Name: path.Base(r.TargetRelative)}}
+		rows, err := tx.QueryContext(ctx, `SELECT note_id,old_operation_id,new_operation_id,name,blob_hash,create_blob_hash FROM conflict_folder_move_delete_note_members WHERE operation_id=? ORDER BY note_id`, r.OperationID.String())
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var note, old, newID, name string
+			var blob, createBlob []byte
+			if err := rows.Scan(&note, &old, &newID, &name, &blob, &createBlob); err != nil {
+				rows.Close()
+				return err
+			}
+			noteID, e := uuid.Parse(note)
+			if e != nil || len(blob) != 32 || len(createBlob) != 32 {
+				rows.Close()
+				return errors.New("corrupt folder move/delete note completion")
+			}
+			newOperation, e := uuid.Parse(newID)
+			if e != nil {
+				rows.Close()
+				return e
+			}
+			res, e := tx.ExecContext(ctx, `UPDATE sync_outbox SET status='superseded' WHERE operation_id=? AND object_id=? AND mutation='create' AND object_type='note' AND parent_id=? AND name=? AND blob_hash=? AND status='pending' AND NOT EXISTS(SELECT 1 FROM sync_outbox_dependencies d JOIN sync_outbox later ON later.operation_id=d.operation_id WHERE d.dependency_operation_id=sync_outbox.operation_id AND later.status IN ('pending','attempted','replay_mismatch','conflict'))`, old, note, r.FolderID.String(), name, createBlob)
+			if e != nil {
+				rows.Close()
+				return e
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				rows.Close()
+				return errors.New("folder move/delete note predecessor changed")
+			}
+			folder := r.RecoveredFolderID
+			mutations = append(mutations, Mutation{OperationID: newOperation, Kind: Create, ObjectID: noteID, ObjectType: Note, ParentID: &folder, Name: name, BlobHash: blob, DependencyOperationID: &r.NewOperationID})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if err := s.enqueueTx(ctx, tx, mutations); err != nil {
 			return err
 		}
 		res, err = tx.ExecContext(ctx, `INSERT INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms) VALUES(?,'folder_move_deleted_recovered',?)`, r.OperationID.String(), s.clock().UTC().UnixMilli())

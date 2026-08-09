@@ -742,7 +742,8 @@ Umsetzung von `SYNC-008`:
 - Für Notes sind beide Reihenfolgen crash-resumierbar umgesetzt: Ein lokaler Move gegen den Remote-Tombstone evakuiert exakte Bytes vor dem Delete-Apply; ein lokaler Delete gegen den Remote-Move rettet den kanonischen Blob und wird anschließend auf die höhere Revision rebased.
 - Technische Evakuierungen werden erst nach verifizierter sichtbarer und synchronisierter Konfliktkopie hashgebunden entfernt.
 - Ein nachweislich leerer lokaler Folder-Move gegen einen kanonischen Remote-Delete wird Inode-gebunden unter neuer UUID in Wiederhergestellt gerettet; die Original-ID bleibt tombstoned.
-- Bei nichtleeren Ordnern muss der gesamte erhaltene Teilbaum materialisiert werden, ohne bereits unabhängig gelöschte Nachfahren wiederzubeleben; diese Variante bleibt separat.
+- Derselbe Tombstone-Schnitt erlaubt einen exakt manifestierten direkten Note-Subtree mit linearer, nie versuchter Create→Update-Historie: Der Root-Inode wird unter neuer UUID verschoben, Note-UUIDs und finale Bytes bleiben erhalten, alte Ketten werden atomar durch Root→Note-Creates ersetzt. Nested Folder, unerwartete Einträge und nichtlineare oder versuchte Historien bleiben fail-closed.
+- Allgemeine nichtleere Ordner außerhalb dieses direkten Manifests müssen den gesamten erhaltenen Teilbaum materialisieren, ohne bereits unabhängig gelöschte Nachfahren wiederzubeleben; diese Variante bleibt separat.
 - Die umgekehrte Richtung lokaler Folder-Delete gegen Remote-Move bleibt bis zur sicheren kanonischen Strukturpublikation fail-closed.
 
 ## 14.4 Umbenennen oder Verschieben gegen Umbenennen oder Verschieben

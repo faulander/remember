@@ -21,7 +21,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Begrenzter Auth-HTTP-Transport für Login, Refresh, Logout sowie Sitzungs- und Geräteverwaltung.
 - Authentifizierter Blob-HTTP-Transport mit strikt mandantengebundenem PUT/GET, 8-MiB-Requestgrenze und konfigurierbarer logischer Benutzerquota.
 - Authentifizierter Sync-HTTP-Transport für idempotente Einzeloperationen, paginierten Cursor-Pull und wiederholbare kanonische Konfliktzustände.
-- Lokaler Index v23 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
+- Lokaler Index v24 mit sequenziellen Migrationen, unveränderlicher Outbox, Sync-Baselines, Cursor sowie persistenten Folder-Restore-, Folder-Move-Revert-, lokalen Folder-Intent-, Konflikt-, Rebase-, No-op- und generationsgebundenen Blob-Cleanup-Journalen.
 - Exaktes, fsync-gesichertes Outbox-Blob-Staging sowie atomare Reconcile-/Outbox-Erfassung.
 - Crash-resumierbarer Remote-Apply für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen ohne permanente Marker.
 - Strikter Client-HTTP-Transport und manueller Vordergrund-Sync mit crash-sicherer Wiederholung mehrdeutiger Operations-Submits.
@@ -62,7 +62,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Divergente konkurrierende Root-Note-Moves und descriptor-verifizierte Nicht-Root-Moves innerhalb derselben exakten Parent-ID retten die verlierende Fassung samt abhängigem Edit unter neuer UUID; äquivalente Root- und descriptor-verifizierte Nicht-Root-Ziele werden als streng gebundener No-op aufgelöst und abhängige Edits bleiben sendbar. Nicht verifizierbare Ancestry-Varianten bleiben fail-closed.
 - Nichtleere Folder-Create-Pfad-/Parent-Konflikte werden für streng manifestierte direkte Note-Creates mit ausschließlich linearer, nie versuchter Create→Update-Historie rekursionsfrei gerettet; Note-UUIDs und finale Bytes bleiben erhalten, Nested Folder und nichtlineare oder versuchte Historien bleiben fail-closed.
 - Authentifizierte Drei-Geräte-HTTP-Konvergenz deckt beide Note-Move/Delete-Reihenfolgen, Direct-Note-Folder-Recovery, leeren Folder-Move gegen Remote-Delete und äquivalente Root-/Nested-Note-Moves einschließlich kaltem Bootstrap ab.
-- Leere lokale Folder-Moves gegen kanonische Remote-Deletes werden unter neuer UUID sichtbar gerettet; Original-ID und exakte Tombstone-Revision bleiben wirksam. Nichtleere und später weiter mutierte Varianten bleiben fail-closed.
+- Leere lokale Folder-Moves sowie streng manifestierte direkte Note-Subtrees mit linearer, nie versuchter Create→Update-Historie werden gegen kanonische Remote-Deletes unter neuer Root-UUID sichtbar gerettet; Note-UUIDs und finale Bytes bleiben erhalten, Original-ID und Tombstone wirksam. Nested, versuchte und nichtlineare Varianten bleiben fail-closed.
 - Eigene akzeptierte Folder-Move/-Delete-Echos werden ausschließlich über atomar persistierte Quellpfad-/Device-/Inode-Intents als lokal ausgeführt bestätigt.
 - Mehrere Note-/Folder-Zustände derselben Pull-Seite verwenden pfadgenaue Zwischenzustände; Create→Delete-Publikationsmarker werden crash-resumierbar vom passenden Delete konsumiert.
 - Ein Netzwerkabbruch zwischen Pull-Seiten setzt nach Clientneustart nachweislich am dauerhaft bestätigten `NextCursor` statt bei Cursor null fort.
