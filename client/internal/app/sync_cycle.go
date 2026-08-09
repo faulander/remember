@@ -12,7 +12,11 @@ import (
 	"github.com/google/uuid"
 )
 
-const maxForegroundPullPages = 32
+const (
+	maxForegroundPullPages     = 32
+	maxIndependentInboxApplies = 32
+	maxIndependentInboxScan    = 1000
+)
 
 var testHookAfterInboxIngest func() error
 
@@ -137,6 +141,12 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil {
 		return err
 	} else if unresolved {
+		if err := c.ingestPullWhileOutboundBlocked(ctx, store, remote); err != nil {
+			return err
+		}
+		if err := c.drainIndependentInbox(ctx, store, remote); err != nil {
+			return err
+		}
 		return ErrUnresolvedOutbound
 	}
 	for pageNumber := 0; pageNumber < maxForegroundPullPages; pageNumber++ {
@@ -144,7 +154,15 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		if err != nil {
 			return err
 		}
-		page, err := remote.Pull(ctx, after, 100)
+		pullLimit := 100
+		downloaded, downloadErr := store.DownloadedCursor(ctx)
+		if downloadErr != nil {
+			return downloadErr
+		}
+		if after < downloaded && downloaded-after < uint64(pullLimit) {
+			pullLimit = int(downloaded - after)
+		}
+		page, err := remote.Pull(ctx, after, pullLimit)
 		if err != nil {
 			return err
 		}
@@ -154,24 +172,9 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			}
 			return nil
 		}
-		expected := after
-		for _, change := range page.Changes {
-			expected++
-			if change.Cursor != expected {
-				return remotehttp.ErrInvalidResponse
-			}
-			if change.ObjectType == clientsync.Folder {
-				validMutation := change.Mutation == clientsync.Create || change.Mutation == clientsync.Move || change.Mutation == clientsync.Delete
-				validRevision := change.Mutation == clientsync.Create && change.Revision == 1 || change.Mutation != clientsync.Create && change.Revision >= 2
-				if !validMutation || !validRevision || change.Deleted != (change.Mutation == clientsync.Delete) || len(change.BlobHash) != 0 {
-					return ErrUnsupportedPullPage
-				}
-			} else if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update && change.Mutation != clientsync.Move && change.Mutation != clientsync.Delete) {
-				return ErrUnsupportedPullPage
-			}
-		}
-		if page.NextCursor != expected || page.NextCursor <= after {
-			return remotehttp.ErrInvalidResponse
+		_, err = validatePullChanges(after, page)
+		if err != nil {
+			return err
 		}
 		if err := store.IngestPullPage(ctx, after, page.NextCursor, page.Changes); err != nil {
 			return err
@@ -205,4 +208,104 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		}
 	}
 	return errors.New("foreground pull page bound exceeded")
+}
+
+func validatePullChanges(after uint64, page remotehttp.PullPage) (uint64, error) {
+	expected := after
+	for _, change := range page.Changes {
+		expected++
+		if change.Cursor != expected {
+			return 0, remotehttp.ErrInvalidResponse
+		}
+		if change.ObjectType == clientsync.Folder {
+			validMutation := change.Mutation == clientsync.Create || change.Mutation == clientsync.Move || change.Mutation == clientsync.Delete
+			validRevision := change.Mutation == clientsync.Create && change.Revision == 1 || change.Mutation != clientsync.Create && change.Revision >= 2
+			if !validMutation || !validRevision || change.Deleted != (change.Mutation == clientsync.Delete) || len(change.BlobHash) != 0 {
+				return 0, ErrUnsupportedPullPage
+			}
+		} else if change.ObjectType != clientsync.Note || (change.Mutation != clientsync.Create && change.Mutation != clientsync.Update && change.Mutation != clientsync.Move && change.Mutation != clientsync.Delete) {
+			return 0, ErrUnsupportedPullPage
+		}
+	}
+	if page.NextCursor != expected || page.NextCursor <= after {
+		return 0, remotehttp.ErrInvalidResponse
+	}
+	return expected, nil
+}
+
+// ingestPullWhileOutboundBlocked only extends the durable downloaded frontier.
+// It intentionally creates no cursor-ordered legacy plan.
+func (c *LocalCore) ingestPullWhileOutboundBlocked(ctx context.Context, store *clientsync.Store, remote SyncRemote) error {
+	for pageNumber := 0; pageNumber < maxForegroundPullPages; pageNumber++ {
+		after, err := store.DownloadedCursor(ctx)
+		if err != nil {
+			return err
+		}
+		page, err := remote.Pull(ctx, after, 100)
+		if err != nil {
+			return err
+		}
+		if len(page.Changes) == 0 {
+			if page.HasMore || page.NextCursor != after {
+				return remotehttp.ErrInvalidResponse
+			}
+			return nil
+		}
+		if _, err := validatePullChanges(after, page); err != nil {
+			return err
+		}
+		if err := store.IngestPullPage(ctx, after, page.NextCursor, page.Changes); err != nil {
+			return err
+		}
+		if testHookAfterInboxIngest != nil {
+			if err := testHookAfterInboxIngest(); err != nil {
+				return err
+			}
+		}
+		if !page.HasMore {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (c *LocalCore) drainIndependentInbox(ctx context.Context, store *clientsync.Store, remote SyncRemote) error {
+	candidates, err := store.ListIndependentInboxCandidates(ctx, maxIndependentInboxScan)
+	if err != nil {
+		return err
+	}
+	applied := 0
+	for _, candidate := range candidates {
+		if applied >= maxIndependentInboxApplies {
+			break
+		}
+		unresolved, err := store.HasUnresolvedLocalIntent(ctx, candidate.Change.ObjectID)
+		if err != nil {
+			return err
+		}
+		if unresolved {
+			continue
+		}
+		planID, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("generate independent apply plan id: %w", err)
+		}
+		if err := store.CreateInboxApplyPlan(ctx, candidate.Change.Cursor, planID); err != nil {
+			return err
+		}
+		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
+			return err
+		}
+		if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
+			return err
+		}
+		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
+			return err
+		}
+		if err := c.cleanupCompletedOutboxBlobs(ctx, store); err != nil {
+			return err
+		}
+		applied++
+	}
+	return nil
 }

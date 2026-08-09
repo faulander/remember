@@ -68,5 +68,6 @@
 | [0054](adr/0054-m2-durable-sync-inbox-foundation.md) | Dauerhafte Sync-Inbox-Grundlage mit getrenntem Download-/Confirmed-Fortschritt |
 | [0055](adr/0055-m2-sync-inbox-mirror.md) | Sync-Inbox als crash-fortsetzbarer Spiegel des cursor-geordneten Apply-Pfads; Isolation bleibt offen |
 | [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) | Inbox-gebundene Einzelpläne für out-of-order Root-Note-Apply ohne Scheduler |
+| [0057](adr/0057-m2-root-note-out-of-order-scheduler.md) | Begrenzter out-of-order Scheduler für unabhängige Root-Note-Updates/-Deletes |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

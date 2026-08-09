@@ -224,6 +224,32 @@ func (s *Store) PendingInboxChange(ctx context.Context, cursor uint64) (InboxIte
 	return item, found, err
 }
 
+// ListIndependentInboxCandidates returns the currently eligible root-note
+// update/delete rows in cursor order. Eligibility is a point-in-time filter;
+// CreateInboxApplyPlan repeats every invariant atomically.
+func (s *Store) ListIndependentInboxCandidates(ctx context.Context, limit int) ([]InboxItem, error) {
+	if limit <= 0 || limit > 1000 {
+		return nil, errors.New("invalid independent inbox candidate limit")
+	}
+	var items []InboxItem
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes i WHERE i.state='pending' AND i.object_type='note' AND i.parent_id IS NULL AND i.mutation IN ('update','delete') AND EXISTS(SELECT 1 FROM sync_baselines b WHERE b.object_id=i.object_id AND b.revision=i.revision-1) AND NOT EXISTS(SELECT 1 FROM sync_inbox_changes earlier WHERE earlier.object_id=i.object_id AND earlier.cursor<i.cursor AND earlier.state<>'applied') ORDER BY i.cursor LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			item, err := scanInboxItem(rows)
+			if err != nil {
+				return err
+			}
+			items = append(items, item)
+		}
+		return rows.Err()
+	})
+	return items, err
+}
+
 // ListPendingInbox returns pending rows in cursor order.
 func (s *Store) ListPendingInbox(ctx context.Context, limit int) ([]InboxItem, error) {
 	if limit <= 0 || limit > 1000 {

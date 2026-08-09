@@ -21,12 +21,13 @@ import (
 )
 
 type memorySyncServer struct {
-	blobs   map[[32]byte][]byte
-	results map[uuid.UUID]clientsync.Result
-	states  map[uuid.UUID]clientsync.Change
-	changes []clientsync.Change
-	pullErr error
-	maxPull int
+	blobs      map[[32]byte][]byte
+	results    map[uuid.UUID]clientsync.Result
+	states     map[uuid.UUID]clientsync.Change
+	changes    []clientsync.Change
+	pullErr    error
+	maxPull    int
+	pullAfters []uint64
 }
 
 type memoryRemote struct{ server *memorySyncServer }
@@ -181,6 +182,7 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 	return result, nil
 }
 func (r *memoryRemote) Pull(_ context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
+	r.server.pullAfters = append(r.server.pullAfters, after)
 	if r.server.pullErr != nil {
 		err := r.server.pullErr
 		r.server.pullErr = nil
@@ -4295,6 +4297,214 @@ func TestSyncOnceConvergesRootNoteMoveAndDelete(t *testing.T) {
 	cursorB, _ := storeB.ConfirmedCursor(ctx)
 	if cursorA != 3 || cursorB != 3 {
 		t.Fatalf("cursors=%d/%d", cursorA, cursorB)
+	}
+}
+
+func TestSyncOnceAppliesIndependentRootNotesBehindUnresolvedIntent(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	for _, name := range []string{"X.md", "Y.md", "Z.md", "W.md"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("initial "+name+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	x, _ := core.ReadNote(ctx, "X.md")
+	y, _ := core.ReadNote(ctx, "Y.md")
+	z, _ := core.ReadNote(ctx, "Z.md")
+	w, _ := core.ReadNote(ctx, "W.md")
+	store, _ := clientsync.NewStore(core.index)
+	base, _ := store.ConfirmedCursor(ctx)
+	server.maxPull = 2
+	if _, _, err := core.SaveNote(ctx, "X.md", x.Revision, "local unresolved\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.ListReady(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var xOperation uuid.UUID
+	for _, item := range ready {
+		if item.Mutation.ObjectID == x.ID {
+			xOperation = item.Mutation.OperationID
+		}
+	}
+	if xOperation == uuid.Nil {
+		t.Fatal("missing X operation")
+	}
+	server.results[xOperation] = clientsync.Result{Conflict: "type_mismatch", Canonical: &clientsync.CanonicalState{ObjectType: clientsync.Folder, Revision: 2, Name: "X-folder"}}
+	makeBytes := func(id uuid.UUID, body string) ([]byte, []byte) {
+		doc, err := frontmatter.EnsureIdentity([]byte(body), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(doc.Markdown)
+		server.blobs[hash] = doc.Markdown
+		return doc.Markdown, hash[:]
+	}
+	xBytes, xHash := makeBytes(x.ID, "remote X\n")
+	_ = xBytes
+	y2, y2Hash := makeBytes(y.ID, "remote Y2\n")
+	y3, y3Hash := makeBytes(y.ID, "remote Y3\n")
+	createID := uuid.New()
+	_, createHash := makeBytes(createID, "remote create\n")
+	appendChange := func(change clientsync.Change) {
+		change.Cursor = uint64(len(server.changes) + 1)
+		change.OperationID = uuid.Must(uuid.NewV7())
+		server.changes = append(server.changes, change)
+	}
+	appendChange(clientsync.Change{ObjectID: x.ID, ObjectType: clientsync.Note, Mutation: clientsync.Update, Revision: 2, Name: "X.md", BlobHash: xHash})
+	appendChange(clientsync.Change{ObjectID: y.ID, ObjectType: clientsync.Note, Mutation: clientsync.Update, Revision: 2, Name: "Y.md", BlobHash: y2Hash})
+	appendChange(clientsync.Change{ObjectID: y.ID, ObjectType: clientsync.Note, Mutation: clientsync.Update, Revision: 3, Name: "Y.md", BlobHash: y3Hash})
+	appendChange(clientsync.Change{ObjectID: z.ID, ObjectType: clientsync.Note, Mutation: clientsync.Delete, Revision: 2, Name: "Z.md", BlobHash: append([]byte(nil), server.states[z.ID].BlobHash...), Deleted: true})
+	appendChange(clientsync.Change{ObjectID: createID, ObjectType: clientsync.Note, Mutation: clientsync.Create, Revision: 1, Name: "Created.md", BlobHash: createHash})
+	appendChange(clientsync.Change{ObjectID: w.ID, ObjectType: clientsync.Note, Mutation: clientsync.Move, Revision: 2, Name: "Moved.md", BlobHash: append([]byte(nil), server.states[w.ID].BlobHash...)})
+	appendChange(clientsync.Change{ObjectID: uuid.New(), ObjectType: clientsync.Folder, Mutation: clientsync.Create, Revision: 1, Name: "Folder"})
+	q, _, err := core.CreateNote(ctx, "Q.md", "outbound while blocked\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedPullStart := len(server.pullAfters)
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("sync=%v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Y.md")); err != nil || !bytes.Equal(got, y2) {
+		t.Fatalf("Y=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Z.md")); !os.IsNotExist(err) {
+		t.Fatalf("Z delete=%v", err)
+	}
+	if _, ok := server.states[q.ID]; !ok {
+		t.Fatal("independent outbound Q was not submitted")
+	}
+	if len(server.pullAfters)-blockedPullStart < 4 {
+		t.Fatalf("blocked pull was not paginated: %v", server.pullAfters[blockedPullStart:])
+	}
+	downloaded, _ := store.DownloadedCursor(ctx)
+	confirmed, _ := store.ConfirmedCursor(ctx)
+	if confirmed != base || downloaded != uint64(len(server.changes)) {
+		t.Fatalf("confirmed=%d base=%d downloaded=%d server=%d", confirmed, base, downloaded, len(server.changes))
+	}
+	xItem, _, _ := store.InboxChange(ctx, base+1)
+	yItem, _, _ := store.InboxChange(ctx, base+2)
+	y3Item, _, _ := store.InboxChange(ctx, base+3)
+	if xItem.State != "pending" || yItem.State != "applied" || y3Item.State != "pending" {
+		t.Fatalf("states X/Y2/Y3=%s/%s/%s", xItem.State, yItem.State, y3Item.State)
+	}
+	for cursor := base + 5; cursor <= base+7; cursor++ {
+		item, _, err := store.InboxChange(ctx, cursor)
+		if err != nil || item.State != "pending" {
+			t.Fatalf("ineligible cursor %d state=%s err=%v", cursor, item.State, err)
+		}
+	}
+	beforePulls := len(server.pullAfters)
+	if err := core.Close(); err != nil {
+		t.Fatal(err)
+	}
+	core, _, err = Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	store, _ = clientsync.NewStore(core.index)
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("restart sync=%v", err)
+	}
+	if len(server.pullAfters) <= beforePulls || server.pullAfters[beforePulls] != downloaded {
+		t.Fatalf("restart pulls=%v downloaded=%d", server.pullAfters[beforePulls:], downloaded)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Y.md")); err != nil || !bytes.Equal(got, y3) {
+		t.Fatalf("Y3=%q err=%v", got, err)
+	}
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != base {
+		t.Fatalf("restart confirmed=%d base=%d", confirmed, base)
+	}
+}
+
+func TestSyncOnceLegacyReplaySkipsAlreadyAppliedIndependentStep(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	for _, name := range []string{"X.md", "Y.md"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("initial "+name+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	x, _ := core.ReadNote(ctx, "X.md")
+	y, _ := core.ReadNote(ctx, "Y.md")
+	store, _ := clientsync.NewStore(core.index)
+	base, _ := store.ConfirmedCursor(ctx)
+	remoteBytes := func(id uuid.UUID, body string) ([]byte, []byte) {
+		doc, err := frontmatter.EnsureIdentity([]byte(body), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(doc.Markdown)
+		server.blobs[hash] = doc.Markdown
+		return doc.Markdown, hash[:]
+	}
+	xBytes, xHash := remoteBytes(x.ID, "remote X\n")
+	yBytes, yHash := remoteBytes(y.ID, "remote Y\n")
+	changes := []clientsync.Change{{Cursor: base + 1, OperationID: uuid.Must(uuid.NewV7()), ObjectID: x.ID, ObjectType: clientsync.Note, Mutation: clientsync.Update, Revision: 2, Name: "X.md", BlobHash: xHash}, {Cursor: base + 2, OperationID: uuid.Must(uuid.NewV7()), ObjectID: y.ID, ObjectType: clientsync.Note, Mutation: clientsync.Update, Revision: 2, Name: "Y.md", BlobHash: yHash}}
+	server.changes = append(server.changes, changes...)
+	if err := store.IngestPullPage(ctx, base, base+2, changes); err != nil {
+		t.Fatal(err)
+	}
+	planID := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, base+2, planID); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ExecuteActiveApplyPlan(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(root, "Y.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	folderChange := clientsync.Change{Cursor: base + 3, OperationID: uuid.Must(uuid.NewV7()), ObjectID: uuid.New(), ObjectType: clientsync.Folder, Mutation: clientsync.Create, Revision: 1, Name: "AfterReplay"}
+	server.changes = append(server.changes, folderChange)
+	server.states[folderChange.ObjectID] = folderChange
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != base {
+		t.Fatalf("confirmed before replay=%d", confirmed)
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(root, "Y.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("already-applied Y was published again")
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "X.md")); !bytes.Equal(got, xBytes) {
+		t.Fatalf("X=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "Y.md")); !bytes.Equal(got, yBytes) {
+		t.Fatalf("Y=%q", got)
+	}
+	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != base+3 {
+		t.Fatalf("confirmed after replay=%d", confirmed)
+	}
+	if info, err := os.Stat(filepath.Join(root, "AfterReplay")); err != nil || !info.IsDir() {
+		t.Fatalf("new suffix change missing: %v", err)
 	}
 }
 
