@@ -694,6 +694,256 @@ func TestFolderMutationBindingIsImmutable(t *testing.T) {
 	}
 }
 
+func inboxFolderChange(t *testing.T, cursor, revision uint64, object uuid.UUID, mutation MutationKind, name string) Change {
+	t.Helper()
+	op, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Change{Cursor: cursor, OperationID: op, ObjectID: object, Mutation: mutation, ObjectType: Folder, Revision: revision, Name: name, Deleted: mutation == Delete}
+}
+
+func TestInboxPageIngestIsAtomicReplaySafeAndPersistent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	index, err := localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewStore(index)
+	object1, object2 := uuid.New(), uuid.New()
+	first := inboxFolderChange(t, 1, 1, object1, Create, "One")
+	second := inboxFolderChange(t, 2, 1, object2, Create, "Two")
+	invalid := second
+	invalid.Name = ""
+	if err := store.IngestPullPage(ctx, 0, 2, []Change{first, invalid}); err == nil {
+		t.Fatal("invalid page accepted")
+	}
+	if cursor, err := store.DownloadedCursor(ctx); err != nil || cursor != 0 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	if _, found, err := store.InboxChange(ctx, 1); err != nil || found {
+		t.Fatalf("partial page persisted found=%t err=%v", found, err)
+	}
+	if err := store.IngestPullPage(ctx, 0, 2, []Change{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.IngestPullPage(ctx, 0, 2, []Change{first, second}); err != nil {
+		t.Fatalf("exact replay: %v", err)
+	}
+	mismatch := second
+	mismatch.Name = "Other"
+	if err := store.IngestPullPage(ctx, 0, 2, []Change{first, mismatch}); err == nil {
+		t.Fatal("mismatched replay accepted")
+	}
+	if cursor, err := store.DownloadedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("mismatch changed cursor=%d err=%v", cursor, err)
+	}
+	if stored, found, err := store.InboxChange(ctx, 2); err != nil || !found || stored.Change.Name != second.Name {
+		t.Fatalf("mismatch changed row=%#v found=%t err=%v", stored, found, err)
+	}
+	if err := store.IngestPullPage(ctx, 1, 3, []Change{second, inboxFolderChange(t, 3, 1, uuid.New(), Create, "Three")}); err == nil {
+		t.Fatal("overlapping page accepted")
+	}
+	gap1 := inboxFolderChange(t, 4, 1, uuid.New(), Create, "Gap")
+	gap2 := inboxFolderChange(t, 5, 1, uuid.New(), Create, "Gap2")
+	if err := store.IngestPullPage(ctx, 2, 4, []Change{gap1, gap2}); err == nil {
+		t.Fatal("cursor gap accepted")
+	}
+	duplicate := inboxFolderChange(t, 3, 1, uuid.New(), Create, "Duplicate")
+	duplicate.OperationID = first.OperationID
+	if err := store.IngestPullPage(ctx, 2, 3, []Change{duplicate}); err == nil {
+		t.Fatal("duplicate operation id accepted")
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	index, err = localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ = NewStore(index)
+	if cursor, err := store.DownloadedCursor(ctx); err != nil || cursor != 2 {
+		t.Fatalf("reopened cursor=%d err=%v", cursor, err)
+	}
+	pending, err := store.ListPendingInbox(ctx, 10)
+	if err != nil || len(pending) != 2 || pending[0].Change.OperationID != first.OperationID || pending[1].Change.OperationID != second.OperationID {
+		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+}
+
+func TestInboxRejectsStrictlyInvalidChangeShapes(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	valid := inboxFolderChange(t, 1, 1, uuid.New(), Create, "Folder")
+	cases := []Change{valid, valid, valid, valid, valid, valid}
+	cases[0].OperationID = uuid.New()
+	cases[1].Revision = 2
+	cases[2].Deleted = true
+	cases[3].BlobHash = make([]byte, sha256.Size)
+	cases[4].State = "pending"
+	cases[5].BlobHash = []byte{}
+	for i, change := range cases {
+		if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err == nil {
+			t.Fatalf("invalid shape %d accepted", i)
+		}
+	}
+	if cursor, err := store.DownloadedCursor(ctx); err != nil || cursor != 0 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
+	}
+	parent := uuid.New()
+	hash := sha256.Sum256([]byte("note"))
+	operation, _ := uuid.NewV7()
+	note := Change{Cursor: 1, OperationID: operation, ObjectID: uuid.New(), Mutation: Create, ObjectType: Note, Revision: 1, ParentID: &parent, Name: "Note.md", BlobHash: hash[:]}
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{note}); err != nil {
+		t.Fatalf("valid note rejected: %v", err)
+	}
+	stored, found, err := store.InboxChange(ctx, 1)
+	if err != nil || !found || !sameChangePayload(stored.Change, note) {
+		t.Fatalf("stored note=%#v found=%t err=%v", stored, found, err)
+	}
+}
+
+func TestInboxStateFrontierAndSameObjectOrdering(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	x, y := uuid.New(), uuid.New()
+	first := inboxFolderChange(t, 1, 1, x, Create, "X")
+	second := inboxFolderChange(t, 2, 1, y, Create, "Y")
+	third := inboxFolderChange(t, 3, 2, x, Move, "X2")
+	if err := store.IngestPullPage(ctx, 0, 3, []Change{first, second, third}); err != nil {
+		t.Fatal(err)
+	}
+	if earlier, err := store.HasEarlierPendingInboxForObject(ctx, x, 3); err != nil || !earlier {
+		t.Fatalf("earlier=%t err=%v", earlier, err)
+	}
+	if item, found, err := store.PendingInboxChange(ctx, 2); err != nil || !found || item.Change.OperationID != second.OperationID {
+		t.Fatalf("pending item=%#v found=%t err=%v", item, found, err)
+	}
+	if err := store.MarkInboxApplying(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.PendingInboxChange(ctx, 2); err != nil || found {
+		t.Fatalf("applying row returned pending found=%t err=%v", found, err)
+	}
+	if err := store.MarkInboxApplied(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if frontier, err := store.AdvanceConfirmedInboxCursor(ctx); err != nil || frontier != 0 {
+		t.Fatalf("frontier=%d err=%v", frontier, err)
+	}
+	if err := store.MarkInboxApplied(ctx, 1); err == nil {
+		t.Fatal("pending skipped directly to applied")
+	}
+	if err := store.MarkInboxApplying(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if earlier, err := store.HasEarlierPendingInboxForObject(ctx, x, 3); err != nil || !earlier {
+		t.Fatalf("applying earlier=%t err=%v", earlier, err)
+	}
+	if frontier, err := store.AdvanceConfirmedInboxCursor(ctx); err != nil || frontier != 0 {
+		t.Fatalf("applying frontier=%d err=%v", frontier, err)
+	}
+	if err := store.MarkInboxApplied(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if frontier, err := store.AdvanceConfirmedInboxCursor(ctx); err != nil || frontier != 2 {
+		t.Fatalf("frontier=%d err=%v", frontier, err)
+	}
+	if earlier, err := store.HasEarlierPendingInboxForObject(ctx, x, 3); err != nil || earlier {
+		t.Fatalf("applied earlier=%t err=%v", earlier, err)
+	}
+	if err := store.MarkInboxApplying(ctx, 1); err == nil {
+		t.Fatal("applied row moved backwards")
+	}
+	if err := store.MarkInboxApplying(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInboxApplied(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	if frontier, err := store.AdvanceConfirmedInboxCursor(ctx); err != nil || frontier != 3 {
+		t.Fatalf("final frontier=%d err=%v", frontier, err)
+	}
+	item, found, err := store.InboxChange(ctx, 3)
+	if err != nil || !found || item.State != "applied" || item.ApplyingAt == nil || item.AppliedAt == nil {
+		t.Fatalf("item=%#v found=%t err=%v", item, found, err)
+	}
+}
+
+func TestInboxSQLGuardsPayloadStateAndDelete(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	change := inboxFolderChange(t, 1, 1, uuid.New(), Create, "Folder")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`INSERT OR REPLACE INTO sync_inbox_changes(cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,deleted,state,ingested_at_ms) SELECT cursor,'01900000-0000-7000-8000-000000000001',object_id,mutation,object_type,revision,parent_id,'Replaced',blob_hash,deleted,state,ingested_at_ms FROM sync_inbox_changes WHERE cursor=1`,
+		`UPDATE sync_inbox_changes SET name='Changed' WHERE cursor=1`,
+		`UPDATE sync_inbox_changes SET state='applied',applying_at_ms=ingested_at_ms,applied_at_ms=ingested_at_ms WHERE cursor=1`,
+		`DELETE FROM sync_inbox_changes WHERE cursor=1`,
+	} {
+		if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { _, err := tx.Exec(statement); return err }); err == nil {
+			t.Fatalf("SQL guard accepted %q", statement)
+		}
+	}
+	if item, found, err := store.InboxChange(ctx, 1); err != nil || !found || item.Change.Name != "Folder" || item.State != "pending" {
+		t.Fatalf("item=%#v found=%t err=%v", item, found, err)
+	}
+}
+
+func TestInboxScanAndFrontierRejectCorruptStoredPayload(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	change := inboxFolderChange(t, 1, 1, uuid.New(), Create, "Folder")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DROP TRIGGER sync_inbox_payload_immutable`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE sync_inbox_changes SET mutation='update' WHERE cursor=1`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`PRAGMA ignore_check_constraints=OFF`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.InboxChange(ctx, 1); err == nil {
+		t.Fatal("corrupt inbox payload scanned")
+	}
+	if _, err := store.AdvanceConfirmedInboxCursor(ctx); err == nil {
+		t.Fatal("corrupt inbox advanced frontier")
+	}
+}
+
 func TestApplyPlanRejectsCursorGaps(t *testing.T) {
 	ctx := context.Background()
 	index, _ := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

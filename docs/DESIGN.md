@@ -587,6 +587,8 @@ Netzwerkfehler führen zur Wiederholung derselben Operations-ID.
 
 Der Client fragt Änderungen seit seinem letzten bestätigten Cursor ab. Änderungen werden in einer stabilen Reihenfolge angewendet.
 
+Schema v25 stellt zusätzlich eine dauerhafte Sync-Inbox bereit. Sie trennt `downloaded_cursor` vom bestehenden `confirmed_cursor`, nimmt ausschließlich vollständige lückenlose Pull-Seiten atomar auf, erlaubt nur payload-identischen Replay und hält pro Zeile den monotonen Zustand `pending → applying → applied`. Der Confirmed-Frontier darf nur über einen zusammenhängenden Präfix angewendeter Inbox-Zeilen fortschreiten. Diese Grundlage ist bewusst noch nicht in `LocalCore.SyncOnce` oder den Apply-Scheduler verdrahtet; der folgende Ablauf beschreibt weiterhin den aktiven Legacy-Pfad und `SYNC-012` bleibt offen.
+
 Ablauf:
 
 1. Batch laden,

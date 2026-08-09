@@ -230,8 +230,42 @@ func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
 	}
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 24 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 25 {
 		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v24.db")
+	index, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO sync_state(key,value) VALUES('confirmed_cursor','42') ON CONFLICT(key) DO UPDATE SET value='42'`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	index, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	var downloaded string
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT value FROM sync_state WHERE key='downloaded_cursor'`).Scan(&downloaded)
+	}); err != nil || downloaded != "42" {
+		t.Fatalf("downloaded=%q err=%v", downloaded, err)
 	}
 }
 
@@ -241,7 +275,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=25`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=26`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
