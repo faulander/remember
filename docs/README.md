@@ -70,5 +70,6 @@
 | [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) | Inbox-gebundene Einzelpläne für out-of-order Root-Note-Apply ohne Scheduler |
 | [0057](adr/0057-m2-root-note-out-of-order-scheduler.md) | Begrenzter out-of-order Scheduler für unabhängige Root-Note-Updates/-Deletes |
 | [0058](adr/0058-m2-authenticated-root-note-isolation.md) | Authentifizierte A/B-/Cold-C-Abnahme der Root-Note-Isolation hinter divergentem Folder-Move |
+| [0059](adr/0059-m2-inbox-plan-retry.md) | Expliziter Retry abgebrochener unveränderlicher Inbox-Pläne |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

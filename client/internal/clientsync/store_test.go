@@ -1388,6 +1388,13 @@ func TestAbandonPreparedInboxPlanRequiresPristineState(t *testing.T) {
 		if item.State != "pending" {
 			t.Fatalf("inbox=%s", item.State)
 		}
+		if err := store.RetryAbandonedInboxPlan(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+		active, err := store.ActiveApplyPlan(ctx)
+		if err != nil || active == nil || active.ID != plan || active.Status != "prepared" {
+			t.Fatalf("retried active=%#v err=%v", active, err)
+		}
 	})
 	t.Run("applying", func(t *testing.T) {
 		ctx := context.Background()

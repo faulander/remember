@@ -1,6 +1,6 @@
 # M2-Konfliktmatrix – Audit nach ADR 0051
 
-Stand: Client-Schema v26, einschließlich der in den cursor-geordneten Legacy-Apply-Pfad gespiegelten Sync-Inbox aus ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md)/[0055](adr/0055-m2-sync-inbox-mirror.md) der out-of-order Root-Note-Einzelpläne aus ADR [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) und des ersten begrenzten Schedulers aus ADR [0057](adr/0057-m2-root-note-out-of-order-scheduler.md) und seiner authentifizierten Abnahme aus ADR [0058](adr/0058-m2-authenticated-root-note-isolation.md).
+Stand: Client-Schema v27, einschließlich der in den cursor-geordneten Legacy-Apply-Pfad gespiegelten Sync-Inbox aus ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md)/[0055](adr/0055-m2-sync-inbox-mirror.md) der out-of-order Root-Note-Einzelpläne aus ADR [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) und des ersten begrenzten Schedulers aus ADR [0057](adr/0057-m2-root-note-out-of-order-scheduler.md) und seiner authentifizierten Abnahme aus ADR [0058](adr/0058-m2-authenticated-root-note-isolation.md).
 
 Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt keine ADR-Entscheidung und erklärt M2 **nicht** für abgeschlossen.
 
@@ -80,7 +80,7 @@ Relevante Anforderungen: [SYNC-002](PRD.md#sync-002--später-abgleich), [SYNC-00
 
 Priorisiert, ohne externe Zielhardware:
 
-1. Den authentifiziert abgenommenen engen Root-Note-Update/-Delete-Scheduler aus ADR 0057/0058 auf weitere beweisbar unabhängige Objektformen erweitern; terminal abgebrochene Pläne benötigen zuvor eine explizite Retry-/Operator-Regel.
+1. Den authentifiziert abgenommenen engen Root-Note-Update/-Delete-Scheduler aus ADR 0057/0058 auf weitere beweisbar unabhängige Objektformen erweitern; der technische Retry abgebrochener unveränderlicher Planlinks ist durch ADR 0059 vorhanden, eine UI-/Operator-Steuerung bleibt offen.
 2. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
 3. Für divergente Folder Move/Move-Ziele eine explizite Produktregel plus inode-/ancestry-gebundenes Journal entwerfen; bis zur Freigabe bleibt die Zelle fail-closed.
 4. Nutzer- und Betriebsalarmierung für `SYNC-013`/M2-AC-004 vervollständigen.

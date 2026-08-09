@@ -394,6 +394,31 @@ func (s *Store) AbandonPreparedInboxPlan(ctx context.Context, planID uuid.UUID) 
 	})
 }
 
+// RetryAbandonedInboxPlan returns one pristine terminal linked plan to prepared
+// after rechecking its inbox ordering and exact predecessor baseline.
+func (s *Store) RetryAbandonedInboxPlan(ctx context.Context, planID uuid.UUID) error {
+	if !validOperationID(planID) {
+		return errors.New("invalid apply plan id")
+	}
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='prepared',completed_at_ms=NULL WHERE plan_id=? AND status='failed'
+   AND EXISTS(SELECT 1 FROM sync_inbox_apply_plans l JOIN sync_inbox_changes i ON i.cursor=l.cursor JOIN apply_steps step ON step.plan_id=l.plan_id AND step.step_index=0
+    WHERE l.plan_id=apply_plans.plan_id AND i.state='pending' AND step.state='pending'
+    AND EXISTS(SELECT 1 FROM sync_baselines baseline WHERE baseline.object_id=i.object_id AND baseline.revision=i.revision-1)
+    AND NOT EXISTS(SELECT 1 FROM sync_inbox_changes earlier WHERE earlier.object_id=i.object_id AND earlier.cursor<i.cursor AND earlier.state<>'applied')
+    AND NOT EXISTS(SELECT 1 FROM apply_folder_publications f WHERE f.plan_id=apply_plans.plan_id)
+    AND NOT EXISTS(SELECT 1 FROM apply_folder_mutations m WHERE m.plan_id=apply_plans.plan_id))
+   AND NOT EXISTS(SELECT 1 FROM apply_plans active WHERE active.plan_id<>apply_plans.plan_id AND active.status IN ('prepared','applying'))`, planID.String())
+		if err != nil {
+			return err
+		}
+		if count, err := result.RowsAffected(); err != nil || count != 1 {
+			return errors.New("abandoned inbox apply plan is not retryable")
+		}
+		return nil
+	})
+}
+
 // ReconcileInboxAppliedThroughConfirmed mirrors the legacy apply frontier into
 // inbox state. It never advances confirmed_cursor. For a database with no inbox
 // history, it may seed downloaded_cursor from a newer legacy confirmed cursor.
