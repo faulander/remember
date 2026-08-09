@@ -642,6 +642,12 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 		if resolveErr != nil {
 			return step, resolveErr
 		}
+		if !resolved {
+			resolved, resolveErr = store.FolderMoveDeleteRecoveryMatches(ctx, change)
+			if resolveErr != nil {
+				return step, resolveErr
+			}
+		}
 		if resolved {
 			step.deleted, step.locallyApplied, step.conflictDeferred = true, true, true
 			return step, nil

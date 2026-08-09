@@ -14,6 +14,7 @@ import (
 	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/localindex"
+	"github.com/faulander/remember/client/internal/reconcile"
 	"github.com/faulander/remember/client/internal/remotehttp"
 	"github.com/faulander/remember/client/internal/repository"
 	"github.com/google/uuid"
@@ -2067,6 +2068,267 @@ func TestSyncOnceRejectsNonemptyFolderCreatePathCollision(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName)); err != nil {
 		t.Fatalf("conflict namespace missing: %v", err)
+	}
+}
+
+func TestSyncOnceRecoversEmptyFolderMoveAgainstRemoteDelete(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := a.index.ReadSnapshot(ctx)
+	var folderID uuid.UUID
+	for _, object := range snapshot.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "F" {
+			folderID = object.ID
+		}
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(rootA, "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	var moveCount int
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM sync_outbox WHERE object_id=? AND mutation='move' AND status='pending'`, folderID.String()).Scan(&moveCount)
+	}); err != nil || moveCount != 1 {
+		t.Fatalf("folder move outbox=%d err=%v", moveCount, err)
+	}
+	device, inode, err := repository.RootedFolderIdentity(rootB, "Local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterConflictFolderMoveDeleteReconcile = func() {
+		testHookAfterConflictFolderMoveDeleteReconcile = nil
+		panic("folder move/delete recovery crash")
+	}
+	defer func() { testHookAfterConflictFolderMoveDeleteReconcile = nil }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected move/delete recovery crash")
+			}
+		}()
+		_ = b.SyncOnce(ctx, remote)
+	}()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 4; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Local")); !os.IsNotExist(err) {
+		t.Fatalf("losing move remains: %v", err)
+	}
+	final, _ := b.index.ReadSnapshot(ctx)
+	var recovered localindex.Object
+	for _, object := range final.Objects {
+		if object.Type == localindex.ObjectFolder && strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Local (Konflikt - ") {
+			recovered = object
+		}
+	}
+	if recovered.ID == uuid.Nil || recovered.ID == folderID || recovered.FolderDevice != device || recovered.FolderInode != inode {
+		t.Fatalf("move/delete recovery=%#v", recovered)
+	}
+	state := server.states[folderID]
+	if !state.Deleted {
+		t.Fatalf("original folder not tombstoned: %#v", state)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("move/delete recovery unresolved=%t err=%v", unresolved, err)
+	}
+	var resolution string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT resolution FROM sync_conflict_resolutions WHERE operation_id=(SELECT operation_id FROM sync_outbox WHERE object_id=? AND conflict_code='object_deleted' ORDER BY sequence LIMIT 1)`, folderID.String()).Scan(&resolution)
+	}); err != nil || resolution != "folder_move_deleted_recovered" {
+		t.Fatalf("move/delete resolution=%s err=%v", resolution, err)
+	}
+	recoveredState := server.states[recovered.ID]
+	if recoveredState.ParentID == nil || *recoveredState.ParentID != clientsync.ConflictRecoveredID || recoveredState.Deleted {
+		t.Fatalf("recovered folder server=%#v", recoveredState)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for label, core := range map[string]*LocalCore{"A": a, "C": c} {
+		snap, _ := core.index.ReadSnapshot(ctx)
+		found := false
+		for _, object := range snap.Objects {
+			found = found || object.ID == recovered.ID
+		}
+		if !found {
+			t.Fatalf("%s missed recovered empty folder", label)
+		}
+	}
+}
+
+func TestSyncOnceRejectsNonemptyFolderMoveAgainstRemoteDelete(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(rootA, "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.CreateNote(ctx, "Local/N.md", "must remain\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("nonempty moved folder recovered")
+	}
+	content, err := os.ReadFile(filepath.Join(rootB, "Local", "N.md"))
+	if err != nil || !bytes.Contains(content, []byte("must remain")) {
+		t.Fatalf("nonempty move bytes=%q err=%v", content, err)
+	}
+}
+
+func TestSyncOnceRejectsLaterOperationDuringFolderMoveDeleteRecovery(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := a.index.ReadSnapshot(ctx)
+	var folderID uuid.UUID
+	for _, object := range snapshot.Objects {
+		if object.RelativePath == "F" && object.Type == localindex.ObjectFolder {
+			folderID = object.ID
+		}
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(rootA, "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := repository.RootedFolderIdentity(rootB, "Local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := uuid.Must(uuid.NewV7())
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,dependency_operation_id,status,created_at_ms) VALUES(?,'move',?,'folder',1,NULL,'Later',NULL,NULL,'pending',1)`, later.String(), folderID.String())
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`INSERT INTO sync_outbox_folder_intents(operation_id,folder_id,mutation_kind,source_relative,device,inode) VALUES(?,?,'move','Local',?,?)`, later.String(), folderID.String(), device, inode)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("later same-folder operation accepted")
+	}
+	if err := repository.VerifyRootedEmptyFolderIdentity(rootB, "Local", device, inode); err != nil {
+		t.Fatal(err)
+	}
+	targets, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "Local (Konflikt - *)"))
+	if len(targets) != 0 {
+		t.Fatalf("later-operation recovery moved folder: %v", targets)
 	}
 }
 

@@ -738,7 +738,9 @@ Umsetzung von `SYNC-008`:
 - Die konkurrierend verschobene Fassung wird unter Wiederhergestellt gerettet.
 - Für Notes sind beide Reihenfolgen crash-resumierbar umgesetzt: Ein lokaler Move gegen den Remote-Tombstone evakuiert exakte Bytes vor dem Delete-Apply; ein lokaler Delete gegen den Remote-Move rettet den kanonischen Blob und wird anschließend auf die höhere Revision rebased.
 - Technische Evakuierungen werden erst nach verifizierter sichtbarer und synchronisierter Konfliktkopie hashgebunden entfernt.
-- Bei Ordnern muss der gesamte erhaltene Teilbaum materialisiert werden, ohne bereits unabhängig gelöschte Nachfahren wiederzubeleben; diese Matrixzelle bleibt separat.
+- Ein nachweislich leerer lokaler Folder-Move gegen einen kanonischen Remote-Delete wird Inode-gebunden unter neuer UUID in Wiederhergestellt gerettet; die Original-ID bleibt tombstoned.
+- Bei nichtleeren Ordnern muss der gesamte erhaltene Teilbaum materialisiert werden, ohne bereits unabhängig gelöschte Nachfahren wiederzubeleben; diese Variante bleibt separat.
+- Die umgekehrte Richtung lokaler Folder-Delete gegen Remote-Move bleibt bis zur sicheren kanonischen Strukturpublikation fail-closed.
 
 ## 14.4 Umbenennen oder Verschieben gegen Umbenennen oder Verschieben
 
