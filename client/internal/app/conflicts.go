@@ -98,9 +98,9 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 			}
 			continue
 		}
-		equivalentRootNoteMove := m.ObjectType == clientsync.Note && m.Kind == clientsync.Move && m.ParentID == nil && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && conflict.Canonical.ParentID == nil && conflict.Canonical.Name == m.Name && conflict.Canonical.Revision > m.BaseRevision && len(conflict.Canonical.BlobHash) == sha256.Size
-		if equivalentRootNoteMove {
-			if err := c.resolveEquivalentRootNoteMove(ctx, store, conflict); err != nil {
+		equivalentNoteMove := m.ObjectType == clientsync.Note && m.Kind == clientsync.Move && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Note && !conflict.Canonical.Deleted && conflict.Canonical.Name == m.Name && conflict.Canonical.Revision > m.BaseRevision && len(conflict.Canonical.BlobHash) == sha256.Size && (m.ParentID == nil && conflict.Canonical.ParentID == nil || m.ParentID != nil && conflict.Canonical.ParentID != nil && *m.ParentID == *conflict.Canonical.ParentID)
+		if equivalentNoteMove {
+			if err := c.resolveEquivalentNoteMove(ctx, store, conflict); err != nil {
 				return err
 			}
 			continue
@@ -146,31 +146,48 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 	return nil
 }
 
-func (c *LocalCore) resolveEquivalentRootNoteMove(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+func (c *LocalCore) resolveEquivalentNoteMove(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
 	m := conflict.Outbox.Mutation
 	snapshot, err := c.index.ReadSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	var found *localindex.Object
-	for i := range snapshot.Objects {
-		object := &snapshot.Objects[i]
-		if object.ID == m.ObjectID {
-			found = object
-			break
+	objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects[object.ID] = object
+	}
+	if m.ParentID != nil {
+		parent, ok := objects[*m.ParentID]
+		if !ok || parent.Type != localindex.ObjectFolder || parent.IdentityState != localindex.IdentityKnown || parent.FolderDevice == 0 || parent.FolderInode == 0 {
+			return errors.New("equivalent note move parent identity unavailable")
+		}
+		unresolved, err := store.HasUnresolvedLocalIntent(ctx, *m.ParentID)
+		if err != nil {
+			return err
+		}
+		if unresolved {
+			return errors.New("equivalent note move parent has unresolved local intent")
+		}
+		if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
+			return err
 		}
 	}
-	if found == nil || found.Type != localindex.ObjectNote || found.RelativePath != m.Name {
+	target, err := remoteNotePath(objects, m.ParentID, m.Name)
+	if err != nil {
+		return err
+	}
+	found, ok := objects[m.ObjectID]
+	if !ok || found.Type != localindex.ObjectNote || found.RelativePath != target {
 		return errors.New("equivalent note move local target mismatch")
 	}
-	document, err := c.readNoteFileRooted(m.Name)
+	document, err := c.readNoteFileRooted(target)
 	if err != nil {
 		return err
 	}
 	if document.ID != m.ObjectID {
 		return errors.New("equivalent note move file identity mismatch")
 	}
-	return store.ResolveEquivalentRootNoteMove(ctx, m.OperationID)
+	return store.ResolveEquivalentNoteMove(ctx, m.OperationID)
 }
 
 func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {

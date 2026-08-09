@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 21
+const schemaVersion = 22
 
 //go:embed migrations/*.sql
 var migrations embed.FS

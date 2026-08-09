@@ -785,6 +785,147 @@ func TestSyncOnceResolvesEquivalentRootNoteMoves(t *testing.T) {
 	}
 }
 
+func TestSyncOnceResolvesEquivalentNonRootNoteMoves(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := a.CreateNote(ctx, "F/N.md", "nested equivalent base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for _, core := range []*LocalCore{a, b} {
+		current, err := core.ReadNote(ctx, "F/N.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.MoveNote(ctx, "F/N.md", "F/Same.md", current.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	local, err := b.ReadNote(ctx, "F/Same.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "F/Same.md", local.Revision, "nested dependent edit survives\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for label, core := range map[string]*LocalCore{"A": a, "B": b} {
+		got, err := core.ReadNote(ctx, "F/Same.md")
+		if err != nil || got.ID != doc.ID || !strings.Contains(got.Body, "nested dependent edit survives") {
+			t.Fatalf("%s nested convergence=%#v err=%v", label, got, err)
+		}
+	}
+	var resolution string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT r.resolution FROM sync_conflict_resolutions r JOIN sync_outbox o ON o.operation_id=r.operation_id WHERE o.object_id=? AND o.mutation='move' AND o.status='conflict'`, doc.ID.String()).Scan(&resolution)
+	}); err != nil || resolution != "note_move_equivalent" {
+		t.Fatalf("nested resolution=%q err=%v", resolution, err)
+	}
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ReadNote(ctx, "F/Same.md")
+	if err != nil || got.ID != doc.ID || !strings.Contains(got.Body, "nested dependent edit survives") {
+		t.Fatalf("cold C nested=%#v err=%v", got, err)
+	}
+}
+
+func TestSyncOnceRejectsEquivalentNonRootNoteMoveWithParentIntent(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := a.CreateNote(ctx, "F/N.md", "must remain\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for _, core := range []*LocalCore{a, b} {
+		current, err := core.ReadNote(ctx, "F/N.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.MoveNote(ctx, "F/N.md", "F/Same.md", current.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "LocalF")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err == nil {
+		t.Fatal("equivalent nested move resolved across parent intent")
+	}
+	got, err := b.ReadNote(ctx, "LocalF/Same.md")
+	if err != nil || got.ID != doc.ID || !strings.Contains(got.Body, "must remain") {
+		t.Fatalf("local bytes changed=%#v err=%v", got, err)
+	}
+	var count int
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM sync_conflict_resolutions r JOIN sync_outbox o ON o.operation_id=r.operation_id WHERE o.object_id=? AND r.resolution='note_move_equivalent'`, doc.ID.String()).Scan(&count)
+	}); err != nil || count != 0 {
+		t.Fatalf("unsafe resolution count=%d err=%v", count, err)
+	}
+}
+
 func TestSyncOnceMaterializesDivergentRootNoteMoves(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
