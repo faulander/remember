@@ -64,6 +64,13 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 		return result, nil
 	}
 	state := r.server.states[m.ObjectID]
+	if m.Kind == clientsync.Create && state.Revision != 0 {
+		r.server.ensureConflictNamespace()
+		canonical := &clientsync.CanonicalState{ObjectType: state.ObjectType, Revision: state.Revision, ParentID: state.ParentID, Name: state.Name, BlobHash: append([]byte(nil), state.BlobHash...), Deleted: state.Deleted}
+		result := clientsync.Result{Conflict: "object_exists", Canonical: canonical}
+		r.server.results[m.OperationID] = result
+		return result, nil
+	}
 	if m.Kind != clientsync.Create && state.Revision == 0 {
 		r.server.ensureConflictNamespace()
 		result := clientsync.Result{Conflict: "object_missing"}
@@ -190,6 +197,105 @@ func (r *memoryRemote) Pull(_ context.Context, after uint64, limit int) (remoteh
 	}
 	page.HasMore = int(page.NextCursor) < len(r.server.changes)
 	return page, nil
+}
+
+func TestSyncOnceFailsClosedForCreateObjectExists(t *testing.T) {
+	t.Run("note", func(t *testing.T) {
+		ctx := context.Background()
+		server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+		remote := &memoryRemote{server: server}
+		root := t.TempDir()
+		core, _, err := Initialize(ctx, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer core.Close()
+		note, _, err := core.CreateNote(ctx, "Local.md", "local collision bytes\n", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(filepath.Join(root, "Local.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.states[note.ID] = clientsync.Change{ObjectID: note.ID, ObjectType: clientsync.Folder, Revision: 7, Name: "CanonicalFolder"}
+		if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("object-exists note sync=%v", err)
+		}
+		after, err := os.ReadFile(filepath.Join(root, "Local.md"))
+		if err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("object-exists note changed=%t err=%v", bytes.Equal(after, before), err)
+		}
+		if state := server.states[note.ID]; state.ObjectType != clientsync.Folder || state.Revision != 7 || state.Name != "CanonicalFolder" {
+			t.Fatalf("canonical object overwritten: %#v", state)
+		}
+		assertSingleFailClosedConflict(t, ctx, core, note.ID, "object_exists", clientsync.Folder)
+		if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("object-exists note replay=%v", err)
+		}
+	})
+	t.Run("folder subtree", func(t *testing.T) {
+		ctx := context.Background()
+		server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+		remote := &memoryRemote{server: server}
+		root := t.TempDir()
+		core, _, err := Initialize(ctx, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer core.Close()
+		if _, err := core.CreateFolder(ctx, "Local"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.CreateNote(ctx, "Local/Child.md", "subtree survives\n", nil); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := core.index.ReadSnapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var folderID uuid.UUID
+		for _, object := range snapshot.Objects {
+			if object.Type == localindex.ObjectFolder && object.RelativePath == "Local" {
+				folderID = object.ID
+			}
+		}
+		if folderID == uuid.Nil {
+			t.Fatal("local folder id missing")
+		}
+		device, inode, err := repository.RootedFolderIdentity(root, "Local")
+		if err != nil {
+			t.Fatal(err)
+		}
+		childBefore, err := os.ReadFile(filepath.Join(root, "Local", "Child.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.states[folderID] = clientsync.Change{ObjectID: folderID, ObjectType: clientsync.Folder, Revision: 3, Name: "Canonical"}
+		if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("object-exists folder sync=%v", err)
+		}
+		if err := repository.VerifyRootedFolderIdentity(root, "Local", device, inode); err != nil {
+			t.Fatal(err)
+		}
+		childAfter, err := os.ReadFile(filepath.Join(root, "Local", "Child.md"))
+		if err != nil || !bytes.Equal(childAfter, childBefore) {
+			t.Fatalf("object-exists subtree changed=%t err=%v", bytes.Equal(childAfter, childBefore), err)
+		}
+		assertSingleFailClosedConflict(t, ctx, core, folderID, "object_exists", clientsync.Folder)
+		if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("object-exists folder replay=%v", err)
+		}
+	})
+}
+
+func assertSingleFailClosedConflict(t *testing.T, ctx context.Context, core *LocalCore, objectID uuid.UUID, code string, canonicalType clientsync.ObjectType) {
+	t.Helper()
+	store, _ := clientsync.NewStore(core.index)
+	conflicts, err := store.ListConflicts(ctx, 10)
+	if err != nil || len(conflicts) != 1 || conflicts[0].Outbox.Mutation.ObjectID != objectID || conflicts[0].Code != code || conflicts[0].Canonical == nil || conflicts[0].Canonical.ObjectType != canonicalType {
+		t.Fatalf("fail-closed conflicts=%#v err=%v", conflicts, err)
+	}
 }
 
 func TestSyncOnceFailsClosedForNoteToFolderTypeMismatch(t *testing.T) {

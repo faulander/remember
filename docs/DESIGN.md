@@ -706,6 +706,12 @@ Umsetzung von `SYNC-008`:
 - Note-Move rettet die lokale Zielfassung und stellt zusätzlich die authentifizierte kanonische Serverfassung an ihrem bisherigen Pfad wieder her.
 - Während der Evakuierung bleibt allgemeines Reconcile auch über Neustarts gesperrt.
 
+## 14.2.4 Create gegen bereits vorhandene UUID
+
+- `object_exists` zeigt bei Create eine beschädigte oder wiederverwendete lokale UUID an, nicht eine normale Pfadkonkurrenz.
+- Der Client bleibt vor Pull und Apply fail-closed; lokales Objekt und kanonischer Serverzustand bleiben unverändert.
+- Automatische Recovery benötigt eine neue Objekt-ID und bei nichtleeren Foldern ein vollständiges Subtree-Rekeying.
+
 ## 14.2.5 Typkonflikte
 
 - `type_mismatch` zeigt eine beschädigte oder falsch zugeordnete lokale UUID an, nicht einen regulären konkurrierenden Edit.
