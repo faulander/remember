@@ -13,7 +13,10 @@ import (
 	"testing"
 
 	clientapp "github.com/faulander/remember/client/internal/app"
+	"github.com/faulander/remember/client/internal/clientsync"
 	"github.com/faulander/remember/client/internal/frontmatter"
+	"github.com/faulander/remember/client/internal/localindex"
+	"github.com/faulander/remember/client/internal/reconcile"
 	"github.com/faulander/remember/client/internal/remotehttp"
 	"github.com/faulander/remember/server/integrationtest"
 	"github.com/google/uuid"
@@ -235,6 +238,207 @@ func TestAuthenticatedStructuralConflictsConverge(t *testing.T) {
 	}
 	_ = moveDelete
 	_ = deleteMove
+}
+
+func TestAuthenticatedPostADR44Convergence(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "post-adr44@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Post ADR A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Post ADR B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if _, err := a.CreateFolder(ctx, "FolderMoveDelete"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	states := httpSyncStates(t, ctx, remoteA)
+	var originalFolderID uuid.UUID
+	originalCount := 0
+	for id, state := range states {
+		if state.ObjectType == clientsync.Folder && state.Name == "FolderMoveDelete" && !state.Deleted {
+			originalFolderID = id
+			originalCount++
+		}
+	}
+	if originalFolderID == uuid.Nil || originalCount != 1 {
+		t.Fatalf("original folder candidates=%d id=%s", originalCount, originalFolderID)
+	}
+	if err := os.Remove(filepath.Join(rootA, "FolderMoveDelete")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	if err := os.Rename(filepath.Join(rootB, "FolderMoveDelete"), filepath.Join(rootB, "LocallyMovedFolder")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "FolderMoveDelete")
+	syncTimes(t, ctx, b, remoteB, 4)
+	syncTimes(t, ctx, a, remoteA, 2)
+	states = httpSyncStates(t, ctx, remoteA)
+	original := states[originalFolderID]
+	if !original.Deleted || original.Revision != 2 || original.Mutation != clientsync.Delete {
+		t.Fatalf("original folder tombstone=%#v", original)
+	}
+	var recoveredFolderID uuid.UUID
+	recoveredName := ""
+	recoveredCount := 0
+	for id, state := range states {
+		if state.ObjectType == clientsync.Folder && !state.Deleted && state.ParentID != nil && *state.ParentID == clientsync.ConflictRecoveredID && strings.HasPrefix(state.Name, "LocallyMovedFolder (Konflikt - ") {
+			recoveredFolderID, recoveredName = id, state.Name
+			recoveredCount++
+		}
+	}
+	if recoveredFolderID == uuid.Nil || recoveredFolderID == originalFolderID || recoveredCount != 1 {
+		t.Fatalf("recovered candidates=%d id=%s original=%s", recoveredCount, recoveredFolderID, originalFolderID)
+	}
+	for label, root := range map[string]string{"A": rootA, "B": rootB} {
+		if info, err := os.Stat(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, recoveredName)); err != nil || !info.IsDir() {
+			t.Fatalf("%s recovered folder missing: %v", label, err)
+		}
+		if _, err := os.Stat(filepath.Join(root, "LocallyMovedFolder")); !os.IsNotExist(err) {
+			t.Fatalf("%s retained losing folder: %v", label, err)
+		}
+	}
+
+	rootNote, _, err := a.CreateNote(ctx, "EquivalentRoot.md", "root equivalent base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	for _, core := range []*clientapp.LocalCore{a, b} {
+		doc, err := core.ReadNote(ctx, "EquivalentRoot.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.MoveNote(ctx, "EquivalentRoot.md", "EquivalentRootTarget.md", doc.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rootLocal, err := b.ReadNote(ctx, "EquivalentRootTarget.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "EquivalentRootTarget.md", rootLocal.Revision, "authenticated root dependent edit\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 2)
+	syncTimes(t, ctx, a, remoteA, 1)
+
+	if _, err := a.CreateFolder(ctx, "KnownParent"); err != nil {
+		t.Fatal(err)
+	}
+	nestedNote, _, err := a.CreateNote(ctx, "KnownParent/EquivalentNested.md", "nested equivalent base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	for _, core := range []*clientapp.LocalCore{a, b} {
+		doc, err := core.ReadNote(ctx, "KnownParent/EquivalentNested.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.MoveNote(ctx, "KnownParent/EquivalentNested.md", "KnownParent/EquivalentNestedTarget.md", doc.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nestedLocal, err := b.ReadNote(ctx, "KnownParent/EquivalentNestedTarget.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "KnownParent/EquivalentNestedTarget.md", nestedLocal.Revision, "authenticated nested dependent edit\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 2)
+	syncTimes(t, ctx, a, remoteA, 1)
+	if copies, _ := filepath.Glob(filepath.Join(rootB, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md")); len(copies) != 0 {
+		t.Fatalf("equivalent moves created note conflict copies: %v", copies)
+	}
+
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Post ADR C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	for label, core := range map[string]*clientapp.LocalCore{"A": a, "B": b, "C": c} {
+		rootDoc, err := core.ReadNote(ctx, "EquivalentRootTarget.md")
+		if err != nil || rootDoc.ID != rootNote.ID || rootDoc.Body != "authenticated root dependent edit\n" {
+			t.Fatalf("%s root note=%#v err=%v", label, rootDoc, err)
+		}
+		nestedDoc, err := core.ReadNote(ctx, "KnownParent/EquivalentNestedTarget.md")
+		if err != nil || nestedDoc.ID != nestedNote.ID || nestedDoc.Body != "authenticated nested dependent edit\n" {
+			t.Fatalf("%s nested note=%#v err=%v", label, nestedDoc, err)
+		}
+		if copies, _ := filepath.Glob(filepath.Join(core.Root(), clientsync.ConflictRootName, clientsync.ConflictRecoveredName, "*.md")); len(copies) != 0 {
+			t.Fatalf("%s has unnecessary note conflicts: %v", label, copies)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(rootC, clientsync.ConflictRootName, clientsync.ConflictRecoveredName, recoveredName)); err != nil || !info.IsDir() {
+		t.Fatalf("cold C recovered folder missing: %v", err)
+	}
+}
+
+func reconcileFolderMove(t *testing.T, ctx context.Context, root, source string) {
+	t.Helper()
+	index, err := localindex.Open(ctx, filepath.Join(root, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	if _, err := reconcile.Run(ctx, root, index, reconcile.Options{MoveCandidates: []string{source}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func httpSyncStates(t *testing.T, ctx context.Context, remote *remotehttp.Client) map[uuid.UUID]clientsync.Change {
+	t.Helper()
+	states := map[uuid.UUID]clientsync.Change{}
+	after := uint64(0)
+	for page := 0; page < 16; page++ {
+		result, err := remote.Pull(ctx, after, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, change := range result.Changes {
+			states[change.ObjectID] = change
+		}
+		if !result.HasMore {
+			return states
+		}
+		if result.NextCursor <= after {
+			t.Fatal("non-progressing integration pull")
+		}
+		after = result.NextCursor
+	}
+	t.Fatal("integration pull page bound exceeded")
+	return nil
 }
 
 func assertConflictContent(t *testing.T, root, needle string) {

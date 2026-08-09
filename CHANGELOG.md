@@ -61,7 +61,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Create-`object_exists` ist für Notes und nichtleere Folder-Unterbäume explizit fail-closed verifiziert; lokale und kanonische Fassungen bleiben bei Replay unverändert.
 - Divergente konkurrierende Root-Note-Moves retten die verlierende Fassung samt abhängigem Edit unter neuer UUID; äquivalente Root- und descriptor-verifizierte Nicht-Root-Ziele werden als streng gebundener No-op aufgelöst und abhängige Edits bleiben sendbar. Nicht verifizierbare Ancestry-Varianten bleiben fail-closed.
 - Nichtleere Folder-Create-Pfad-/Parent-Konflikte werden für streng manifestierte direkte, nie versuchte Note-Creates rekursionsfrei gerettet; Note-UUIDs und Bytes bleiben erhalten, Nested Folder und spätere Edits bleiben fail-closed.
-- Authentifizierte Drei-Geräte-HTTP-Konvergenz deckt beide Note-Move/Delete-Reihenfolgen und die Direct-Note-Folder-Recovery einschließlich kaltem Bootstrap ab.
+- Authentifizierte Drei-Geräte-HTTP-Konvergenz deckt beide Note-Move/Delete-Reihenfolgen, Direct-Note-Folder-Recovery, leeren Folder-Move gegen Remote-Delete und äquivalente Root-/Nested-Note-Moves einschließlich kaltem Bootstrap ab.
 - Leere lokale Folder-Moves gegen kanonische Remote-Deletes werden unter neuer UUID sichtbar gerettet; Original-ID und exakte Tombstone-Revision bleiben wirksam. Nichtleere und später weiter mutierte Varianten bleiben fail-closed.
 - Eigene akzeptierte Folder-Move/-Delete-Echos werden ausschließlich über atomar persistierte Quellpfad-/Device-/Inode-Intents als lokal ausgeführt bestätigt.
 - Mehrere Note-/Folder-Zustände derselben Pull-Seite verwenden pfadgenaue Zwischenzustände; Create→Delete-Publikationsmarker werden crash-resumierbar vom passenden Delete konsumiert.

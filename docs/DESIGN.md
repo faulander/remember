@@ -686,6 +686,7 @@ Umsetzung von `SYNC-008`:
 
 - Drei unabhängige Geräte durchlaufen über echte Login-, Blob- und Sync-HTTP-Routen beide Note-Move/Delete-Reihenfolgen sowie eine Direct-Note-Folder-Pfadkollision.
 - Ein kaltes Drittgerät muss ausschließlich aus Cursor-Historie dieselben Konfliktkopien, Tombstones, Recovery-Pfade und Note-UUIDs herstellen.
+- Die nachfolgenden Zellen werden zusätzlich gemeinsam über denselben authentifizierten Drei-Geräte-Pfad abgenommen: leerer Folder-Move gegen Remote-Delete sowie äquivalente Root- und Nested-Note-Moves mit abhängigen Edits. Dabei bleiben Original-Tombstone, neue Recovery-UUID und das Ausbleiben unnötiger Note-Konfliktkopien explizite Invarianten.
 
 ## 14.2.3.1 Lokale Folder-Mutations-Echos
 
