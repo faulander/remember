@@ -8,6 +8,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Added
 
+- ADR 0064 legt für divergente Folder Move/Move den kanonischen Serverpfad mit verlustfreier Recovery des lokalen Verlierer-Subtrees fest; Folder Delete gegen Remote-Move bleibt bis zu einer atomaren servergestützten Preserve-and-Delete-Lösung protokoll-blockiert.
 - Wails-Desktop-Client mit Go, Svelte 5, TypeScript und Vite.
 - Lokaler Markdown-Datenkern mit YAML-Frontmatter v1, UUIDv7, atomaren Schreibvorgängen und optimistischen Revisionen.
 - SQLite-Index, Scanner, Reconcile, Move-Erkennung und rekursiver Dateisystem-Watcher.
