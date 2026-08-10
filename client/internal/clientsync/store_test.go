@@ -1608,6 +1608,59 @@ func TestIntegrityIncidentsAreLinkedVisibleAndDeduplicated(t *testing.T) {
 	}
 }
 
+func TestIndependentInboxChainReselectsAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "i.db")
+	index, err := localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewStore(index)
+	x, y := uuid.New(), uuid.New()
+	changes := []Change{inboxNoteChange(t, 1, 2, x, Update, nil, "X.md"), inboxNoteChange(t, 2, 2, y, Update, nil, "Y.md"), inboxNoteChange(t, 3, 3, y, Update, nil, "Y.md")}
+	if err := store.IngestPullPage(ctx, 0, 3, changes); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, y, 1)
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 2, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkApplyStepApplied(ctx, plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	index, err = localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ = NewStore(index)
+	items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Change.Cursor != 3 || items[0].Change.ObjectID != y {
+		t.Fatalf("resumed candidates=%#v", items)
+	}
+	next := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 3, next); err != nil {
+		t.Fatal(err)
+	}
+	confirmed, err := store.ConfirmedCursor(ctx)
+	if err != nil || confirmed != 0 {
+		t.Fatalf("confirmed=%d err=%v", confirmed, err)
+	}
+}
+
 func TestIndependentInboxCandidatesExcludeUnresolvedIntentsBeforeLimit(t *testing.T) {
 	ctx := context.Background()
 	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))

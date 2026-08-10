@@ -13,7 +13,7 @@ Der begrenzte Scheduler lädt nach jedem Fortschritt erneut höchstens 1000 Kand
 
 ## Verifikation
 
-Der Scheduler-Test nimmt eine Update-Kette Y@2→Y@3 hinter einer ungelösten X-Zeile auf, prüft beide Inbox-Zeilen als `applied`, die exakten finalen Y@3-Bytes, den weiterhin blockierten Confirmed-Frontier sowie nach Neustart unveränderten Inode und Änderungszeitpunkt.
+Der Scheduler-Test nimmt eine Update-Kette Y@2→Y@3 hinter einer ungelösten X-Zeile auf, prüft beide Inbox-Zeilen als `applied`, die exakten finalen Y@3-Bytes, den weiterhin blockierten Confirmed-Frontier sowie nach Neustart unveränderten Inode und Änderungszeitpunkt. `TestIndependentInboxChainReselectsAfterReopen` unterbricht zusätzlich exakt nach dem dauerhaften Abschluss von Y@2, öffnet den Index neu und bindet erst dann Y@3 bei weiterhin blockiertem Präfix.
 
 ## Folgen
 
