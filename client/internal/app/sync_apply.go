@@ -30,6 +30,15 @@ var testHookBeforeFolderPublication func()
 var testHookAfterFolderReconcile func()
 var testHookAfterFolderMutationPublication func() error
 
+type applyIntegrityError struct {
+	change clientsync.Change
+	code   string
+	cause  error
+}
+
+func (e *applyIntegrityError) Error() string { return e.cause.Error() }
+func (e *applyIntegrityError) Unwrap() error { return e.cause }
+
 type preparedNoteStep struct {
 	index             int
 	change            clientsync.Change
@@ -80,6 +89,14 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 	}
 	steps, err := c.preflightNotePlan(ctx, plan, resolver)
 	if err != nil {
+		var incident *applyIntegrityError
+		if errors.As(err, &incident) {
+			var hash [sha256.Size]byte
+			copy(hash[:], incident.change.BlobHash)
+			if recordErr := store.RecordIntegrityIncident(ctx, plan.ID, incident.change.Cursor, incident.change.ObjectID, hash, incident.code); recordErr != nil {
+				return fmt.Errorf("record integrity incident: %w", recordErr)
+			}
+		}
 		return err
 	}
 	if err := store.BeginApplyPlan(ctx, plan.ID); err != nil {
@@ -246,10 +263,14 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 		copy(hash[:], change.BlobHash)
 		blob, err := resolver.ResolveBlob(ctx, hash)
 		if err != nil {
-			return nil, fmt.Errorf("resolve remote blob: %w", err)
+			wrapped := fmt.Errorf("resolve remote blob: %w", err)
+			if errors.Is(err, clientsync.ErrBlobMissing) {
+				return nil, &applyIntegrityError{change: change, code: "missing_blob", cause: wrapped}
+			}
+			return nil, wrapped
 		}
 		if int64(len(blob)) > clientsync.MaxBlobBytes || sha256.Sum256(blob) != hash {
-			return nil, errors.New("remote blob failed size or hash validation")
+			return nil, &applyIntegrityError{change: change, code: "hash_mismatch", cause: errors.New("remote blob failed size or hash validation")}
 		}
 		inspection, err := frontmatter.Inspect(blob)
 		if err != nil || !inspection.HasRemember || inspection.NoteID != change.ObjectID {

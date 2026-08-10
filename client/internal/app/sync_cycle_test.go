@@ -4195,7 +4195,7 @@ func (r *cycleRemote) ResolveBlob(_ context.Context, h [32]byte) ([]byte, error)
 	r.events = append(r.events, "get")
 	b, ok := r.blobs[h]
 	if !ok {
-		return nil, errors.New("missing blob")
+		return nil, clientsync.ErrBlobMissing
 	}
 	return b, nil
 }
@@ -4600,6 +4600,25 @@ func TestSyncOnceDoesNotAdvanceCursorWhenRemoteApplyFails(t *testing.T) {
 	}
 	if inbox, found, err := store.InboxChange(ctx, 1); err != nil || !found || inbox.State != "pending" {
 		t.Fatalf("inbox=%#v found=%t err=%v", inbox, found, err)
+	}
+	incidents, err := core.IntegrityIncidents(ctx, 10)
+	if err != nil || len(incidents) != 1 || incidents[0].Code != "hash_mismatch" || incidents[0].ObjectID != object {
+		t.Fatalf("hash incidents=%#v err=%v", incidents, err)
+	}
+	delete(remote.blobs, hash)
+	if err := core.SyncOnce(ctx, remote); !errors.Is(err, clientsync.ErrBlobMissing) {
+		t.Fatalf("missing blob retry=%v", err)
+	}
+	incidents, err = store.ListOpenIntegrityIncidents(ctx, 10)
+	if err != nil || len(incidents) != 2 {
+		t.Fatalf("missing incidents=%#v err=%v", incidents, err)
+	}
+	codes := map[string]bool{}
+	for _, incident := range incidents {
+		codes[incident.Code] = true
+	}
+	if !codes["missing_blob"] || !codes["hash_mismatch"] {
+		t.Fatalf("incident codes=%v", codes)
 	}
 	if _, err := os.Stat(filepath.Join(root, "Remote.md")); !os.IsNotExist(err) {
 		t.Fatalf("remote file=%v", err)

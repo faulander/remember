@@ -574,7 +574,9 @@ func stateFromCore(ctx context.Context, core *coreapp.LocalCore, report reconcil
 		Objects: make([]ObjectView, 0, len(snapshot.Objects)),
 		Issues:  make([]IssueView, 0, len(snapshot.Issues)),
 	}
+	objectPaths := make(map[string]string, len(snapshot.Objects))
 	for _, object := range snapshot.Objects {
+		objectPaths[object.ID.String()] = object.RelativePath
 		view := objectView(object)
 		if object.Type == localindex.ObjectNote {
 			if document, readErr := core.ReadNote(ctx, object.RelativePath); readErr == nil {
@@ -588,9 +590,16 @@ func stateFromCore(ctx context.Context, core *coreapp.LocalCore, report reconcil
 		state.Objects = append(state.Objects, view)
 	}
 	for _, issue := range snapshot.Issues {
-		state.Issues = append(state.Issues, IssueView{
-			Code: issue.Code, RelativePath: issue.RelativePath, Detail: issue.Detail,
-		})
+		state.Issues = append(state.Issues, IssueView{Code: issue.Code, RelativePath: issue.RelativePath, Detail: issue.Detail})
+	}
+	incidents, err := core.IntegrityIncidents(ctx, 100)
+	if err != nil {
+		return ClientState{}, err
+	}
+	for _, incident := range incidents {
+		code := "sync_" + incident.Code
+		detail := "Synchronisierter Inhalt fehlt oder stimmt nicht mit seinem Hash überein."
+		state.Issues = append(state.Issues, IssueView{Code: code, RelativePath: objectPaths[incident.ObjectID.String()], Detail: detail})
 	}
 	sort.Slice(state.Objects, func(i, j int) bool { return state.Objects[i].RelativePath < state.Objects[j].RelativePath })
 	sort.Slice(state.Issues, func(i, j int) bool {

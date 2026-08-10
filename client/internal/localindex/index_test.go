@@ -230,7 +230,7 @@ func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
 	}
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 28 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 29 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
@@ -246,7 +246,7 @@ func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
 		if _, err := tx.Exec(`INSERT INTO sync_state(key,value) VALUES('confirmed_cursor','42') ON CONFLICT(key) DO UPDATE SET value='42'`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
+		if _, err := tx.Exec(`DROP TRIGGER sync_integrity_incident_insert_guard; DROP TRIGGER sync_integrity_incident_binding_immutable; DROP TRIGGER sync_integrity_incident_progress_guard; DROP TRIGGER sync_integrity_incident_no_delete; DROP TRIGGER sync_integrity_incident_step_binding_immutable; DROP TRIGGER sync_integrity_incident_step_no_delete; DROP TABLE sync_integrity_incidents; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
 			return err
 		}
 		return nil
@@ -277,7 +277,7 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; PRAGMA user_version=25`); err != nil {
+		if _, err := tx.Exec(`DROP TRIGGER sync_integrity_incident_insert_guard; DROP TRIGGER sync_integrity_incident_binding_immutable; DROP TRIGGER sync_integrity_incident_progress_guard; DROP TRIGGER sync_integrity_incident_no_delete; DROP TRIGGER sync_integrity_incident_step_binding_immutable; DROP TRIGGER sync_integrity_incident_step_no_delete; DROP TABLE sync_integrity_incidents; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; PRAGMA user_version=25`); err != nil {
 			return err
 		}
 		return nil
@@ -293,7 +293,7 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 	}
 	defer index.Close()
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 28 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 29 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
@@ -310,7 +310,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=29`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=30`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

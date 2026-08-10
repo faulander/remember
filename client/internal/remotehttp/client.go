@@ -157,7 +157,12 @@ func (c *Client) ResolveBlob(ctx context.Context, hash [32]byte) ([]byte, error)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, classify(resp)
+		err := classify(resp)
+		var rejected *RejectedError
+		if errors.As(err, &rejected) && rejected.Code == "blob_not_found" {
+			return nil, clientsync.ErrBlobMissing
+		}
+		return nil, err
 	}
 	values := resp.Header.Values("Content-Type")
 	if len(values) != 1 {

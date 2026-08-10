@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 28
+const schemaVersion = 29
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -108,6 +108,7 @@ func (i *Index) WithTransaction(ctx context.Context, fn func(*sql.Tx) error) err
 func (i *Index) initialize(ctx context.Context) error {
 	for _, pragma := range []string{
 		"PRAGMA foreign_keys = ON",
+		"PRAGMA recursive_triggers = ON",
 		"PRAGMA busy_timeout = 5000",
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = FULL",

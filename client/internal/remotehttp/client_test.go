@@ -86,6 +86,22 @@ func TestClientSubmitPullAndBlobContracts(t *testing.T) {
 	}
 }
 
+func TestResolveBlobClassifiesMissingReference(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"blob_not_found"}`))
+	}))
+	defer server.Close()
+	client, err := New(server.URL, nil, tokenSource())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ResolveBlob(context.Background(), sha256.Sum256([]byte("missing"))); !errors.Is(err, clientsync.ErrBlobMissing) {
+		t.Fatalf("missing err=%v", err)
+	}
+}
+
 func TestClientRefusesRedirectDuplicateJSONAndNonTLSRemote(t *testing.T) {
 	if _, err := New("http://example.com", nil, tokenSource()); err == nil {
 		t.Fatal("non-TLS accepted")

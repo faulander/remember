@@ -1544,6 +1544,70 @@ func TestStageNoteExactBytesDedupeSizeAndSymlink(t *testing.T) {
 		t.Fatalf("large error=%v", err)
 	}
 }
+func TestIntegrityIncidentsAreLinkedVisibleAndDeduplicated(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	id := uuid.New()
+	change := inboxNoteChange(t, 1, 2, id, Update, nil, "N.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	putInboxBaseline(t, index, id, 1)
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	var hash [32]byte
+	copy(hash[:], change.BlobHash)
+	for range 2 {
+		if err := store.RecordIntegrityIncident(ctx, plan, 1, id, hash, "missing_blob"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO sync_integrity_incidents(plan_id,cursor,object_id,blob_hash,code,first_detected_at_ms,last_detected_at_ms,occurrence_count) VALUES(?,?,?,?, 'hash_mismatch',1,1,1)`, plan.String(), 1, uuid.New().String(), hash[:])
+		return err
+	}); err == nil {
+		t.Fatal("spoofed integrity binding accepted")
+	}
+	items, err := store.ListOpenIntegrityIncidents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].PlanID != plan || items[0].ObjectID != id || items[0].Code != "missing_blob" || items[0].OccurrenceCount != 2 || items[0].BlobHash != hash {
+		t.Fatalf("incidents=%#v", items)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_integrity_incidents SET object_id=? WHERE incident_id=?`, uuid.New().String(), items[0].ID)
+		return err
+	}); err == nil {
+		t.Fatal("incident binding mutated")
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM sync_integrity_incidents WHERE incident_id=?`, items[0].ID)
+		return err
+	}); err == nil {
+		t.Fatal("incident deleted")
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT OR REPLACE INTO sync_integrity_incidents(incident_id,plan_id,cursor,object_id,blob_hash,code,first_detected_at_ms,last_detected_at_ms,occurrence_count) VALUES(?,?,?,?,?,?,1,1,1)`, items[0].ID, plan.String(), 1, id.String(), hash[:], "missing_blob")
+		return err
+	}); err == nil {
+		t.Fatal("incident replaced")
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM apply_steps WHERE plan_id=?`, plan.String())
+		return err
+	}); err == nil {
+		t.Fatal("incident-linked step deleted")
+	}
+}
+
 func TestIndependentInboxCandidatesExcludeUnresolvedIntentsBeforeLimit(t *testing.T) {
 	ctx := context.Background()
 	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
