@@ -1544,6 +1544,58 @@ func TestStageNoteExactBytesDedupeSizeAndSymlink(t *testing.T) {
 		t.Fatalf("large error=%v", err)
 	}
 }
+func TestIndependentInboxCandidatesExcludeUnresolvedIntentsBeforeLimit(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	const blocked = 1000
+	changes := make([]Change, 0, blocked+1)
+	ids := make([]uuid.UUID, 0, blocked+1)
+	for cursor := 1; cursor <= blocked+1; cursor++ {
+		id := uuid.New()
+		ids = append(ids, id)
+		changes = append(changes, inboxNoteChange(t, uint64(cursor), 2, id, Update, nil, "N.md"))
+	}
+	if err := store.IngestPullPage(ctx, 0, blocked+1, changes); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		for i, id := range ids {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO sync_baselines(object_id,revision) VALUES(?,1)`, id.String()); err != nil {
+				return err
+			}
+			if i < blocked {
+				hash := make([]byte, 32)
+				hash[0] = byte(i)
+				if _, err := tx.ExecContext(ctx, `INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,name,blob_hash,status,created_at_ms) VALUES(?,'update',?,'note',1,'',?,'pending',1)`, uuid.Must(uuid.NewV7()).String(), id.String(), hash); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateInboxApplyPlan(ctx, 1, uuid.Must(uuid.NewV7())); err == nil {
+		t.Fatal("linked plan accepted unresolved local intent")
+	}
+	items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Change.ObjectID != ids[blocked] {
+		t.Fatalf("candidates=%d", len(items))
+	}
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, items[0].Change.Cursor, plan); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func fmtHash(hash [32]byte) string { return fmt.Sprintf("%x", hash[:]) }
 
 func setBootstrap(t *testing.T, index *localindex.Index) {

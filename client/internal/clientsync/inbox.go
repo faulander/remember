@@ -233,7 +233,7 @@ func (s *Store) ListIndependentInboxCandidates(ctx context.Context, limit int) (
 	}
 	var items []InboxItem
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes i WHERE i.state='pending' AND i.object_type='note' AND i.parent_id IS NULL AND i.mutation IN ('update','delete') AND EXISTS(SELECT 1 FROM sync_baselines b WHERE b.object_id=i.object_id AND b.revision=i.revision-1) AND NOT EXISTS(SELECT 1 FROM sync_inbox_changes earlier WHERE earlier.object_id=i.object_id AND earlier.cursor<i.cursor AND earlier.state<>'applied') ORDER BY i.cursor LIMIT ?`, limit)
+		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes i WHERE i.state='pending' AND i.object_type='note' AND i.parent_id IS NULL AND i.mutation IN ('update','delete') AND EXISTS(SELECT 1 FROM sync_baselines b WHERE b.object_id=i.object_id AND b.revision=i.revision-1) AND NOT EXISTS(SELECT 1 FROM sync_inbox_changes earlier WHERE earlier.object_id=i.object_id AND earlier.cursor<i.cursor AND earlier.state<>'applied') AND NOT EXISTS(SELECT 1 FROM sync_unresolved_local_intents unresolved WHERE unresolved.object_id=i.object_id) ORDER BY i.cursor LIMIT ?`, limit)
 		if err != nil {
 			return err
 		}
@@ -333,6 +333,13 @@ func (s *Store) CreateInboxApplyPlan(ctx context.Context, cursor uint64, planID 
 		if earlier != 0 {
 			return errors.New("earlier inbox change for object is not applied")
 		}
+		var unresolved int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_unresolved_local_intents WHERE object_id=?)`, item.Change.ObjectID.String()).Scan(&unresolved); err != nil {
+			return err
+		}
+		if unresolved != 0 {
+			return errors.New("inbox object has unresolved local intent")
+		}
 		var baseline uint64
 		if err := tx.QueryRowContext(ctx, `SELECT revision FROM sync_baselines WHERE object_id=?`, item.Change.ObjectID.String()).Scan(&baseline); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -406,6 +413,7 @@ func (s *Store) RetryAbandonedInboxPlan(ctx context.Context, planID uuid.UUID) e
     WHERE l.plan_id=apply_plans.plan_id AND i.state='pending' AND step.state='pending'
     AND EXISTS(SELECT 1 FROM sync_baselines baseline WHERE baseline.object_id=i.object_id AND baseline.revision=i.revision-1)
     AND NOT EXISTS(SELECT 1 FROM sync_inbox_changes earlier WHERE earlier.object_id=i.object_id AND earlier.cursor<i.cursor AND earlier.state<>'applied')
+    AND NOT EXISTS(SELECT 1 FROM sync_unresolved_local_intents unresolved WHERE unresolved.object_id=i.object_id)
     AND NOT EXISTS(SELECT 1 FROM apply_folder_publications f WHERE f.plan_id=apply_plans.plan_id)
     AND NOT EXISTS(SELECT 1 FROM apply_folder_mutations m WHERE m.plan_id=apply_plans.plan_id))
    AND NOT EXISTS(SELECT 1 FROM apply_plans active WHERE active.plan_id<>apply_plans.plan_id AND active.status IN ('prepared','applying'))`, planID.String())

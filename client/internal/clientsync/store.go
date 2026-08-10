@@ -633,7 +633,7 @@ func (s *Store) HasUnresolvedLocalIntent(ctx context.Context, objectID uuid.UUID
 	}
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE object_id=? AND ((status IN ('pending','attempted','replay_mismatch') AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_note_members n JOIN conflict_folder_create_recoveries f ON f.operation_id=n.operation_id WHERE n.old_operation_id=o.operation_id AND f.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_move_delete_note_members n JOIN conflict_folder_move_delete_recoveries d ON d.operation_id=n.operation_id WHERE n.old_operation_id=o.operation_id AND d.state IN ('moved','completed'))) OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_recoveries f WHERE f.operation_id=o.operation_id AND f.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_move_delete_recoveries d WHERE d.operation_id=o.operation_id AND d.state IN ('moved','completed')))))`, objectID.String()).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_unresolved_local_intents WHERE object_id=?)`, objectID.String()).Scan(&exists)
 	})
 	return exists != 0, err
 }

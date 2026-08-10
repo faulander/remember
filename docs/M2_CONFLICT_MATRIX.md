@@ -1,6 +1,6 @@
 # M2-Konfliktmatrix – Audit nach ADR 0051
 
-Stand: Client-Schema v27, einschließlich der in den cursor-geordneten Legacy-Apply-Pfad gespiegelten Sync-Inbox aus ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md)/[0055](adr/0055-m2-sync-inbox-mirror.md) der out-of-order Root-Note-Einzelpläne aus ADR [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) und des ersten begrenzten Schedulers aus ADR [0057](adr/0057-m2-root-note-out-of-order-scheduler.md) und seiner authentifizierten Abnahme aus ADR [0058](adr/0058-m2-authenticated-root-note-isolation.md).
+Stand: Client-Schema v28, einschließlich der in den cursor-geordneten Legacy-Apply-Pfad gespiegelten Sync-Inbox aus ADR [0054](adr/0054-m2-durable-sync-inbox-foundation.md)/[0055](adr/0055-m2-sync-inbox-mirror.md) der out-of-order Root-Note-Einzelpläne aus ADR [0056](adr/0056-m2-inbox-linked-out-of-order-apply-plans.md) und des ersten begrenzten Schedulers aus ADR [0057](adr/0057-m2-root-note-out-of-order-scheduler.md) und seiner authentifizierten Abnahme aus ADR [0058](adr/0058-m2-authenticated-root-note-isolation.md).
 
 Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt keine ADR-Entscheidung und erklärt M2 **nicht** für abgeschlossen.
 
