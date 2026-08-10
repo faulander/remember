@@ -176,8 +176,11 @@ func (c *Client) ResolveBlob(ctx context.Context, hash [32]byte) ([]byte, error)
 		return nil, ErrInvalidResponse
 	}
 	content, err := io.ReadAll(io.LimitReader(resp.Body, clientsync.MaxBlobBytes+1))
-	if err != nil || int64(len(content)) > clientsync.MaxBlobBytes || int64(len(content)) != resp.ContentLength || sha256.Sum256(content) != hash {
+	if err != nil || int64(len(content)) > clientsync.MaxBlobBytes || int64(len(content)) != resp.ContentLength {
 		return nil, ErrInvalidResponse
+	}
+	if sha256.Sum256(content) != hash {
+		return nil, clientsync.ErrBlobHashMismatch
 	}
 	return content, nil
 }

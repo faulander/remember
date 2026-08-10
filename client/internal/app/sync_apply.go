@@ -267,6 +267,9 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 			if errors.Is(err, clientsync.ErrBlobMissing) {
 				return nil, &applyIntegrityError{change: change, code: "missing_blob", cause: wrapped}
 			}
+			if errors.Is(err, clientsync.ErrBlobHashMismatch) {
+				return nil, &applyIntegrityError{change: change, code: "hash_mismatch", cause: wrapped}
+			}
 			return nil, wrapped
 		}
 		if int64(len(blob)) > clientsync.MaxBlobBytes || sha256.Sum256(blob) != hash {

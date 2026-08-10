@@ -11,6 +11,7 @@ import (
 )
 
 var ErrBlobMissing = errors.New("referenced remote blob is missing")
+var ErrBlobHashMismatch = errors.New("remote blob hash mismatch")
 
 type IntegrityIncident struct {
 	ID              int64

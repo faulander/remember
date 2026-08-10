@@ -74,5 +74,6 @@
 | [0060](adr/0060-m2-ordered-independent-note-chains.md) | Geordnete unabhängige Root-Note-Revisionsketten im begrenzten Scheduler |
 | [0061](adr/0061-m2-starvation-free-root-note-selection.md) | Starvation-freie Root-Note-Auswahl vor der Kandidatenbegrenzung |
 | [0062](adr/0062-m2-durable-integrity-alarms.md) | Dauerhafte sichtbare Alarme für fehlende oder hashinkonsistente Apply-Blobs |
+| [0063](adr/0063-m2-authenticated-integrity-alarm-recovery.md) | Authentifizierte Alarm-, Restart- und Recovery-Abnahme für Apply-Blobs |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -8,9 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	clientapp "github.com/faulander/remember/client/internal/app"
@@ -90,6 +94,169 @@ func syncTimes(t *testing.T, ctx context.Context, core *clientapp.LocalCore, rem
 		if err := core.SyncOnce(ctx, remote); err != nil {
 			t.Fatalf("sync %d/%d: %v", i+1, count, err)
 		}
+	}
+}
+
+func TestAuthenticatedBlobIntegrityAlarmsResumeAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "integrity@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Integrity A"))
+	rootA := t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	note, _, err := a.CreateNote(ctx, "Alarm.md", "exact alarm bytes\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	expected, err := os.ReadFile(filepath.Join(rootA, "Alarm.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse(server.URL)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var mode atomic.Int32
+	fault := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/blobs/") {
+			switch mode.Load() {
+			case 0:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":"blob_not_found"}`))
+				return
+			case 1:
+				wrong := []byte("wrong authenticated blob")
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", fmt.Sprint(len(wrong)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(wrong)
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer fault.Close()
+	remoteB := remote(t, fault.URL, login(t, server.URL, email, password, "Integrity B"))
+	rootB := t.TempDir()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remoteB); !errors.Is(err, clientsync.ErrBlobMissing) {
+		t.Fatalf("missing sync=%v", err)
+	}
+	incidents, err := b.IntegrityIncidents(ctx, 10)
+	if err != nil || len(incidents) != 1 || incidents[0].Code != "missing_blob" || incidents[0].ObjectID != note.ID || incidents[0].OccurrenceCount != 1 {
+		t.Fatalf("missing incidents=%#v err=%v", incidents, err)
+	}
+	index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(index)
+	confirmed, _ := store.ConfirmedCursor(ctx)
+	downloaded, _ := store.DownloadedCursor(ctx)
+	active, _ := store.ActiveApplyPlan(ctx)
+	index.Close()
+	if confirmed >= downloaded || active == nil {
+		t.Fatalf("frontiers confirmed/downloaded=%d/%d active=%#v", confirmed, downloaded, active)
+	}
+	planID := active.ID
+	if _, err := os.Stat(filepath.Join(rootB, "Alarm.md")); !os.IsNotExist(err) {
+		t.Fatalf("alarm note published: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = clientapp.Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remoteB); !errors.Is(err, clientsync.ErrBlobMissing) {
+		t.Fatalf("restart missing sync=%v", err)
+	}
+	incidents, err = b.IntegrityIncidents(ctx, 10)
+	if err != nil || len(incidents) != 1 || incidents[0].OccurrenceCount != 2 {
+		t.Fatalf("deduplicated incidents=%#v err=%v", incidents, err)
+	}
+	assertBlocked := func(stage string) {
+		t.Helper()
+		index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := clientsync.NewStore(index)
+		if err != nil {
+			index.Close()
+			t.Fatal(err)
+		}
+		confirmed, err := store.ConfirmedCursor(ctx)
+		if err != nil {
+			index.Close()
+			t.Fatal(err)
+		}
+		downloaded, err := store.DownloadedCursor(ctx)
+		if err != nil {
+			index.Close()
+			t.Fatal(err)
+		}
+		active, err := store.ActiveApplyPlan(ctx)
+		if err != nil {
+			index.Close()
+			t.Fatal(err)
+		}
+		if err := index.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if confirmed >= downloaded || active == nil || active.ID != planID {
+			t.Fatalf("%s frontiers=%d/%d active=%#v want plan=%s", stage, confirmed, downloaded, active, planID)
+		}
+		if _, err := os.Stat(filepath.Join(rootB, "Alarm.md")); !os.IsNotExist(err) {
+			t.Fatalf("%s alarm note published: %v", stage, err)
+		}
+	}
+	assertBlocked("restart missing")
+	mode.Store(1)
+	if err := b.SyncOnce(ctx, remoteB); !errors.Is(err, clientsync.ErrBlobHashMismatch) {
+		t.Fatalf("corrupt sync=%v", err)
+	}
+	incidents, _ = b.IntegrityIncidents(ctx, 10)
+	codes := map[string]clientsync.IntegrityIncident{}
+	for _, incident := range incidents {
+		codes[incident.Code] = incident
+	}
+	if len(codes) != 2 || codes["hash_mismatch"].ObjectID != note.ID {
+		t.Fatalf("corrupt incidents=%#v", incidents)
+	}
+	assertBlocked("hash mismatch")
+	mode.Store(2)
+	if err := b.SyncOnce(ctx, remoteB); err != nil {
+		t.Fatal(err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, b, "Alarm.md", expected, note.ID)
+	index, err = localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ = clientsync.NewStore(index)
+	finalConfirmed, _ := store.ConfirmedCursor(ctx)
+	finalDownloaded, _ := store.DownloadedCursor(ctx)
+	active, _ = store.ActiveApplyPlan(ctx)
+	index.Close()
+	if finalConfirmed != finalDownloaded || active != nil {
+		t.Fatalf("final frontiers=%d/%d active=%#v", finalConfirmed, finalDownloaded, active)
 	}
 }
 
