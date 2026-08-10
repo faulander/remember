@@ -270,42 +270,49 @@ func (c *LocalCore) ingestPullWhileOutboundBlocked(ctx context.Context, store *c
 }
 
 func (c *LocalCore) drainIndependentInbox(ctx context.Context, store *clientsync.Store, remote SyncRemote) error {
-	candidates, err := store.ListIndependentInboxCandidates(ctx, maxIndependentInboxScan)
-	if err != nil {
-		return err
-	}
 	applied := 0
-	for _, candidate := range candidates {
-		if applied >= maxIndependentInboxApplies {
+	for applied < maxIndependentInboxApplies {
+		candidates, err := store.ListIndependentInboxCandidates(ctx, maxIndependentInboxScan)
+		if err != nil {
+			return err
+		}
+		progressed := false
+		for _, candidate := range candidates {
+			if applied >= maxIndependentInboxApplies {
+				break
+			}
+			unresolved, err := store.HasUnresolvedLocalIntent(ctx, candidate.Change.ObjectID)
+			if err != nil {
+				return err
+			}
+			if unresolved {
+				continue
+			}
+			planID, err := uuid.NewV7()
+			if err != nil {
+				return fmt.Errorf("generate independent apply plan id: %w", err)
+			}
+			if err := store.CreateInboxApplyPlan(ctx, candidate.Change.Cursor, planID); err != nil {
+				return err
+			}
+			if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
+				return err
+			}
+			if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
+				return err
+			}
+			if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
+				return err
+			}
+			if err := c.cleanupCompletedOutboxBlobs(ctx, store); err != nil {
+				return err
+			}
+			applied++
+			progressed = true
+		}
+		if !progressed {
 			break
 		}
-		unresolved, err := store.HasUnresolvedLocalIntent(ctx, candidate.Change.ObjectID)
-		if err != nil {
-			return err
-		}
-		if unresolved {
-			continue
-		}
-		planID, err := uuid.NewV7()
-		if err != nil {
-			return fmt.Errorf("generate independent apply plan id: %w", err)
-		}
-		if err := store.CreateInboxApplyPlan(ctx, candidate.Change.Cursor, planID); err != nil {
-			return err
-		}
-		if err := c.executeActiveApplyPlanLocked(ctx, remote); err != nil {
-			return err
-		}
-		if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
-			return err
-		}
-		if err := c.publishStagedConflicts(ctx, store, remote); err != nil {
-			return err
-		}
-		if err := c.cleanupCompletedOutboxBlobs(ctx, store); err != nil {
-			return err
-		}
-		applied++
 	}
 	return nil
 }

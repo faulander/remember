@@ -80,7 +80,7 @@ Relevante Anforderungen: [SYNC-002](PRD.md#sync-002--später-abgleich), [SYNC-00
 
 Priorisiert, ohne externe Zielhardware:
 
-1. Den authentifiziert abgenommenen engen Root-Note-Update/-Delete-Scheduler aus ADR 0057/0058 auf weitere beweisbar unabhängige Objektformen erweitern; der technische Retry abgebrochener unveränderlicher Planlinks ist durch ADR 0059 vorhanden, eine UI-/Operator-Steuerung bleibt offen.
+1. Den authentifiziert abgenommenen engen Scheduler für lineare Root-Note-Update/-Delete-Ketten aus ADR 0057/0058 auf weitere beweisbar unabhängige Objektformen erweitern; der technische Retry abgebrochener unveränderlicher Planlinks ist durch ADR 0059 vorhanden, eine UI-/Operator-Steuerung bleibt offen.
 2. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
 3. Für divergente Folder Move/Move-Ziele eine explizite Produktregel plus inode-/ancestry-gebundenes Journal entwerfen; bis zur Freigabe bleibt die Zelle fail-closed.
 4. Nutzer- und Betriebsalarmierung für `SYNC-013`/M2-AC-004 vervollständigen.

@@ -20,7 +20,7 @@ Nur wenn nach dem vollständigen normalen Outbox-Submit weiterhin ein ungelöste
 6. `confirmed_cursor` rückt weiterhin nur über den zusammenhängenden applied-Präfix vor. Nach der begrenzten unabhängigen Arbeit bleibt `ErrUnresolvedOutbound` das sichtbare Ergebnis.
 7. Sobald kein ungelöster Outbox-Zustand mehr existiert, bleibt der bisherige cursor-geordnete Legacy-Pfad maßgeblich. Replay-Seiten werden bis zum bereits dauerhaften `downloaded_cursor` begrenzt, damit keine Seite gespeicherten und neuen Verlauf mischt; bereits out-of-order angewendete Revisionen werden dort als applied geplant und nicht erneut im Dateisystem veröffentlicht.
 
-Creates, Moves, Nested Notes und sämtliche Folder-Änderungen sind ausdrücklich ausgeschlossen. Spätere Revisionen desselben Objekts werden nicht in demselben Kandidatensnapshot nachgezogen.
+Creates, Moves, Nested Notes und sämtliche Folder-Änderungen sind ausdrücklich ausgeschlossen. Spätere Revisionen desselben Objekts werden nicht in demselben Kandidatensnapshot nachgezogen. ADR 0060 ergänzt später eine erneute Kandidatenauswahl nach jedem Fortschritt, sodass lineare Folgerevisionen bei nun exakter Baseline noch im selben begrenzten Zyklus laufen dürfen.
 
 ## Folgen
 

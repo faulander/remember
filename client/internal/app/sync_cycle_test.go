@@ -4356,7 +4356,7 @@ func TestSyncOnceAppliesIndependentRootNotesBehindUnresolvedIntent(t *testing.T)
 	}
 	xBytes, xHash := makeBytes(x.ID, "remote X\n")
 	_ = xBytes
-	y2, y2Hash := makeBytes(y.ID, "remote Y2\n")
+	_, y2Hash := makeBytes(y.ID, "remote Y2\n")
 	y3, y3Hash := makeBytes(y.ID, "remote Y3\n")
 	createID := uuid.New()
 	_, createHash := makeBytes(createID, "remote create\n")
@@ -4380,8 +4380,12 @@ func TestSyncOnceAppliesIndependentRootNotesBehindUnresolvedIntent(t *testing.T)
 	if err := core.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
 		t.Fatalf("sync=%v", err)
 	}
-	if got, err := os.ReadFile(filepath.Join(root, "Y.md")); err != nil || !bytes.Equal(got, y2) {
-		t.Fatalf("Y=%q err=%v", got, err)
+	if got, err := os.ReadFile(filepath.Join(root, "Y.md")); err != nil || !bytes.Equal(got, y3) {
+		t.Fatalf("Y chain=%q err=%v", got, err)
+	}
+	yBeforeRestart, err := os.Stat(filepath.Join(root, "Y.md"))
+	if err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "Z.md")); !os.IsNotExist(err) {
 		t.Fatalf("Z delete=%v", err)
@@ -4400,7 +4404,7 @@ func TestSyncOnceAppliesIndependentRootNotesBehindUnresolvedIntent(t *testing.T)
 	xItem, _, _ := store.InboxChange(ctx, base+1)
 	yItem, _, _ := store.InboxChange(ctx, base+2)
 	y3Item, _, _ := store.InboxChange(ctx, base+3)
-	if xItem.State != "pending" || yItem.State != "applied" || y3Item.State != "pending" {
+	if xItem.State != "pending" || yItem.State != "applied" || y3Item.State != "applied" {
 		t.Fatalf("states X/Y2/Y3=%s/%s/%s", xItem.State, yItem.State, y3Item.State)
 	}
 	for cursor := base + 5; cursor <= base+7; cursor++ {
@@ -4427,6 +4431,10 @@ func TestSyncOnceAppliesIndependentRootNotesBehindUnresolvedIntent(t *testing.T)
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "Y.md")); err != nil || !bytes.Equal(got, y3) {
 		t.Fatalf("Y3=%q err=%v", got, err)
+	}
+	yAfterRestart, err := os.Stat(filepath.Join(root, "Y.md"))
+	if err != nil || !os.SameFile(yBeforeRestart, yAfterRestart) || !yBeforeRestart.ModTime().Equal(yAfterRestart.ModTime()) {
+		t.Fatalf("Y chain republished after restart: %v", err)
 	}
 	if confirmed, _ := store.ConfirmedCursor(ctx); confirmed != base {
 		t.Fatalf("restart confirmed=%d base=%d", confirmed, base)
