@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/faulander/remember/client/internal/clientsync"
@@ -30,6 +31,12 @@ var testHookAfterConflictFolderCreateMove func()
 var testHookAfterConflictFolderCreateReconcile func()
 var testHookAfterConflictFolderMoveDeleteMove func()
 var testHookAfterConflictFolderMoveDeleteReconcile func()
+var testHookAfterDivergentFolderEvacuationMove func() error
+var testHookAfterDivergentFolderEvacuationReconcile func() error
+var testHookBeforeDivergentFolderEvacuatedTransition func() error
+var testHookAfterDivergentCanonicalStageCreate func() error
+var testHookAfterDivergentCanonicalPublish func() error
+var testHookAfterDivergentCanonicalCleanup func() error
 
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
@@ -69,6 +76,19 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 				return err
 			}
 			if err := c.recoverEmptyFolderMoveAgainstDelete(ctx, store, conflict); err != nil {
+				return err
+			}
+			continue
+		}
+		divergentRootFolderMove := m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && m.ParentID == nil && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.ParentID == nil && conflict.Canonical.Revision > m.BaseRevision && len(conflict.Canonical.BlobHash) == 0 && conflict.Canonical.Name != m.Name
+		if divergentRootFolderMove {
+			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
+				return err
+			}
+			if err := c.recoverEmptyDivergentRootFolderMove(ctx, store, conflict); err != nil {
+				if errors.Is(err, clientsync.ErrDivergentFolderMoveIneligible) {
+					continue
+				}
 				return err
 			}
 			continue
@@ -431,6 +451,201 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 		recovery.State = "completed"
 	}
 	return verify()
+}
+
+func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+	m, canonical := conflict.Outbox.Mutation, conflict.Canonical
+	recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, m.OperationID)
+	if err != nil {
+		return err
+	}
+	snapshot, err := c.index.ReadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	objects := make(map[uuid.UUID]localindex.Object, len(snapshot.Objects))
+	paths := make(map[string]bool, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects[object.ID] = object
+		paths[portablePathKey(object.RelativePath)] = true
+	}
+	if recovery == nil {
+		eligible, err := store.DivergentFolderMoveRecoveryEligible(ctx, m.OperationID)
+		if err != nil {
+			return err
+		}
+		if !eligible {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		object, ok := objects[m.ObjectID]
+		if !ok || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.ParentID != uuid.Nil || object.RelativePath != m.Name || object.FolderDevice == 0 || object.FolderInode == 0 {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		if paths[portablePathKey(canonical.Name)] {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(canonical.Name))); err == nil || !os.IsNotExist(err) {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		if err := repository.VerifyRootedSubtreeExpected(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, nil, clientsync.MaxBlobBytes); err != nil {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		recoveredID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		newOperation, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName(path.Base(object.RelativePath), m.OperationID)
+		if paths[portablePathKey(target)] {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(target))); err == nil || !os.IsNotExist(err) {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		var nonce [sha256.Size]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return err
+		}
+		recovery = &clientsync.ConflictFolderDivergentMoveRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperation, AttemptedRelative: object.RelativePath, CanonicalRelative: canonical.Name, RecoveryRelative: target, SourceDevice: object.FolderDevice, SourceInode: object.FolderInode, CanonicalRevision: canonical.Revision, CanonicalNonce: nonce, State: "prepared"}
+		if err := store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery); err != nil {
+			return err
+		}
+	}
+	verifyRecovery := func() error {
+		return repository.VerifyRootedSubtreeExpected(c.root, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, nil, clientsync.MaxBlobBytes)
+	}
+	restorePrepared := func(cause error) error {
+		restoreErr := repository.MoveRootedEmptyFolderExpected(c.root, recovery.RecoveryRelative, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode)
+		if restoreErr == nil {
+			_, restoreErr = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: func() error {
+				return repository.VerifyRootedSubtreeExpected(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, nil, clientsync.MaxBlobBytes)
+			}})
+		}
+		return errors.Join(cause, restoreErr)
+	}
+	if recovery.State == "prepared" {
+		if err := verifyRecovery(); err != nil {
+			if err := repository.VerifyRootedSubtreeExpected(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, nil, clientsync.MaxBlobBytes); err != nil {
+				return err
+			}
+			if err := repository.MoveRootedEmptyFolderExpected(c.root, recovery.AttemptedRelative, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode); err != nil {
+				return err
+			}
+		}
+		if testHookAfterDivergentFolderEvacuationMove != nil {
+			if err := testHookAfterDivergentFolderEvacuationMove(); err != nil {
+				return restorePrepared(err)
+			}
+		}
+		verify := func() error { return verifyRecovery() }
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+			return restorePrepared(err)
+		}
+		if testHookAfterDivergentFolderEvacuationReconcile != nil {
+			if err := testHookAfterDivergentFolderEvacuationReconcile(); err != nil {
+				return restorePrepared(err)
+			}
+		}
+		if testHookBeforeDivergentFolderEvacuatedTransition != nil {
+			if err := testHookBeforeDivergentFolderEvacuatedTransition(); err != nil {
+				return restorePrepared(err)
+			}
+		}
+		if err := store.MarkConflictFolderDivergentMoveEvacuated(ctx, recovery.OperationID); err != nil {
+			return restorePrepared(err)
+		}
+		recovery.State = "evacuated"
+	}
+	stage := ".remember/conflicts/folders/" + recovery.OperationID.String()
+	if recovery.State == "evacuated" {
+		if err := verifyRecovery(); err != nil {
+			return err
+		}
+		device, inode, err := repository.RootedFolderIdentity(c.root, stage)
+		if err == nil {
+			err = repository.VerifyRootedFolderPublication(c.root, stage, recovery.CanonicalNonce, device, inode)
+		} else {
+			device, inode, err = repository.CreateRootedFolderPublication(c.root, stage, recovery.CanonicalNonce)
+		}
+		if err != nil {
+			return err
+		}
+		if testHookAfterDivergentCanonicalStageCreate != nil {
+			if err := testHookAfterDivergentCanonicalStageCreate(); err != nil {
+				return err
+			}
+		}
+		if err := store.MarkConflictFolderDivergentMoveCanonicalPrepared(ctx, recovery.OperationID, device, inode); err != nil {
+			return err
+		}
+		recovery.State = "canonical_prepared"
+		recovery.CanonicalDevice = device
+		recovery.CanonicalInode = inode
+	}
+	if recovery.State == "canonical_prepared" {
+		stageErr := repository.VerifyRootedFolderPublication(c.root, stage, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode)
+		if stageErr == nil {
+			if err := repository.PublishRootedFolderPublication(c.root, stage, recovery.CanonicalRelative, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); err != nil {
+				return err
+			}
+		} else if targetErr := repository.VerifyRootedFolderPublication(c.root, recovery.CanonicalRelative, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); targetErr != nil {
+			return errors.Join(stageErr, targetErr)
+		}
+		if testHookAfterDivergentCanonicalPublish != nil {
+			if err := testHookAfterDivergentCanonicalPublish(); err != nil {
+				return err
+			}
+		}
+		if err := store.MarkConflictFolderDivergentMoveCanonicalPublished(ctx, recovery.OperationID); err != nil {
+			return err
+		}
+		recovery.State = "canonical_published"
+	}
+	if recovery.State == "canonical_published" {
+		if err := repository.CleanupRootedFolderPublication(c.root, recovery.CanonicalRelative, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); err != nil {
+			return err
+		}
+		if testHookAfterDivergentCanonicalCleanup != nil {
+			if err := testHookAfterDivergentCanonicalCleanup(); err != nil {
+				return err
+			}
+		}
+		verify := func() error {
+			if err := verifyRecovery(); err != nil {
+				return err
+			}
+			return repository.VerifyRootedSubtreeExpected(c.root, recovery.CanonicalRelative, recovery.CanonicalDevice, recovery.CanonicalInode, nil, clientsync.MaxBlobBytes)
+		}
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID, recovery.CanonicalRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+			return err
+		}
+		if err := verifyRecovery(); err != nil {
+			return err
+		}
+		if err := repository.VerifyRootedSubtreeExpected(c.root, recovery.CanonicalRelative, recovery.CanonicalDevice, recovery.CanonicalInode, nil, clientsync.MaxBlobBytes); err != nil {
+			return err
+		}
+		revision, found, err := store.Baseline(ctx, recovery.FolderID)
+		if err != nil {
+			return err
+		}
+		if !found || revision != recovery.CanonicalRevision {
+			return nil
+		}
+		if _, found, err := store.Baseline(ctx, clientsync.ConflictRecoveredID); err != nil {
+			return err
+		} else if !found {
+			return nil
+		}
+		if err := store.CompleteConflictFolderDivergentMoveRecovery(ctx, *recovery); err != nil {
+			return err
+		}
+		recovery.State = "completed"
+	}
+	return verifyRecovery()
 }
 
 func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {

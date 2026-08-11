@@ -286,6 +286,10 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	if _, err := a.CreateFolder(ctx, "FolderX"); err != nil {
 		t.Fatal(err)
 	}
+	blocked, _, err := a.CreateNote(ctx, "FolderX/Blocked.md", "structural blocker\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	y, _, err := a.CreateNote(ctx, "Y.md", "initial Y\n", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -340,6 +344,10 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncTimes(t, ctx, a, remoteA, 1)
+	expectedBlocked, err := os.ReadFile(filepath.Join(rootA, "RemoteFolder", "Blocked.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	expectedY, err := os.ReadFile(filepath.Join(rootA, "Y.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -441,6 +449,7 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rootC, "LocalFolder")); !os.IsNotExist(err) {
 		t.Fatalf("cold retained local losing path: %v", err)
 	}
+	assertRememberNoteBytesAndID(t, ctx, c, "RemoteFolder/Blocked.md", expectedBlocked, blocked.ID)
 	assertRememberNoteBytesAndID(t, ctx, c, "Y.md", expectedY, y.ID)
 	if _, err := c.ReadNote(ctx, "Z.md"); err == nil {
 		t.Fatal("cold retained Z")
