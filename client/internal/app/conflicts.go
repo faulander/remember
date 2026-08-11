@@ -453,6 +453,14 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 	return verify()
 }
 
+func verifyDivergentDirectNoteSubtree(root, relative string, device, inode uint64, members []clientsync.ConflictFolderCreateNoteMember) error {
+	entries := make([]repository.RootedSubtreeEntry, 0, len(members))
+	for _, member := range members {
+		entries = append(entries, repository.RootedSubtreeEntry{Relative: member.Name, Kind: repository.RootedSubtreeFile, Hash: member.BlobHash})
+	}
+	return repository.VerifyRootedSubtreeExpected(root, relative, device, inode, entries, clientsync.MaxBlobBytes)
+}
+
 func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
 	m, canonical := conflict.Outbox.Mutation, conflict.Canonical
 	recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, m.OperationID)
@@ -469,6 +477,7 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		objects[object.ID] = object
 		paths[portablePathKey(object.RelativePath)] = true
 	}
+	var members []clientsync.ConflictFolderCreateNoteMember
 	if recovery == nil {
 		eligible, err := store.DivergentFolderMoveRecoveryEligible(ctx, m.OperationID)
 		if err != nil {
@@ -487,7 +496,29 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(canonical.Name))); err == nil || !os.IsNotExist(err) {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
-		if err := repository.VerifyRootedSubtreeExpected(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, nil, clientsync.MaxBlobBytes); err != nil {
+		members, err = store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+		if err != nil {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		byID := map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember{}
+		for _, member := range members {
+			byID[member.NoteID] = member
+		}
+		prefix := object.RelativePath + "/"
+		for _, desc := range snapshot.Objects {
+			if desc.ID == object.ID || !strings.HasPrefix(desc.RelativePath, prefix) {
+				continue
+			}
+			member, ok := byID[desc.ID]
+			if !ok || desc.Type != localindex.ObjectNote || path.Dir(desc.RelativePath) != object.RelativePath || member.Name != path.Base(desc.RelativePath) || !bytes.Equal(desc.ContentHash, member.BlobHash[:]) {
+				return clientsync.ErrDivergentFolderMoveIneligible
+			}
+			delete(byID, desc.ID)
+		}
+		if len(byID) != 0 {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		if err := verifyDivergentDirectNoteSubtree(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, members); err != nil {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
 		recoveredID, err := uuid.NewV7()
@@ -510,28 +541,49 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			return err
 		}
 		recovery = &clientsync.ConflictFolderDivergentMoveRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperation, AttemptedRelative: object.RelativePath, CanonicalRelative: canonical.Name, RecoveryRelative: target, SourceDevice: object.FolderDevice, SourceInode: object.FolderInode, CanonicalRevision: canonical.Revision, CanonicalNonce: nonce, State: "prepared"}
-		if err := store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery); err != nil {
+		if len(members) == 0 {
+			err = store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery)
+		} else {
+			err = store.PutConflictFolderDivergentMoveRecoveryWithNotes(ctx, *recovery, members)
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		members, err = store.ConflictFolderDivergentMoveNoteMembers(ctx, m.OperationID)
+		if err != nil {
 			return err
 		}
 	}
 	verifyRecovery := func() error {
-		return repository.VerifyRootedSubtreeExpected(c.root, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, nil, clientsync.MaxBlobBytes)
+		return verifyDivergentDirectNoteSubtree(c.root, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, members)
 	}
+	noteOptions := func(base string) (map[uuid.UUID][32]byte, map[uuid.UUID]string) {
+		hashes := map[uuid.UUID][32]byte{}
+		paths := map[uuid.UUID]string{}
+		for _, member := range members {
+			hashes[member.NoteID] = member.BlobHash
+			paths[member.NoteID] = path.Join(base, member.Name)
+		}
+		return hashes, paths
+	}
+	recoveryNotes, recoveryPaths := noteOptions(recovery.RecoveryRelative)
+	attemptedNotes, attemptedPaths := noteOptions(recovery.AttemptedRelative)
 	restorePrepared := func(cause error) error {
-		restoreErr := repository.MoveRootedEmptyFolderExpected(c.root, recovery.RecoveryRelative, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode)
+		restoreErr := repository.MoveRootedFolderExpected(c.root, recovery.RecoveryRelative, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode)
 		if restoreErr == nil {
-			_, restoreErr = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: func() error {
-				return repository.VerifyRootedSubtreeExpected(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, nil, clientsync.MaxBlobBytes)
+			_, restoreErr = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: attemptedNotes, AppliedRemoteNotePaths: attemptedPaths, AppliedRemoteFolders: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteFolderPaths: map[uuid.UUID]string{recovery.FolderID: recovery.AttemptedRelative}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: func() error {
+				return verifyDivergentDirectNoteSubtree(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, members)
 			}})
 		}
 		return errors.Join(cause, restoreErr)
 	}
 	if recovery.State == "prepared" {
 		if err := verifyRecovery(); err != nil {
-			if err := repository.VerifyRootedSubtreeExpected(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, nil, clientsync.MaxBlobBytes); err != nil {
+			if err := verifyDivergentDirectNoteSubtree(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, members); err != nil {
 				return err
 			}
-			if err := repository.MoveRootedEmptyFolderExpected(c.root, recovery.AttemptedRelative, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode); err != nil {
+			if err := repository.MoveRootedFolderExpected(c.root, recovery.AttemptedRelative, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode); err != nil {
 				return err
 			}
 		}
@@ -541,7 +593,7 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			}
 		}
 		verify := func() error { return verifyRecovery() }
-		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteNotes: recoveryNotes, AppliedRemoteNotePaths: recoveryPaths, AppliedRemoteFolders: map[uuid.UUID]bool{recovery.RecoveredFolderID: true}, AppliedRemoteFolderPaths: map[uuid.UUID]string{recovery.RecoveredFolderID: recovery.RecoveryRelative}, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
 			return restorePrepared(err)
 		}
 		if testHookAfterDivergentFolderEvacuationReconcile != nil {
@@ -619,7 +671,7 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			}
 			return repository.VerifyRootedSubtreeExpected(c.root, recovery.CanonicalRelative, recovery.CanonicalDevice, recovery.CanonicalInode, nil, clientsync.MaxBlobBytes)
 		}
-		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID, recovery.CanonicalRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: recoveryNotes, AppliedRemoteNotePaths: recoveryPaths, AppliedRemoteFolders: map[uuid.UUID]bool{recovery.FolderID: true, recovery.RecoveredFolderID: true}, AppliedRemoteFolderPaths: map[uuid.UUID]string{recovery.FolderID: recovery.CanonicalRelative, recovery.RecoveredFolderID: recovery.RecoveryRelative}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID, recovery.CanonicalRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
 			return err
 		}
 		if err := verifyRecovery(); err != nil {

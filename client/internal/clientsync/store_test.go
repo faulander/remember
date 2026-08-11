@@ -682,6 +682,13 @@ func TestFolderMutationBindingIsImmutable(t *testing.T) {
 	if err := store.PutFolderMutation(ctx, binding); err == nil {
 		t.Fatal("duplicate folder mutation accepted")
 	}
+	reserved := binding
+	reserved.StepIndex = 2
+	reserved.SourceRelative = ConflictRootName + "/" + ConflictRecoveredName + "/Arbitrary"
+	reserved.TargetRelative = reserved.SourceRelative
+	if err := store.PutFolderMutation(ctx, reserved); err == nil {
+		t.Fatal("arbitrary reserved folder mutation accepted")
+	}
 	got, err := store.FolderMutation(ctx, planID, 1)
 	if err != nil || got == nil || *got != binding {
 		t.Fatalf("binding=%#v err=%v", got, err)

@@ -3943,6 +3943,14 @@ func TestDivergentEmptyFolderMoveRecoveryFaultBoundaries(t *testing.T) {
 			if !errors.Is(err, injected) {
 				t.Fatalf("fault sync=%v", err)
 			}
+			if tc.name == "after canonical cleanup" {
+				if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+					_, err := tx.Exec(`UPDATE conflict_folder_divergent_move_recoveries SET state='completed' WHERE operation_id=?`, operation.String())
+					return err
+				}); err == nil {
+					t.Fatal("adjacent completed state spoof accepted")
+				}
+			}
 			if tc.compensated {
 				if info, statErr := os.Stat(filepath.Join(rootB, "Local")); statErr != nil || !info.IsDir() {
 					t.Fatalf("source not compensated: %v", statErr)
@@ -3967,6 +3975,265 @@ func TestDivergentEmptyFolderMoveRecoveryFaultBoundaries(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(rootB, "Local")); !os.IsNotExist(err) {
 				t.Fatalf("source remains after recovery: %v", err)
+			}
+		})
+	}
+}
+
+func TestSyncOnceRecoversEditedDirectNoteInDivergentRootFolderMove(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	folderID := func() uuid.UUID {
+		snapshot, _ := b.Snapshot(ctx)
+		for _, o := range snapshot.Objects {
+			if o.RelativePath == "F" {
+				return o.ID
+			}
+		}
+		return uuid.Nil
+	}()
+	if folderID == uuid.Nil {
+		t.Fatal("folder missing")
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := b.CreateNote(ctx, "Local/N.md", "first\n", []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := b.ReadNote(ctx, "Local/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Local/N.md", current.Revision, "final bytes\n", []string{"final"}); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := os.ReadFile(filepath.Join(rootB, "Local", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceInfo, err := os.Stat(filepath.Join(rootB, "Local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := clientsync.NewStore(b.index)
+	ready, err := store.ListReady(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moveOperation uuid.UUID
+	for _, item := range ready {
+		if item.Mutation.ObjectID == folderID && item.Mutation.Kind == clientsync.Move {
+			moveOperation = item.Mutation.OperationID
+		}
+	}
+	if moveOperation == uuid.Nil {
+		t.Fatal("move operation missing")
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootA, a.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil && !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	store, _ = clientsync.NewStore(b.index)
+	for i := 0; i < 6; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil && !errors.Is(err, ErrUnresolvedOutbound) {
+			recovery, _ := store.ConflictFolderDivergentMoveRecovery(ctx, moveOperation)
+			snapshot, _ := b.Snapshot(ctx)
+			plan, _ := store.ActiveApplyPlan(ctx)
+			t.Fatalf("recovery sync %d: %v recovery=%#v plan=%#v objects=%#v", i, err, recovery, plan, snapshot.Objects)
+		}
+	}
+	recovered := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName("Local", moveOperation)
+	actual, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recovered), "N.md"))
+	if err != nil || !bytes.Equal(actual, expected) {
+		t.Fatalf("recovered bytes err=%v", err)
+	}
+	inspection, err := frontmatter.Inspect(actual)
+	if err != nil || inspection.NoteID != note.ID {
+		t.Fatalf("recovered identity=%s err=%v", inspection.NoteID, err)
+	}
+	recoveredInfo, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recovered)))
+	if err != nil || !os.SameFile(sourceInfo, recoveredInfo) {
+		t.Fatalf("recovered inode err=%v", err)
+	}
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("unresolved=%t err=%v", unresolved, err)
+	}
+}
+
+func TestSyncOnceRejectsUnsafeDivergentDirectNoteRecoveries(t *testing.T) {
+	cases := []string{"branch", "attempted", "nested", "unindexed"}
+	for _, kind := range cases {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+			remote := &memoryRemote{server: server}
+			rootA, rootB := t.TempDir(), t.TempDir()
+			a, _, err := Initialize(ctx, rootA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
+			b, _, err := Initialize(ctx, rootB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.Close()
+			if _, err := a.CreateFolder(ctx, "F"); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.SyncOnce(ctx, remote); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.SyncOnce(ctx, remote); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, _ := b.Snapshot(ctx)
+			var folderID uuid.UUID
+			for _, o := range snapshot.Objects {
+				if o.RelativePath == "F" {
+					folderID = o.ID
+				}
+			}
+			if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+				t.Fatal(err)
+			}
+			store, _ := clientsync.NewStore(b.index)
+			switch kind {
+			case "branch", "attempted":
+				note, _, err := b.CreateNote(ctx, "Local/N.md", "one\n", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var createOp uuid.UUID
+				if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+					var raw string
+					if err := tx.QueryRow(`SELECT operation_id FROM sync_outbox WHERE object_id=? AND mutation='create'`, note.ID.String()).Scan(&raw); err != nil {
+						return err
+					}
+					var parseErr error
+					createOp, parseErr = uuid.Parse(raw)
+					return parseErr
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "attempted" {
+					if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+						_, err := tx.Exec(`UPDATE sync_outbox SET status='attempted',attempted_at_ms=1 WHERE operation_id=? AND status='pending'`, createOp.String())
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					current, _ := b.ReadNote(ctx, "Local/N.md")
+					_, _, err = b.SaveNote(ctx, "Local/N.md", current.Revision, "two\n", nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					content, readErr := os.ReadFile(filepath.Join(rootB, "Local", "N.md"))
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					hash := sha256.Sum256(content)
+					op := uuid.Must(uuid.NewV7())
+					if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+						if _, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,name,blob_hash,dependency_operation_id,status,created_at_ms) VALUES(?,'update',?,'note',1,'',?,?,'pending',1)`, op.String(), note.ID.String(), hash[:], createOp.String()); err != nil {
+							return err
+						}
+						_, err := tx.Exec(`INSERT INTO sync_outbox_dependencies(operation_id,dependency_operation_id) VALUES(?,?)`, op.String(), createOp.String())
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "nested":
+				if err := os.Mkdir(filepath.Join(rootB, "Local", "Sub"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := b.Reconcile(ctx); err != nil {
+					t.Fatal(err)
+				}
+			case "unindexed":
+				if err := os.WriteFile(filepath.Join(rootB, "Local", "raw.bin"), []byte("raw"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Stat(filepath.Join(rootB, "Local"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reconcile.Run(ctx, rootA, a.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.SyncOnce(ctx, remote); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+				t.Fatalf("unsafe recovery err=%v", err)
+			}
+			after, err := os.Stat(filepath.Join(rootB, "Local"))
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("source changed: %v", err)
+			}
+			ready, _ := store.ListReady(ctx, 100)
+			var moveOp uuid.UUID
+			for _, item := range ready {
+				if item.Mutation.ObjectID == folderID && item.Mutation.Kind == clientsync.Move {
+					moveOp = item.Mutation.OperationID
+				}
+			}
+			if moveOp != uuid.Nil {
+				recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, moveOp)
+				if err != nil || recovery != nil {
+					t.Fatalf("unsafe recovery journal=%#v err=%v", recovery, err)
+				}
 			}
 		})
 	}

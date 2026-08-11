@@ -622,7 +622,7 @@ func (s *Store) ProjectionTx(ctx context.Context, tx *sql.Tx, objectID uuid.UUID
 func (s *Store) HasUnresolvedOutbox(ctx context.Context) (bool, error) {
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE (status IN ('pending','attempted','replay_mismatch') AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_note_members n JOIN conflict_folder_create_recoveries f ON f.operation_id=n.operation_id WHERE n.old_operation_id=o.operation_id AND f.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_move_delete_note_members n JOIN conflict_folder_move_delete_recoveries d ON d.operation_id=n.operation_id WHERE n.old_operation_id=o.operation_id AND d.state IN ('moved','completed'))) OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_recoveries f WHERE f.operation_id=o.operation_id AND f.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_move_delete_recoveries d WHERE d.operation_id=o.operation_id AND d.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries d WHERE d.operation_id=o.operation_id AND d.state IN ('evacuated','canonical_published','completed'))) )`).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_outbox o WHERE (status IN ('pending','attempted','replay_mismatch') AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_note_members n JOIN conflict_folder_create_recoveries f ON f.operation_id=n.operation_id WHERE n.old_operation_id=o.operation_id AND f.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_move_delete_note_members n JOIN conflict_folder_move_delete_recoveries d ON d.operation_id=n.operation_id WHERE n.old_operation_id=o.operation_id AND d.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_note_members n JOIN conflict_folder_divergent_move_recoveries d ON d.operation_id=n.operation_id WHERE (n.old_operation_id=o.operation_id OR EXISTS(SELECT 1 FROM conflict_folder_divergent_move_note_chains c WHERE c.operation_id=n.operation_id AND c.note_id=n.note_id AND c.old_operation_id=o.operation_id)) AND d.state IN ('evacuated','canonical_published','completed'))) OR (status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_create_recoveries f WHERE f.operation_id=o.operation_id AND f.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_move_delete_recoveries d WHERE d.operation_id=o.operation_id AND d.state IN ('moved','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries d WHERE d.operation_id=o.operation_id AND d.state IN ('evacuated','canonical_published','completed'))) )`).Scan(&exists)
 	})
 	return exists != 0, err
 }
@@ -931,11 +931,21 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 }
 
 func (s *Store) PutFolderMutation(ctx context.Context, mutation FolderMutation) error {
-	validTarget := mutation.Mutation == Move && naming.ValidateUserRelativePath(mutation.TargetRelative) == nil || mutation.Mutation == Delete && len(mutation.TargetRelative) > 0
-	if !validOperationID(mutation.PlanID) || mutation.StepIndex < 0 || !validObjectID(mutation.FolderID) || (mutation.Mutation != Move && mutation.Mutation != Delete) || naming.ValidateUserRelativePath(mutation.SourceRelative) != nil || !validTarget || mutation.Device == 0 || mutation.Inode == 0 || mutation.Device > math.MaxInt64 || mutation.Inode > math.MaxInt64 {
+	reservedEcho := mutation.Mutation == Move && mutation.SourceRelative == mutation.TargetRelative && path.Dir(mutation.SourceRelative) == ConflictRootName+"/"+ConflictRecoveredName && naming.ValidateComponent(path.Base(mutation.SourceRelative)) == nil
+	validTarget := mutation.Mutation == Move && (naming.ValidateUserRelativePath(mutation.TargetRelative) == nil || reservedEcho) || mutation.Mutation == Delete && len(mutation.TargetRelative) > 0
+	if !validOperationID(mutation.PlanID) || mutation.StepIndex < 0 || !validObjectID(mutation.FolderID) || (mutation.Mutation != Move && mutation.Mutation != Delete) || (naming.ValidateUserRelativePath(mutation.SourceRelative) != nil && !reservedEcho) || !validTarget || mutation.Device == 0 || mutation.Inode == 0 || mutation.Device > math.MaxInt64 || mutation.Inode > math.MaxInt64 {
 		return errors.New("invalid folder mutation binding")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if reservedEcho {
+			var bound int
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries WHERE recovered_folder_id=? AND recovery_relative=? AND state='completed')`, mutation.FolderID.String(), mutation.SourceRelative).Scan(&bound); err != nil {
+				return err
+			}
+			if bound != 1 {
+				return errors.New("reserved folder mutation lacks recovery provenance")
+			}
+		}
 		res, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_mutations(plan_id,step_index,folder_id,mutation_kind,source_relative,target_relative,device,inode)
 			SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM apply_steps WHERE plan_id=? AND step_index=? AND object_id=? AND mutation=? AND object_type='folder')`, mutation.PlanID.String(), mutation.StepIndex, mutation.FolderID.String(), mutation.Mutation, mutation.SourceRelative, mutation.TargetRelative, mutation.Device, mutation.Inode, mutation.PlanID.String(), mutation.StepIndex, mutation.FolderID.String(), mutation.Mutation)
 		if err != nil {
