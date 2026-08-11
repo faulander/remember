@@ -260,6 +260,155 @@ func TestAuthenticatedBlobIntegrityAlarmsResumeAfterRestart(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedEmptyDivergentFolderMovesConverge(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "divergent-empty@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Empty A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Empty B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	folderID := localFolderIDAtPath(t, ctx, rootA, "F")
+	before, err := os.Stat(filepath.Join(rootB, "F"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "F")
+	index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.ListReady(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moveOperation uuid.UUID
+	for _, item := range ready {
+		if item.Mutation.ObjectID == folderID && item.Mutation.Kind == clientsync.Move {
+			moveOperation = item.Mutation.OperationID
+		}
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if moveOperation == uuid.Nil {
+		t.Fatal("missing divergent move operation")
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootA, "F")
+	syncTimes(t, ctx, a, remoteA, 1)
+	for i := 0; i < 4; i++ {
+		if err := b.SyncOnce(ctx, remoteB); err != nil {
+			t.Fatalf("B recovery sync %d: %v", i, err)
+		}
+	}
+	recoveredName := clientsync.ConflictFolderName("Local", moveOperation)
+	recoveredPath := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + recoveredName
+	if got := localFolderIDAtPath(t, ctx, rootB, "Server"); got != folderID {
+		t.Fatalf("B canonical id=%s want=%s", got, folderID)
+	}
+	recoveredID := localFolderIDAtPath(t, ctx, rootB, recoveredPath)
+	if recoveredID == uuid.Nil || recoveredID == folderID {
+		t.Fatalf("B recovered id=%s", recoveredID)
+	}
+	recoveredInfo, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredPath)))
+	if err != nil || !os.SameFile(before, recoveredInfo) {
+		t.Fatalf("B recovered inode: %v", err)
+	}
+	for _, old := range []string{"F", "Local"} {
+		if _, err := os.Stat(filepath.Join(rootB, old)); !os.IsNotExist(err) {
+			t.Fatalf("B retained %s: %v", old, err)
+		}
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = clientapp.Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remoteB); err != nil {
+		t.Fatal(err)
+	}
+	if got := localFolderIDAtPath(t, ctx, rootB, "Server"); got != folderID {
+		t.Fatalf("restart canonical id=%s want=%s", got, folderID)
+	}
+	if got := localFolderIDAtPath(t, ctx, rootB, recoveredPath); got != recoveredID {
+		t.Fatalf("restart recovered id=%s want=%s", got, recoveredID)
+	}
+	restartedInfo, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredPath)))
+	if err != nil || !os.SameFile(before, restartedInfo) {
+		t.Fatalf("restart recovered inode: %v", err)
+	}
+	for _, old := range []string{"F", "Local"} {
+		if _, err := os.Stat(filepath.Join(rootB, old)); !os.IsNotExist(err) {
+			t.Fatalf("restart B retained %s: %v", old, err)
+		}
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	if got := localFolderIDAtPath(t, ctx, rootA, "Server"); got != folderID {
+		t.Fatalf("A canonical id=%s", got)
+	}
+	if got := localFolderIDAtPath(t, ctx, rootA, recoveredPath); got != recoveredID {
+		t.Fatalf("A recovered id=%s want=%s", got, recoveredID)
+	}
+	for _, old := range []string{"F", "Local"} {
+		if _, err := os.Stat(filepath.Join(rootA, old)); !os.IsNotExist(err) {
+			t.Fatalf("A retained %s: %v", old, err)
+		}
+	}
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Empty C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	if got := localFolderIDAtPath(t, ctx, rootC, "Server"); got != folderID {
+		t.Fatalf("C canonical id=%s", got)
+	}
+	if got := localFolderIDAtPath(t, ctx, rootC, recoveredPath); got != recoveredID {
+		t.Fatalf("C recovered id=%s want=%s", got, recoveredID)
+	}
+	if _, err := os.Stat(filepath.Join(rootC, "F")); !os.IsNotExist(err) {
+		t.Fatalf("C retained original path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootC, "Local")); !os.IsNotExist(err) {
+		t.Fatalf("C retained losing path: %v", err)
+	}
+}
+
 func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	ctx := context.Background()
 	server, err := integrationtest.New(ctx, t.TempDir())

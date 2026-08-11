@@ -77,5 +77,6 @@
 | [0063](adr/0063-m2-authenticated-integrity-alarm-recovery.md) | Authentifizierte Alarm-, Restart- und Recovery-Abnahme für Apply-Blobs |
 | [0064](adr/0064-m2-divergent-folder-move-policy.md) | Verlustfreie Politik für divergente Folder-Moves und Servergrenze für Delete/Move |
 | [0065](adr/0065-m2-empty-divergent-root-folder-move-recovery.md) | Crash-fortsetzbare Recovery leerer divergenter Root-Folder-Moves |
+| [0066](adr/0066-m2-authenticated-empty-divergent-folder-moves.md) | Authentifizierte A/B-/Restart-/Cold-C-Abnahme leerer divergenter Folder-Moves |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
