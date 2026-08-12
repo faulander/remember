@@ -82,5 +82,6 @@
 | [0068](adr/0068-m2-authenticated-divergent-folder-note-recovery.md) | Authentifizierte A/B-/Restart-/Cold-C-Abnahme divergenter Folder mit Note-Ketten |
 | [0069](adr/0069-m2-atomic-folder-preserve-delete-protocol.md) | Atomare servergestützte Preserve-and-Delete-Operation für Folder Delete gegen Remote-Move |
 | [0070](adr/0070-m2-empty-folder-preserve-delete-core.md) | Actor-gebundener atomarer Server-Core für aktuell leere Folder |
+| [0071](adr/0071-m2-empty-folder-preserve-delete-http.md) | Strikter actor-gebundener HTTP-Transport für leere Folder Preserve-and-Delete |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

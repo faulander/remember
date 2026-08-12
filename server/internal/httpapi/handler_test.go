@@ -554,6 +554,30 @@ func TestSyncSubmitPullDTOAndPrincipalBinding(t *testing.T) {
 	}
 }
 
+func TestPreserveDeleteFolderHTTPBinding(t *testing.T) {
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	actor := newFakeSyncActor()
+	recovered := uuid.New()
+	actor.preserveResult = synccore.PreserveDeleteFolderResult{RecoveredFolderID: recovered, RecoveredCursor: 10, DeletedCursor: 11}
+	api.syncForActor = func(user, device uuid.UUID) (SyncActorService, error) {
+		if user != testUserID || device != testDeviceID {
+			t.Fatalf("actor=%s/%s", user, device)
+		}
+		return actor, nil
+	}
+	operation, conflict := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	folder := uuid.New()
+	body := map[string]any{"operation_id": operation.String(), "conflict_operation_id": conflict.String(), "folder_id": folder.String(), "expected_revision": 2}
+	response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/folder-preserve-delete", body, testAccess, http.StatusOK)
+	if actor.lastPreserve.OperationID != operation || actor.lastPreserve.ConflictOperationID != conflict || actor.lastPreserve.FolderID != folder || actor.lastPreserve.ExpectedRevision != 2 {
+		t.Fatalf("request=%#v", actor.lastPreserve)
+	}
+	if !strings.Contains(response.Body.String(), recovered.String()) {
+		t.Fatalf("body=%s", response.Body.String())
+	}
+}
+
 func TestSyncConflictReplayAndErrorMapping(t *testing.T) {
 	t.Parallel()
 	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
@@ -1012,16 +1036,19 @@ func (f *fakeBlobUser) Get(_ context.Context, hash [sha256.Size]byte) ([]byte, e
 }
 
 type fakeSyncActor struct {
-	mu           sync.Mutex
-	submitResult synccore.SubmitResult
-	pullResult   synccore.PullResult
-	submitErr    error
-	pullErr      error
-	lastMutation synccore.Mutation
-	lastAfter    uint64
-	lastLimit    int
-	block        chan struct{}
-	started      chan struct{}
+	mu             sync.Mutex
+	submitResult   synccore.SubmitResult
+	pullResult     synccore.PullResult
+	submitErr      error
+	pullErr        error
+	preserveResult synccore.PreserveDeleteFolderResult
+	preserveErr    error
+	lastPreserve   synccore.PreserveDeleteFolderRequest
+	lastMutation   synccore.Mutation
+	lastAfter      uint64
+	lastLimit      int
+	block          chan struct{}
+	started        chan struct{}
 }
 
 func newFakeSyncActor() *fakeSyncActor {
@@ -1039,6 +1066,13 @@ func (f *fakeSyncActor) Submit(_ context.Context, mutation synccore.Mutation) (s
 	defer f.mu.Unlock()
 	f.lastMutation = mutation
 	return f.submitResult, f.submitErr
+}
+
+func (f *fakeSyncActor) PreserveAndDeleteEmptyFolder(_ context.Context, request synccore.PreserveDeleteFolderRequest) (synccore.PreserveDeleteFolderResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastPreserve = request
+	return f.preserveResult, f.preserveErr
 }
 
 func (f *fakeSyncActor) Pull(_ context.Context, after uint64, limit int) (synccore.PullResult, error) {

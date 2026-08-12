@@ -65,6 +65,7 @@ type BlobForUser func(uuid.UUID) (BlobUserService, error)
 type SyncActorService interface {
 	Submit(context.Context, synccore.Mutation) (synccore.SubmitResult, error)
 	Pull(context.Context, uint64, int) (synccore.PullResult, error)
+	PreserveAndDeleteEmptyFolder(context.Context, synccore.PreserveDeleteFolderRequest) (synccore.PreserveDeleteFolderResult, error)
 }
 
 type SyncForActor func(uuid.UUID, uuid.UUID) (SyncActorService, error)
@@ -136,6 +137,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.blob(w, r, strings.TrimPrefix(r.URL.Path, "/v1/blobs/"))
 	case r.URL.Path == "/v1/sync/operations":
 		h.submitSync(w, r)
+	case r.URL.Path == "/v1/sync/folder-preserve-delete":
+		h.preserveDeleteFolder(w, r)
 	case syncChangesRoute:
 		h.pullSync(w, r)
 	default:
@@ -438,6 +441,57 @@ func (h *handler) submitSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, response)
 }
 
+func (h *handler) preserveDeleteFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, r, http.MethodPost)
+		return
+	}
+	_, principal, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		OperationID         string `json:"operation_id"`
+		ConflictOperationID string `json:"conflict_operation_id"`
+		FolderID            string `json:"folder_id"`
+		ExpectedRevision    uint64 `json:"expected_revision"`
+	}
+	if err := decodeStrictJSONFields(w, r, &request, "operation_id", "conflict_operation_id", "folder_id", "expected_revision"); err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	operation, err := parseUUIDv7(request.OperationID)
+	if err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	conflict, err := parseUUIDv7(request.ConflictOperationID)
+	if err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	folder, err := parseSyncObjectID(request.FolderID)
+	if err != nil || request.ExpectedRevision == 0 || request.ExpectedRevision > math.MaxInt64 {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	actor, err := h.syncForActor(principal.UserID, principal.DeviceID)
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	if !h.acquireSyncSlot(w, r) {
+		return
+	}
+	defer func() { <-h.syncSlots }()
+	result, err := actor.PreserveAndDeleteEmptyFolder(r.Context(), synccore.PreserveDeleteFolderRequest{OperationID: operation, ConflictOperationID: conflict, FolderID: folder, ExpectedRevision: request.ExpectedRevision})
+	if err != nil {
+		h.writeSyncError(w, r, err)
+		return
+	}
+	writeJSON(w, r, http.StatusOK, map[string]any{"recovered_folder_id": result.RecoveredFolderID.String(), "recovered_cursor": result.RecoveredCursor, "deleted_cursor": result.DeletedCursor})
+}
+
 func (h *handler) pullSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, r, http.MethodGet)
@@ -598,6 +652,8 @@ func (h *handler) writeSyncError(w http.ResponseWriter, r *http.Request, err err
 		writeAPIError(w, r, http.StatusConflict, "blob_unavailable")
 	case errors.Is(err, synccore.ErrOperationReplayMismatch):
 		writeAPIError(w, r, http.StatusConflict, "operation_replay_mismatch")
+	case errors.Is(err, synccore.ErrPreserveDeleteUnavailable):
+		writeAPIError(w, r, http.StatusConflict, "preserve_delete_unavailable")
 	default:
 		writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
 	}
@@ -1081,7 +1137,7 @@ func newRequestID() string {
 
 func knownRoute(path string) string {
 	switch path {
-	case "/healthz", "/readyz", "/v1/auth/login", "/v1/auth/refresh", "/v1/auth/logout", "/v1/sessions", "/v1/sync/operations", "/v1/sync/changes":
+	case "/healthz", "/readyz", "/v1/auth/login", "/v1/auth/refresh", "/v1/auth/logout", "/v1/sessions", "/v1/sync/operations", "/v1/sync/changes", "/v1/sync/folder-preserve-delete":
 		return path
 	default:
 		switch {

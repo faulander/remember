@@ -8,6 +8,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Added
 
+- ADR 0071 exponiert die leere Preserve-and-Delete-Resolution über einen strikten tokengebundenen Sync-HTTP-Transport.
 - Servermigration 006 und ADR 0070 implementieren den actor-gebundenen atomaren Preserve-and-Delete-Core zunächst für aktuell leere Folder mit exaktem Replay und normalen Change-Log-Zeilen.
 - ADR 0069 definiert die atomare servergestützte Preserve-and-Delete-Operation für Folder Delete gegen Remote-Move mit vollständigem Subtree-Clone, neuen UUIDs und child-first Tombstones.
 - Schema v31 erweitert divergente root-level Folder-Move-Recovery auf exakt manifestierte direkte lokal erstellte Notes mit linearen nie versuchten Create→Update-Ketten; A/B, B-Restart und kalter C sind über echte Auth-/Blob-/Sync-Routen abgenommen. Branches, attempted, Nested und unbekannte Dateien bleiben fail-closed.
