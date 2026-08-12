@@ -96,6 +96,118 @@ func TestMutationLifecycleIdempotencyAndPull(t *testing.T) {
 	}
 }
 
+func TestPreserveAndDeleteEmptyFolderIsAtomicAndReplaySafe(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 2)
+	actor := f.actors[0]
+	folder := newID(t)
+	created := mustAccepted(t, actor, createFolder(folder, "Before", nil))
+	moved := mustAccepted(t, actor, func() Mutation {
+		m := mutation(MutationMove, folder, ObjectFolder, created.Revision)
+		m.Name = "After"
+		return m
+	}())
+	conflictOp := mustNewID()
+	deleteRequest := Mutation{OperationID: conflictOp, Kind: MutationDelete, ObjectID: folder, ObjectType: ObjectFolder, BaseRevision: created.Revision}
+	conflict, err := actor.Submit(ctx, deleteRequest)
+	if err != nil || conflict.Conflict != ConflictBaseRevisionMismatch || conflict.Canonical == nil || conflict.Canonical.Revision != moved.Revision {
+		t.Fatalf("conflict=%#v err=%v", conflict, err)
+	}
+	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictOp, FolderID: folder, ExpectedRevision: moved.Revision}
+	result, err := actor.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil || result.RecoveredFolderID == uuid.Nil || result.DeletedCursor != result.RecoveredCursor+1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	replay, err := actor.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil || replay != result {
+		t.Fatalf("replay=%#v err=%v", replay, err)
+	}
+	changed := req
+	changed.ExpectedRevision++
+	if _, err := actor.PreserveAndDeleteEmptyFolder(ctx, changed); !errors.Is(err, ErrOperationReplayMismatch) {
+		t.Fatalf("mismatch=%v", err)
+	}
+	page, err := actor.Pull(ctx, result.RecoveredCursor-1, 10)
+	if err != nil || len(page.Changes) != 2 || page.Changes[0].ObjectID != result.RecoveredFolderID || page.Changes[0].ParentID == nil || *page.Changes[0].ParentID != ConflictRecoveredID || page.Changes[1].ObjectID != folder || !page.Changes[1].Deleted {
+		t.Fatalf("page=%#v err=%v", page, err)
+	}
+	if _, err := f.actors[1].PreserveAndDeleteEmptyFolder(ctx, req); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+		t.Fatalf("tenant accepted=%v", err)
+	}
+	otherDevice := newID(t)
+	if _, err := f.db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms) VALUES(?,?,?,'active',1,1)`, f.users[0][:], otherDevice[:], "Other"); err != nil {
+		t.Fatal(err)
+	}
+	otherActor, err := actor.service.ForActor(f.users[0], otherDevice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := otherActor.PreserveAndDeleteEmptyFolder(ctx, req); !errors.Is(err, ErrOperationReplayMismatch) {
+		t.Fatalf("wrong device replay=%v", err)
+	}
+}
+
+func TestPreserveAndDeleteEmptyFolderHandlesLongNameAndCollision(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	actor := f.actors[0]
+	folder := newID(t)
+	long := strings.Repeat("ä", 90)
+	created := mustAccepted(t, actor, createFolder(folder, long, nil))
+	moved := mustAccepted(t, actor, func() Mutation {
+		m := mutation(MutationMove, folder, ObjectFolder, created.Revision)
+		m.Name = long
+		return m
+	}())
+	conflictOp := mustNewID()
+	conflict, _ := actor.Submit(ctx, Mutation{OperationID: conflictOp, Kind: MutationDelete, ObjectID: folder, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	if conflict.Canonical == nil {
+		t.Fatal("missing conflict")
+	}
+	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictOp, FolderID: folder, ExpectedRevision: moved.Revision}
+	result, err := actor.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, exists, err := loadObject(ctx, tx, f.users[0], result.RecoveredFolderID)
+	tx.Rollback()
+	if err != nil || !exists || len([]byte(state.Name)) > 255 || state.ParentID == nil || *state.ParentID != ConflictRecoveredID {
+		t.Fatalf("state=%#v exists=%t err=%v", state, exists, err)
+	}
+}
+
+func TestPreserveAndDeleteEmptyFolderRejectsChildrenAndStaleRevision(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	actor := f.actors[0]
+	folder := newID(t)
+	created := mustAccepted(t, actor, createFolder(folder, "F", nil))
+	moved := mustAccepted(t, actor, func() Mutation {
+		m := mutation(MutationMove, folder, ObjectFolder, created.Revision)
+		m.Name = "Moved"
+		return m
+	}())
+	conflictOp := mustNewID()
+	request := Mutation{OperationID: conflictOp, Kind: MutationDelete, ObjectID: folder, ObjectType: ObjectFolder, BaseRevision: created.Revision}
+	conflict, err := actor.Submit(ctx, request)
+	if err != nil || conflict.Canonical == nil {
+		t.Fatal(err)
+	}
+	mustAccepted(t, actor, createFolder(newID(t), "Child", &folder))
+	resolution := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictOp, FolderID: folder, ExpectedRevision: moved.Revision}
+	if _, err := actor.PreserveAndDeleteEmptyFolder(ctx, resolution); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+		t.Fatalf("child accepted=%v", err)
+	}
+	var count int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM sync_folder_preserve_delete_resolutions WHERE user_id=?`, f.users[0][:]).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("resolution count=%d err=%v", count, err)
+	}
+}
+
 func TestConflictLazilyProvisionsReservedNamespace(t *testing.T) {
 	fixture := newFixture(t, 1)
 	actor := fixture.actors[0]

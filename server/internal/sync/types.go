@@ -79,6 +79,17 @@ type VersionState struct {
 	Deleted     bool
 }
 
+type PreserveDeleteFolderRequest struct {
+	OperationID, ConflictOperationID, FolderID uuid.UUID
+	ExpectedRevision                           uint64
+}
+type PreserveDeleteFolderResult struct {
+	RecoveredFolderID              uuid.UUID
+	RecoveredCursor, DeletedCursor uint64
+}
+
+var ErrPreserveDeleteUnavailable = errors.New("folder preserve delete unavailable")
+
 type PullResult struct {
 	Changes    []VersionState
 	HasMore    bool
