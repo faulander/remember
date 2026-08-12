@@ -84,5 +84,6 @@
 | [0070](adr/0070-m2-empty-folder-preserve-delete-core.md) | Actor-gebundener atomarer Server-Core für aktuell leere Folder |
 | [0071](adr/0071-m2-empty-folder-preserve-delete-http.md) | Strikter actor-gebundener HTTP-Transport für leere Folder Preserve-and-Delete |
 | [0072](adr/0072-m2-client-empty-preserve-delete-foundation.md) | Dauerhafte Client-Resolution und HTTP-Clientfundament für leere Folder |
+| [0073](adr/0073-m2-authenticated-empty-folder-preserve-delete.md) | Authentifizierte A/B-/Cold-C-Konvergenz für leere Folder Delete/Remote-Move |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -46,7 +46,7 @@ func (s *Store) ListConflicts(ctx context.Context, limit int) ([]ConflictItem, e
 		rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.operation_id,o.mutation,o.object_id,o.object_type,o.base_revision,o.parent_id,o.name,o.blob_hash,o.conflict_code,
 			c.object_type,c.revision,c.parent_id,c.name,c.blob_hash,c.deleted
 			FROM sync_outbox o LEFT JOIN sync_conflict_states c ON c.operation_id=o.operation_id
-			WHERE o.status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries d WHERE d.operation_id=o.operation_id AND d.state='completed')
+			WHERE o.status='conflict' AND NOT EXISTS(SELECT 1 FROM sync_conflict_resolutions r WHERE r.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM conflict_materializations m WHERE m.operation_id=o.operation_id AND m.state IN ('copy_staged','copy_published','completed')) AND NOT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries d WHERE d.operation_id=o.operation_id AND d.state='completed') AND NOT EXISTS(SELECT 1 FROM sync_folder_preserve_delete_resolutions p WHERE p.conflict_operation_id=o.operation_id AND p.state='resolved')
 			ORDER BY o.sequence LIMIT ?`, limit)
 		if err != nil {
 			return err

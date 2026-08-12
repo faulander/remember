@@ -104,7 +104,7 @@ func (a *ActorService) PreserveAndDeleteEmptyFolder(ctx context.Context, r Prese
 		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 	}
 	var child int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM sync_objects WHERE user_id=? AND parent_id=? AND deleted=0 LIMIT 1`, a.userID[:], r.FolderID[:]).Scan(&child)
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM sync_object_versions WHERE user_id=? AND parent_id=? LIMIT 1`, a.userID[:], r.FolderID[:]).Scan(&child)
 	if err == nil {
 		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 	}

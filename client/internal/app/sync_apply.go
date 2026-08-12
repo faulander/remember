@@ -630,6 +630,13 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 		return step, errors.New("remote folder path collision")
 	}
 	if change.Mutation == clientsync.Create {
+		matched, matchErr := store.FolderPreserveDeleteRecoveryCreateMatches(ctx, change)
+		if matchErr != nil {
+			return step, matchErr
+		}
+		if matched && (change.ParentID == nil || *change.ParentID != clientsync.ConflictRecoveredID) {
+			return step, errors.New("preserve delete recovery parent mismatch")
+		}
 		publication, err := store.FolderPublication(ctx, planID, index)
 		if err != nil {
 			return step, err
@@ -661,10 +668,24 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 		return step, err
 	}
 	object, exists := objects[change.ObjectID]
+	if change.Mutation == clientsync.Move && !exists {
+		resolved, resolveErr := store.FolderPreserveDeleteCanonicalMoveMatches(ctx, change)
+		if resolveErr != nil {
+			return step, resolveErr
+		}
+		if resolved {
+			step.locallyApplied = true
+			step.conflictDeferred = true
+			return step, nil
+		}
+	}
 	if change.Mutation == clientsync.Delete && !exists {
 		resolved, resolveErr := store.AlreadyDeletedResolutionMatches(ctx, change)
 		if resolveErr != nil {
 			return step, resolveErr
+		}
+		if !resolved {
+			resolved, resolveErr = store.FolderPreserveDeleteMatches(ctx, change)
 		}
 		if !resolved {
 			resolved, resolveErr = store.FolderMoveDeleteRecoveryMatches(ctx, change)
@@ -864,6 +885,9 @@ func (c *LocalCore) applyFolderCreateStep(ctx context.Context, store *clientsync
 
 func (c *LocalCore) applyFolderMutationStep(ctx context.Context, store *clientsync.Store, planID uuid.UUID, step preparedNoteStep) error {
 	if step.change.State == "applied" || step.locallyApplied {
+		if step.conflictDeferred {
+			return store.MarkApplyStepApplied(ctx, planID, step.index)
+		}
 		if step.deleted {
 			if _, _, err := repository.RootedFolderIdentity(c.root, step.source); err == nil {
 				return errors.New("deleted folder source was recreated")

@@ -17,6 +17,7 @@ import (
 	"github.com/faulander/remember/client/internal/frontmatter"
 	"github.com/faulander/remember/client/internal/localindex"
 	"github.com/faulander/remember/client/internal/reconcile"
+	"github.com/faulander/remember/client/internal/remotehttp"
 	"github.com/faulander/remember/client/internal/repository"
 	"github.com/google/uuid"
 )
@@ -79,6 +80,35 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 				return err
 			}
 			continue
+		}
+		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Delete && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.Revision > m.BaseRevision && resolver != nil {
+			remote, ok := resolver.(interface {
+				PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error)
+			})
+			if ok {
+				resolutionID, err := uuid.NewV7()
+				if err != nil {
+					return err
+				}
+				resolution, err := store.PrepareFolderPreserveDelete(ctx, m.OperationID, resolutionID)
+				if err != nil {
+					return err
+				}
+				if resolution.State == "prepared" {
+					result, err := remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision)
+					if err != nil {
+						var rejected *remotehttp.RejectedError
+						if errors.As(err, &rejected) && rejected.Code == "preserve_delete_unavailable" {
+							continue
+						}
+						return err
+					}
+					if err := store.CompleteFolderPreserveDelete(ctx, m.OperationID, result.RecoveredFolderID, result.RecoveredCursor, result.DeletedCursor); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 		}
 		divergentRootFolderMove := m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && m.ParentID == nil && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.ParentID == nil && conflict.Canonical.Revision > m.BaseRevision && len(conflict.Canonical.BlobHash) == 0 && conflict.Canonical.Name != m.Name
 		if divergentRootFolderMove {

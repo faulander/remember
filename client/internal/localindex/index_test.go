@@ -230,7 +230,7 @@ func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
 	}
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 32 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 33 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
@@ -293,7 +293,7 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 	}
 	defer index.Close()
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 32 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 33 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
@@ -310,7 +310,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=33`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=34`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

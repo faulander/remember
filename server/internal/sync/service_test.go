@@ -180,6 +180,30 @@ func TestPreserveAndDeleteEmptyFolderHandlesLongNameAndCollision(t *testing.T) {
 	}
 }
 
+func TestPreserveAndDeleteEmptyFolderRejectsHistoricalChildren(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	actor := f.actors[0]
+	folder, child := newID(t), newID(t)
+	created := mustAccepted(t, actor, createFolder(folder, "F", nil))
+	mustAccepted(t, actor, createFolder(child, "Child", &folder))
+	mustAccepted(t, actor, Mutation{OperationID: mustNewID(), Kind: MutationDelete, ObjectID: child, ObjectType: ObjectFolder, BaseRevision: 1})
+	moved := mustAccepted(t, actor, func() Mutation {
+		m := mutation(MutationMove, folder, ObjectFolder, created.Revision)
+		m.Name = "Moved"
+		return m
+	}())
+	conflictOp := mustNewID()
+	conflict, _ := actor.Submit(ctx, Mutation{OperationID: conflictOp, Kind: MutationDelete, ObjectID: folder, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	if conflict.Canonical == nil {
+		t.Fatal("missing conflict")
+	}
+	request := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictOp, FolderID: folder, ExpectedRevision: moved.Revision}
+	if _, err := actor.PreserveAndDeleteEmptyFolder(ctx, request); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+		t.Fatalf("historical child accepted=%v", err)
+	}
+}
+
 func TestPreserveAndDeleteEmptyFolderRejectsChildrenAndStaleRevision(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, 1)

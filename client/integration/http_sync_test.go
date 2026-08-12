@@ -266,6 +266,134 @@ func TestAuthenticatedBlobIntegrityAlarmsResumeAfterRestart(t *testing.T) {
 	}
 }
 
+type lostPreserveDeleteResponseRemote struct {
+	*remotehttp.Client
+	lost bool
+}
+
+func (r *lostPreserveDeleteResponseRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	result, err := r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d)
+	if err == nil && !r.lost {
+		r.lost = true
+		return remotehttp.PreserveDeleteFolderResult{}, errors.New("simulated lost preserve-delete response")
+	}
+	return result, err
+}
+
+func TestAuthenticatedEmptyFolderDeleteAgainstRemoteMoveConverges(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "preserve-delete@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Preserve Delete A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Preserve Delete B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	folderID := localFolderIDAtPath(t, ctx, rootA, "F")
+	if err := os.Remove(filepath.Join(rootA, "F")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "RemoteMoved")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "F")
+	syncTimes(t, ctx, b, remoteB, 1)
+	lostRemote := &lostPreserveDeleteResponseRemote{Client: remoteA}
+	if err := a.SyncOnce(ctx, lostRemote); err == nil || !strings.Contains(err.Error(), "simulated lost") {
+		t.Fatalf("lost response=%v", err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a, _, err = clientapp.Open(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	for i := 0; i < 4; i++ {
+		if err := a.SyncOnce(ctx, remoteA); err != nil && !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+			idx, _ := localindex.Open(ctx, filepath.Join(rootA, ".remember", "index.db"))
+			st, _ := clientsync.NewStore(idx)
+			plan, _ := st.ActiveApplyPlan(ctx)
+			idx.Close()
+			t.Fatalf("A resolution %d: %v plan=%#v", i, err, plan)
+		}
+	}
+	if _, err := a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	states := httpSyncStates(t, ctx, remoteA)
+	if state := states[folderID]; !state.Deleted || state.Revision != 3 {
+		t.Fatalf("original=%#v", state)
+	}
+	var recoveredID uuid.UUID
+	var recoveredName string
+	for id, state := range states {
+		if state.ObjectType == clientsync.Folder && !state.Deleted && state.ParentID != nil && *state.ParentID == clientsync.ConflictRecoveredID && strings.Contains(state.Name, "Wiederhergestellt") {
+			recoveredID, recoveredName = id, state.Name
+		}
+	}
+	if recoveredID == uuid.Nil {
+		t.Fatalf("recovery missing: %#v", states)
+	}
+	recoveredPath := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + recoveredName
+	if info, err := os.Stat(filepath.Join(rootA, filepath.FromSlash(recoveredPath))); err != nil || !info.IsDir() {
+		t.Fatalf("A recovered missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "F")); !os.IsNotExist(err) {
+		t.Fatalf("A retained F: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "RemoteMoved")); !os.IsNotExist(err) {
+		t.Fatalf("A retained moved original: %v", err)
+	}
+	syncTimes(t, ctx, b, remoteB, 2)
+	if info, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredPath))); err != nil || !info.IsDir() {
+		t.Fatalf("B recovered missing: %v", err)
+	}
+	for _, old := range []string{"F", "RemoteMoved"} {
+		if _, err := os.Stat(filepath.Join(rootB, old)); !os.IsNotExist(err) {
+			t.Fatalf("B retained %s: %v", old, err)
+		}
+	}
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Preserve Delete C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	if info, err := os.Stat(filepath.Join(rootC, filepath.FromSlash(recoveredPath))); err != nil || !info.IsDir() {
+		t.Fatalf("C recovered missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootC, "RemoteMoved")); !os.IsNotExist(err) {
+		t.Fatalf("C retained original: %v", err)
+	}
+}
+
 func TestAuthenticatedEmptyDivergentFolderMovesConverge(t *testing.T) {
 	ctx := context.Background()
 	server, err := integrationtest.New(ctx, t.TempDir())
