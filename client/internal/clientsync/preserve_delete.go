@@ -73,7 +73,7 @@ func nullablePositiveInt(value uint64) any {
 func (s *Store) KnownPreserveDeleteCursor(ctx context.Context, conflict uuid.UUID) (uint64, error) {
 	var cursor uint64
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT CAST(s.value AS INTEGER) FROM sync_outbox o JOIN sync_conflict_states c ON c.operation_id=o.operation_id JOIN sync_inbox_changes i ON i.object_id=o.object_id AND i.object_type='folder' AND i.mutation='move' AND i.revision=c.revision AND i.name=c.name AND i.parent_id IS c.parent_id JOIN sync_state s ON s.key='confirmed_cursor' WHERE o.operation_id=? AND i.cursor<=CAST(s.value AS INTEGER) ORDER BY i.cursor DESC LIMIT 1`, conflict.String()).Scan(&cursor)
+		return tx.QueryRowContext(ctx, `SELECT CAST(s.value AS INTEGER) FROM sync_outbox o JOIN sync_conflict_states c ON c.operation_id=o.operation_id JOIN sync_inbox_changes i ON i.object_id=o.object_id AND i.object_type='folder' AND i.mutation='move' AND i.revision=c.revision AND i.name=c.name AND i.parent_id IS c.parent_id JOIN sync_state s ON s.key='downloaded_cursor' WHERE o.operation_id=? AND i.cursor<=CAST(s.value AS INTEGER) ORDER BY i.cursor DESC LIMIT 1`, conflict.String()).Scan(&cursor)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
