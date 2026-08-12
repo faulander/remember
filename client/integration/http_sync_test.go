@@ -65,6 +65,9 @@ type interruptingRemote struct {
 	firstNext uint64
 }
 
+func (r *interruptingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	return r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d)
+}
 func (r *interruptingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
 	r.afters = append(r.afters, after)
 	if r.pulls == 1 {
@@ -83,6 +86,9 @@ type recordingRemote struct {
 	afters []uint64
 }
 
+func (r *recordingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	return r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d)
+}
 func (r *recordingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
 	r.afters = append(r.afters, after)
 	return r.Client.Pull(ctx, after, limit)

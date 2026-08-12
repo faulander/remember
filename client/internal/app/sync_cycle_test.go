@@ -181,6 +181,9 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 	r.server.results[m.OperationID] = result
 	return result, nil
 }
+func (r *memoryRemote) PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	return remotehttp.PreserveDeleteFolderResult{}, errors.New("unsupported test resolution")
+}
 func (r *memoryRemote) Pull(_ context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
 	r.server.pullAfters = append(r.server.pullAfters, after)
 	if r.server.pullErr != nil {
@@ -4785,6 +4788,9 @@ func (r *cycleRemote) Submit(_ context.Context, m clientsync.Mutation) (clientsy
 		return clientsync.Result{}, remotehttp.ErrRetryable
 	}
 	return clientsync.Result{Accepted: true, Revision: m.BaseRevision + 1, Cursor: 1}, nil
+}
+func (r *cycleRemote) PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	return remotehttp.PreserveDeleteFolderResult{}, errors.New("unsupported test resolution")
 }
 func (r *cycleRemote) Pull(_ context.Context, after uint64, _ int) (remotehttp.PullPage, error) {
 	r.events = append(r.events, "pull")

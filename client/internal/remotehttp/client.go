@@ -54,13 +54,17 @@ func (e *RejectedError) Error() string {
 	return fmt.Sprintf("remote request rejected with status %d", e.Status)
 }
 
+func validUUIDv7(id uuid.UUID) bool {
+	return id.Version() == 7 && id.Variant() == uuid.RFC4122 && id != uuid.Nil
+}
+
 type PreserveDeleteFolderResult struct {
 	RecoveredFolderID              uuid.UUID
 	RecoveredCursor, DeletedCursor uint64
 }
 
 func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, conflictOperationID, folderID uuid.UUID, expectedRevision uint64) (PreserveDeleteFolderResult, error) {
-	if operationID.Version() != 7 || conflictOperationID.Version() != 7 || folderID == uuid.Nil || expectedRevision == 0 || expectedRevision > math.MaxInt64 {
+	if !validUUIDv7(operationID) || !validUUIDv7(conflictOperationID) || folderID == uuid.Nil || folderID.Variant() != uuid.RFC4122 || expectedRevision == 0 || expectedRevision > math.MaxInt64 {
 		return PreserveDeleteFolderResult{}, errors.New("invalid preserve delete request")
 	}
 	body, _ := json.Marshal(map[string]any{"operation_id": operationID.String(), "conflict_operation_id": conflictOperationID.String(), "folder_id": folderID.String(), "expected_revision": expectedRevision})
@@ -81,7 +85,7 @@ func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, 
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
 	id, err := uuid.Parse(out.RecoveredFolderID)
-	if err != nil || id == uuid.Nil || out.RecoveredCursor == 0 || out.DeletedCursor != out.RecoveredCursor+1 {
+	if err != nil || id == uuid.Nil || id.Variant() != uuid.RFC4122 || id == folderID || out.RecoveredCursor == 0 || out.RecoveredCursor >= math.MaxInt64 || out.DeletedCursor != out.RecoveredCursor+1 || out.DeletedCursor > math.MaxInt64 {
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
 	return PreserveDeleteFolderResult{id, out.RecoveredCursor, out.DeletedCursor}, nil

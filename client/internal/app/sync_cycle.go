@@ -30,6 +30,7 @@ type SyncRemote interface {
 	PutBlob(context.Context, [sha256.Size]byte, []byte) error
 	Submit(context.Context, clientsync.Mutation) (clientsync.Result, error)
 	Pull(context.Context, uint64, int) (remotehttp.PullPage, error)
+	PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error)
 }
 
 // SyncOnce runs one bounded foreground cycle. Credentials remain owned by the
