@@ -54,6 +54,39 @@ func (e *RejectedError) Error() string {
 	return fmt.Sprintf("remote request rejected with status %d", e.Status)
 }
 
+type PreserveDeleteFolderResult struct {
+	RecoveredFolderID              uuid.UUID
+	RecoveredCursor, DeletedCursor uint64
+}
+
+func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, conflictOperationID, folderID uuid.UUID, expectedRevision uint64) (PreserveDeleteFolderResult, error) {
+	if operationID.Version() != 7 || conflictOperationID.Version() != 7 || folderID == uuid.Nil || expectedRevision == 0 || expectedRevision > math.MaxInt64 {
+		return PreserveDeleteFolderResult{}, errors.New("invalid preserve delete request")
+	}
+	body, _ := json.Marshal(map[string]any{"operation_id": operationID.String(), "conflict_operation_id": conflictOperationID.String(), "folder_id": folderID.String(), "expected_revision": expectedRevision})
+	resp, err := c.request(ctx, http.MethodPost, "/v1/sync/folder-preserve-delete", body, "application/json")
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return PreserveDeleteFolderResult{}, classify(resp)
+	}
+	var out struct {
+		RecoveredFolderID string `json:"recovered_folder_id"`
+		RecoveredCursor   uint64 `json:"recovered_cursor"`
+		DeletedCursor     uint64 `json:"deleted_cursor"`
+	}
+	if err := decodeJSON(resp, &out, "recovered_folder_id", "recovered_cursor", "deleted_cursor"); err != nil {
+		return PreserveDeleteFolderResult{}, ErrInvalidResponse
+	}
+	id, err := uuid.Parse(out.RecoveredFolderID)
+	if err != nil || id == uuid.Nil || out.RecoveredCursor == 0 || out.DeletedCursor != out.RecoveredCursor+1 {
+		return PreserveDeleteFolderResult{}, ErrInvalidResponse
+	}
+	return PreserveDeleteFolderResult{id, out.RecoveredCursor, out.DeletedCursor}, nil
+}
+
 type PullPage struct {
 	Changes    []clientsync.Change
 	HasMore    bool
@@ -507,7 +540,7 @@ func validAPIError(status int, code string) bool {
 	case http.StatusNotFound:
 		return code == "blob_not_found"
 	case http.StatusConflict:
-		return code == "blob_unavailable" || code == "operation_replay_mismatch"
+		return code == "blob_unavailable" || code == "operation_replay_mismatch" || code == "preserve_delete_unavailable"
 	case http.StatusRequestEntityTooLarge:
 		return code == "quota_exceeded" || code == "blob_too_large"
 	case http.StatusUnprocessableEntity:
