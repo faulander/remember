@@ -80,5 +80,6 @@
 | [0066](adr/0066-m2-authenticated-empty-divergent-folder-moves.md) | Authentifizierte A/B-/Restart-/Cold-C-Abnahme leerer divergenter Folder-Moves |
 | [0067](adr/0067-m2-divergent-folder-direct-note-recovery.md) | Direkte lineare Note-Ketten in divergent verschobenen Root-Foldern |
 | [0068](adr/0068-m2-authenticated-divergent-folder-note-recovery.md) | Authentifizierte A/B-/Restart-/Cold-C-Abnahme divergenter Folder mit Note-Ketten |
+| [0069](adr/0069-m2-atomic-folder-preserve-delete-protocol.md) | Atomare servergestützte Preserve-and-Delete-Operation für Folder Delete gegen Remote-Move |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

@@ -50,7 +50,7 @@ Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt ke
 | Move | Remote-Delete; rekursiver/Nested oder nichtlinearer Subtree | **Fail-closed** | ADR [0051](adr/0051-m2-direct-note-folder-move-delete-recovery.md); `TestSyncOnceRejectsNonemptyFolderMoveAgainstRemoteDelete`, `TestSyncOnceRejectsUnsafeDirectNotesInFolderMoveDeleteRecovery`. |
 | Delete | Remote-Folder ist nicht leer / `folder_not_empty` | **Konvergiert** | ADR [0027](adr/0027-m2-folder-not-empty-preservation.md); `LocalCore.restoreFolderNotEmptyConflict`; `TestSyncOnceRestoresFolderRejectedAsNotEmpty`. Remote-Struktur bleibt sichtbar. |
 | Delete | Objekt fehlt oder ist bereits tombstoned | **Konvergiert** | ADR [0040](adr/0040-m2-idempotent-stale-deletes.md); `Store.ResolveMissingDelete`; `TestSyncOnceTreatsMissingRemoteFolderDeleteAsSatisfied`. |
-| Delete | Remote-Move / `base_revision_mismatch` | **Protokoll-blockiert** | ADR [0064](adr/0064-m2-divergent-folder-move-policy.md) verwirft eine Client-only-Auflösung verbindlich: Der Konfliktsnapshot beweist keinen dauerhaft vollständigen Subtree. Erforderlich ist eine atomare servergestützte Preserve-and-Delete-Operation oder ein gleichwertiger revisionsgebundener Subtree-Snapshot. |
+| Delete | Remote-Move / `base_revision_mismatch` | **Protokoll festgelegt; Implementierung offen** | ADR [0064](adr/0064-m2-divergent-folder-move-policy.md) verwirft eine Client-only-Auflösung. ADR [0069](adr/0069-m2-atomic-folder-preserve-delete-protocol.md) definiert eine actor-gebundene idempotente Servertransaktion: vollständige aktuelle Subtree-DAG unter neuen UUIDs nach `_Konflikte/Wiederhergestellt` klonen und Original child-first tombstonen. |
 
 ## Querschnitt, Plattformen und Betrieb
 
@@ -83,6 +83,6 @@ Priorisiert, ohne externe Zielhardware:
 1. Den authentifiziert abgenommenen engen Scheduler für lineare Root-Note-Update/-Delete-Ketten aus ADR 0057/0058 auf weitere beweisbar unabhängige Objektformen erweitern; der technische Retry abgebrochener unveränderlicher Planlinks ist durch ADR 0059 vorhanden, eine UI-/Operator-Steuerung bleibt offen.
 2. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
 3. Rekursive oder nichtlineare divergente Folder-Subtrees bleiben separat fail-closed; eine Erweiterung erfordert vollständige Manifest-/DAG- und Source-Restoration-Abnahme.
-4. Für Folder-Delete/Remote-Move per ADR entscheiden, ob eine atomare Preserve-and-Delete-Serveroperation, ein revisionsgebundener Subtree-Snapshot oder ein anderer beweisbar verlustfreier Ansatz verwendet wird; der bisher untersuchte reine Clientansatz war nicht sicher.
+4. ADR 0069 serverseitig, als strikten HTTP-Transport und anschließend als crash-fortsetzbaren Client-Apply mit A/B/Restart/Cold-C implementieren.
 
 Nicht als lokal automatisierbar gezählt werden reale Windows-/Linux-Gerätetests, Codesigning, Reverse-Proxy-/Deployment-Abnahme und der derzeit nicht erreichbare Remote-Docker-Kontext.
