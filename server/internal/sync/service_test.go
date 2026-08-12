@@ -119,7 +119,7 @@ func TestPreserveAndDeleteEmptyFolderIsAtomicAndReplaySafe(t *testing.T) {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 	replay, err := actor.PreserveAndDeleteEmptyFolder(ctx, req)
-	if err != nil || replay != result {
+	if err != nil || replay.RecoveredFolderID != result.RecoveredFolderID || replay.FirstCursor != result.FirstCursor || replay.LastCursor != result.LastCursor {
 		t.Fatalf("replay=%#v err=%v", replay, err)
 	}
 	changed := req
@@ -722,4 +722,100 @@ func mustAccepted(t *testing.T, actor *ActorService, m Mutation) SubmitResult {
 		t.Fatalf("submit=%#v err=%v", r, e)
 	}
 	return r
+}
+
+func TestPreserveAndDeleteDirectEmptyFoldersV2OrderingReplay(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	a := f.actors[0]
+	root, child := newID(t), newID(t)
+	created := mustAccepted(t, a, createFolder(root, "Root", nil))
+	mustAccepted(t, a, createFolder(child, "Child", &root))
+	m := mutation(MutationMove, root, ObjectFolder, created.Revision)
+	m.Name = "Moved"
+	moved := mustAccepted(t, a, m)
+	conflictID := mustNewID()
+	conflict, _ := a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	if conflict.Conflict != ConflictBaseRevisionMismatch {
+		t.Fatalf("conflict=%#v", conflict)
+	}
+	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 2, KnownCursor: moved.Cursor}
+	got, err := a.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Clones) != 1 || got.FirstCursor+3 != got.LastCursor || got.Clones[0].OriginalFolderID != child || got.Clones[0].CreateCursor != got.FirstCursor+1 || got.Clones[0].DeleteCursor != got.FirstCursor+2 {
+		t.Fatalf("result=%#v", got)
+	}
+	page, err := a.Pull(ctx, got.FirstCursor-1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Changes) != 4 || page.Changes[0].Mutation != MutationCreate || page.Changes[0].ObjectID != got.RecoveredFolderID || page.Changes[1].Mutation != MutationCreate || page.Changes[1].ParentID == nil || *page.Changes[1].ParentID != got.RecoveredFolderID || page.Changes[2].Mutation != MutationDelete || page.Changes[2].ObjectID != child || page.Changes[3].Mutation != MutationDelete || page.Changes[3].ObjectID != root {
+		t.Fatalf("changes=%#v", page.Changes)
+	}
+	replay, err := a.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil || len(replay.Clones) != 1 || replay.Clones[0] != got.Clones[0] || replay.FirstCursor != got.FirstCursor || replay.LastCursor != got.LastCursor {
+		t.Fatalf("replay=%#v err=%v", replay, err)
+	}
+	changed := req
+	changed.KnownCursor--
+	if _, err = a.PreserveAndDeleteEmptyFolder(ctx, changed); !errors.Is(err, ErrOperationReplayMismatch) {
+		t.Fatalf("replay mismatch=%v", err)
+	}
+}
+
+func TestPreserveAndDeleteDirectEmptyFoldersV2RejectsLateChildNoteAndNested(t *testing.T) {
+	for _, tc := range []string{"late-child", "note", "nested"} {
+		t.Run(tc, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t, 1)
+			a := f.actors[0]
+			root, child := newID(t), newID(t)
+			created := mustAccepted(t, a, createFolder(root, "Root", nil))
+			m := mutation(MutationMove, root, ObjectFolder, created.Revision)
+			m.Name = "Moved"
+			moved := mustAccepted(t, a, m)
+			known := moved.Cursor
+			switch tc {
+			case "late-child":
+				mustAccepted(t, a, createFolder(child, "Late", &root))
+			case "note":
+				note := mutation(MutationCreate, child, ObjectNote, 0)
+				note.ParentID = &root
+				note.Name = "n.md"
+				note.BlobHash = f.blob
+				mustAccepted(t, a, note)
+			case "nested":
+				mustAccepted(t, a, createFolder(child, "Child", &root))
+				nested := newID(t)
+				mustAccepted(t, a, createFolder(nested, "Nested", &child))
+				known = mustCursor(t, f, root, child, nested)
+			}
+			conflictID := mustNewID()
+			conflict, _ := a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+			if conflict.Canonical == nil {
+				t.Fatal("missing conflict")
+			}
+			req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 2, KnownCursor: known}
+			if _, err := a.PreserveAndDeleteEmptyFolder(ctx, req); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+				t.Fatalf("accepted %s: %v", tc, err)
+			}
+		})
+	}
+}
+
+func mustCursor(t *testing.T, f *fixture, ids ...uuid.UUID) uint64 {
+	t.Helper()
+	var cursor uint64
+	for _, id := range ids {
+		var c uint64
+		if err := f.db.QueryRow(`SELECT MAX(cursor) FROM sync_change_log WHERE user_id=? AND object_id=?`, f.users[0][:], id[:]).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		if c > cursor {
+			cursor = c
+		}
+	}
+	return cursor
 }

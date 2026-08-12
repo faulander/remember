@@ -8,7 +8,9 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Added
 
-- Client-Schema v33 bindet die leere Preserve-and-Delete-Historie exakt und schließt nur die konkrete aufgelöste Konfliktoperation aus ungelösten Intents aus.
+- ADR 0074 erweitert Preserve-and-delete transaktional auf aktuelle direkte leere Child-Folder; versionierter Replay-Hash, bestätigte Cursor-Grenze, zusammenhängende Spanne und Clone-Mapping bleiben dauerhaft gebunden.
+- Client-Schema v34 bindet die leere Preserve-and-Delete-Historie exakt und schließt nur die konkrete aufgelöste Konfliktoperation aus ungelösten Intents aus.
+- Servermigration 007 ergänzt v2-Metadaten und unveränderliche Child-Clone-Zuordnungen bei kompatiblem v1-Replay.
 - ADR 0073 nimmt die leere Folder Delete/Remote-Move-Resolution mit A/B und kaltem C über echte Auth-/Sync-Routen ab.
 - Client-Schema v32 und ADR 0072 persistieren die exakt konfliktgebundene leere Preserve-and-Delete-Resolution und ergänzen den strikten HTTP-Client.
 - ADR 0071 exponiert die leere Preserve-and-Delete-Resolution über einen strikten tokengebundenen Sync-HTTP-Transport.

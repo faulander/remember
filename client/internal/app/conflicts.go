@@ -39,6 +39,14 @@ var testHookAfterDivergentCanonicalStageCreate func() error
 var testHookAfterDivergentCanonicalPublish func() error
 var testHookAfterDivergentCanonicalCleanup func() error
 
+func preserveDeleteClones(in []remotehttp.PreserveDeleteFolderClone) []clientsync.FolderPreserveDeleteClone {
+	out := make([]clientsync.FolderPreserveDeleteClone, len(in))
+	for i, c := range in {
+		out[i] = clientsync.FolderPreserveDeleteClone{OriginalFolderID: c.OriginalFolderID, RecoveredFolderID: c.RecoveredFolderID, CreateCursor: c.CreateCursor, DeleteCursor: c.DeleteCursor}
+	}
+	return out
+}
+
 var ErrConflictMaterializationActive = errors.New("note conflict materialization is active")
 
 func (c *LocalCore) rejectActiveNoteConflict(ctx context.Context, id uuid.UUID) error {
@@ -83,19 +91,23 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		}
 		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Delete && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.Revision > m.BaseRevision && resolver != nil {
 			remote, ok := resolver.(interface {
-				PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error)
+				PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error)
 			})
 			if ok {
 				resolutionID, err := uuid.NewV7()
 				if err != nil {
 					return err
 				}
-				resolution, err := store.PrepareFolderPreserveDelete(ctx, m.OperationID, resolutionID)
+				knownCursor, err := store.KnownPreserveDeleteCursor(ctx, m.OperationID)
+				if err != nil {
+					return err
+				}
+				resolution, err := store.PrepareFolderPreserveDelete(ctx, m.OperationID, resolutionID, knownCursor)
 				if err != nil {
 					return err
 				}
 				if resolution.State == "prepared" {
-					result, err := remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision)
+					result, err := remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision, resolution.KnownCursor)
 					if err != nil {
 						var rejected *remotehttp.RejectedError
 						if errors.As(err, &rejected) && rejected.Code == "preserve_delete_unavailable" {
@@ -103,7 +115,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 						}
 						return err
 					}
-					if err := store.CompleteFolderPreserveDelete(ctx, m.OperationID, result.RecoveredFolderID, result.RecoveredCursor, result.DeletedCursor); err != nil {
+					if err := store.CompleteFolderPreserveDelete(ctx, m.OperationID, result.RecoveredFolderID, result.FirstCursor, result.LastCursor, preserveDeleteClones(result.Clones)); err != nil {
 						return err
 					}
 				}

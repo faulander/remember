@@ -181,7 +181,7 @@ func (r *memoryRemote) Submit(_ context.Context, m clientsync.Mutation) (clients
 	r.server.results[m.OperationID] = result
 	return result, nil
 }
-func (r *memoryRemote) PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+func (r *memoryRemote) PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error) {
 	return remotehttp.PreserveDeleteFolderResult{}, errors.New("unsupported test resolution")
 }
 func (r *memoryRemote) Pull(_ context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
@@ -4789,7 +4789,7 @@ func (r *cycleRemote) Submit(_ context.Context, m clientsync.Mutation) (clientsy
 	}
 	return clientsync.Result{Accepted: true, Revision: m.BaseRevision + 1, Cursor: 1}, nil
 }
-func (r *cycleRemote) PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+func (r *cycleRemote) PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error) {
 	return remotehttp.PreserveDeleteFolderResult{}, errors.New("unsupported test resolution")
 }
 func (r *cycleRemote) Pull(_ context.Context, after uint64, _ int) (remotehttp.PullPage, error) {
@@ -5364,5 +5364,46 @@ func TestSyncOnceReconcilesInboxAfterExistingApplyPlanCompletes(t *testing.T) {
 	}
 	if active, err := store.ActiveApplyPlan(ctx); err != nil || active != nil {
 		t.Fatalf("active=%#v err=%v", active, err)
+	}
+}
+
+func TestPreserveDeleteAbsentChildResolvesBeforeMissingParentPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	index, err := localindex.Open(ctx, filepath.Join(root, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	core := &LocalCore{root: root, index: index}
+	store, _ := clientsync.NewStore(core.index)
+	originalRoot, child, recoveredRoot, recoveredChild := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	createOp, conflict, resolution := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err = store.Enqueue(ctx, []clientsync.Mutation{{OperationID: createOp, Kind: clientsync.Create, ObjectID: originalRoot, ObjectType: clientsync.Folder, Name: "Root"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, createOp, clientsync.Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Enqueue(ctx, []clientsync.Mutation{{OperationID: conflict, Kind: clientsync.Delete, ObjectID: originalRoot, ObjectType: clientsync.Folder, BaseRevision: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.MarkAttempted(ctx, conflict); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, conflict, clientsync.Result{Conflict: "base_revision_mismatch", Canonical: &clientsync.CanonicalState{ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.PrepareFolderPreserveDelete(ctx, conflict, resolution, 9); err != nil {
+		t.Fatal(err)
+	}
+	clones := []clientsync.FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 12}}
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, 10, 13, clones); err != nil {
+		t.Fatal(err)
+	}
+	change := clientsync.Change{Cursor: 12, Mutation: clientsync.Delete, ObjectID: child, ObjectType: clientsync.Folder, Revision: 2, ParentID: &originalRoot, Name: "Child", Deleted: true}
+	step, err := core.preflightFolderStep(ctx, store, uuid.Must(uuid.NewV7()), 0, change, map[uuid.UUID]localindex.Object{}, map[string]uuid.UUID{})
+	if err != nil || !step.conflictDeferred || !step.locallyApplied || !step.deleted {
+		t.Fatalf("step=%#v err=%v", step, err)
 	}
 }

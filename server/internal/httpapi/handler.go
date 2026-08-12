@@ -455,6 +455,8 @@ func (h *handler) preserveDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		ConflictOperationID string `json:"conflict_operation_id"`
 		FolderID            string `json:"folder_id"`
 		ExpectedRevision    uint64 `json:"expected_revision"`
+		RequestVersion      uint64 `json:"request_version"`
+		KnownCursor         uint64 `json:"known_cursor"`
 	}
 	if err := decodeStrictJSONFields(w, r, &request, "operation_id", "conflict_operation_id", "folder_id", "expected_revision"); err != nil {
 		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
@@ -471,7 +473,7 @@ func (h *handler) preserveDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	folder, err := parseSyncObjectID(request.FolderID)
-	if err != nil || request.ExpectedRevision == 0 || request.ExpectedRevision > math.MaxInt64 {
+	if err != nil || request.ExpectedRevision == 0 || request.ExpectedRevision > math.MaxInt64 || request.RequestVersion > 2 || (request.RequestVersion == 2 && (request.KnownCursor == 0 || request.KnownCursor > math.MaxInt64)) || (request.RequestVersion != 2 && request.KnownCursor != 0) {
 		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -484,12 +486,20 @@ func (h *handler) preserveDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-h.syncSlots }()
-	result, err := actor.PreserveAndDeleteEmptyFolder(r.Context(), synccore.PreserveDeleteFolderRequest{OperationID: operation, ConflictOperationID: conflict, FolderID: folder, ExpectedRevision: request.ExpectedRevision})
+	result, err := actor.PreserveAndDeleteEmptyFolder(r.Context(), synccore.PreserveDeleteFolderRequest{OperationID: operation, ConflictOperationID: conflict, FolderID: folder, ExpectedRevision: request.ExpectedRevision, Version: request.RequestVersion, KnownCursor: request.KnownCursor})
 	if err != nil {
 		h.writeSyncError(w, r, err)
 		return
 	}
-	writeJSON(w, r, http.StatusOK, map[string]any{"recovered_folder_id": result.RecoveredFolderID.String(), "recovered_cursor": result.RecoveredCursor, "deleted_cursor": result.DeletedCursor})
+	if request.RequestVersion == 0 || request.RequestVersion == 1 {
+		writeJSON(w, r, http.StatusOK, map[string]any{"recovered_folder_id": result.RecoveredFolderID.String(), "recovered_cursor": result.RecoveredCursor, "deleted_cursor": result.DeletedCursor})
+		return
+	}
+	clones := make([]map[string]any, 0, len(result.Clones))
+	for _, clone := range result.Clones {
+		clones = append(clones, map[string]any{"original_folder_id": clone.OriginalFolderID.String(), "recovered_folder_id": clone.RecoveredFolderID.String(), "create_cursor": clone.CreateCursor, "delete_cursor": clone.DeleteCursor})
+	}
+	writeJSON(w, r, http.StatusOK, map[string]any{"recovered_folder_id": result.RecoveredFolderID.String(), "recovered_cursor": result.RecoveredCursor, "deleted_cursor": result.DeletedCursor, "first_cursor": result.FirstCursor, "last_cursor": result.LastCursor, "clones": clones})
 }
 
 func (h *handler) pullSync(w http.ResponseWriter, r *http.Request) {

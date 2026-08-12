@@ -58,16 +58,26 @@ func validUUIDv7(id uuid.UUID) bool {
 	return id.Version() == 7 && id.Variant() == uuid.RFC4122 && id != uuid.Nil
 }
 
+type PreserveDeleteFolderClone struct {
+	OriginalFolderID, RecoveredFolderID uuid.UUID
+	CreateCursor, DeleteCursor          uint64
+}
 type PreserveDeleteFolderResult struct {
-	RecoveredFolderID              uuid.UUID
-	RecoveredCursor, DeletedCursor uint64
+	RecoveredFolderID                                       uuid.UUID
+	RecoveredCursor, DeletedCursor, FirstCursor, LastCursor uint64
+	Clones                                                  []PreserveDeleteFolderClone
 }
 
-func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, conflictOperationID, folderID uuid.UUID, expectedRevision uint64) (PreserveDeleteFolderResult, error) {
-	if !validUUIDv7(operationID) || !validUUIDv7(conflictOperationID) || folderID == uuid.Nil || folderID.Variant() != uuid.RFC4122 || expectedRevision == 0 || expectedRevision > math.MaxInt64 {
+func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, conflictOperationID, folderID uuid.UUID, expectedRevision, knownCursor uint64) (PreserveDeleteFolderResult, error) {
+	if !validUUIDv7(operationID) || !validUUIDv7(conflictOperationID) || folderID == uuid.Nil || folderID.Variant() != uuid.RFC4122 || expectedRevision == 0 || expectedRevision > math.MaxInt64 || knownCursor > math.MaxInt64 {
 		return PreserveDeleteFolderResult{}, errors.New("invalid preserve delete request")
 	}
-	body, _ := json.Marshal(map[string]any{"operation_id": operationID.String(), "conflict_operation_id": conflictOperationID.String(), "folder_id": folderID.String(), "expected_revision": expectedRevision})
+	request := map[string]any{"operation_id": operationID.String(), "conflict_operation_id": conflictOperationID.String(), "folder_id": folderID.String(), "expected_revision": expectedRevision}
+	if knownCursor > 0 {
+		request["request_version"] = 2
+		request["known_cursor"] = knownCursor
+	}
+	body, _ := json.Marshal(request)
 	resp, err := c.request(ctx, http.MethodPost, "/v1/sync/folder-preserve-delete", body, "application/json")
 	if err != nil {
 		return PreserveDeleteFolderResult{}, err
@@ -76,19 +86,58 @@ func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, 
 	if resp.StatusCode != http.StatusOK {
 		return PreserveDeleteFolderResult{}, classify(resp)
 	}
+	if knownCursor == 0 {
+		var old struct {
+			RecoveredFolderID string `json:"recovered_folder_id"`
+			RecoveredCursor   uint64 `json:"recovered_cursor"`
+			DeletedCursor     uint64 `json:"deleted_cursor"`
+		}
+		if err := decodeJSON(resp, &old, "recovered_folder_id", "recovered_cursor", "deleted_cursor"); err != nil {
+			return PreserveDeleteFolderResult{}, ErrInvalidResponse
+		}
+		id, err := uuid.Parse(old.RecoveredFolderID)
+		if err != nil || id == folderID || old.RecoveredCursor == 0 || old.DeletedCursor != old.RecoveredCursor+1 {
+			return PreserveDeleteFolderResult{}, ErrInvalidResponse
+		}
+		return PreserveDeleteFolderResult{RecoveredFolderID: id, RecoveredCursor: old.RecoveredCursor, DeletedCursor: old.DeletedCursor, FirstCursor: old.RecoveredCursor, LastCursor: old.DeletedCursor}, nil
+	}
 	var out struct {
 		RecoveredFolderID string `json:"recovered_folder_id"`
 		RecoveredCursor   uint64 `json:"recovered_cursor"`
 		DeletedCursor     uint64 `json:"deleted_cursor"`
+		FirstCursor       uint64 `json:"first_cursor"`
+		LastCursor        uint64 `json:"last_cursor"`
+		Clones            []struct {
+			OriginalFolderID  string `json:"original_folder_id"`
+			RecoveredFolderID string `json:"recovered_folder_id"`
+			CreateCursor      uint64 `json:"create_cursor"`
+			DeleteCursor      uint64 `json:"delete_cursor"`
+		} `json:"clones"`
 	}
-	if err := decodeJSON(resp, &out, "recovered_folder_id", "recovered_cursor", "deleted_cursor"); err != nil {
+	if err := decodeJSON(resp, &out, "recovered_folder_id", "recovered_cursor", "deleted_cursor", "first_cursor", "last_cursor", "clones"); err != nil {
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
 	id, err := uuid.Parse(out.RecoveredFolderID)
-	if err != nil || id == uuid.Nil || id.Variant() != uuid.RFC4122 || id == folderID || out.RecoveredCursor == 0 || out.RecoveredCursor >= math.MaxInt64 || out.DeletedCursor != out.RecoveredCursor+1 || out.DeletedCursor > math.MaxInt64 {
+	if err != nil || id == uuid.Nil || id.Variant() != uuid.RFC4122 || id == folderID || out.FirstCursor == 0 || out.LastCursor < out.FirstCursor || out.RecoveredCursor != out.FirstCursor || out.DeletedCursor != out.LastCursor || out.LastCursor > math.MaxInt64 {
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
-	return PreserveDeleteFolderResult{id, out.RecoveredCursor, out.DeletedCursor}, nil
+	n := uint64(len(out.Clones))
+	if n > (math.MaxInt64-2)/2 || out.LastCursor != out.FirstCursor+2*n+1 {
+		return PreserveDeleteFolderResult{}, ErrInvalidResponse
+	}
+	result := PreserveDeleteFolderResult{RecoveredFolderID: id, RecoveredCursor: out.RecoveredCursor, DeletedCursor: out.DeletedCursor, FirstCursor: out.FirstCursor, LastCursor: out.LastCursor}
+	seen := map[uuid.UUID]bool{folderID: true, id: true}
+	for index, raw := range out.Clones {
+		oldID, e1 := uuid.Parse(raw.OriginalFolderID)
+		newID, e2 := uuid.Parse(raw.RecoveredFolderID)
+		if e1 != nil || e2 != nil || oldID == uuid.Nil || newID == uuid.Nil || seen[oldID] || seen[newID] || raw.CreateCursor != out.FirstCursor+1+uint64(index) || raw.DeleteCursor != out.FirstCursor+1+n+uint64(index) {
+			return PreserveDeleteFolderResult{}, ErrInvalidResponse
+		}
+		seen[oldID] = true
+		seen[newID] = true
+		result.Clones = append(result.Clones, PreserveDeleteFolderClone{oldID, newID, raw.CreateCursor, raw.DeleteCursor})
+	}
+	return result, nil
 }
 
 type PullPage struct {

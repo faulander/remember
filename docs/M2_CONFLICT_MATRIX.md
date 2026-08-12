@@ -1,6 +1,6 @@
 # M2-Konfliktmatrix – Audit bis ADR 0063
 
-Stand: Client-Schema v33. Berücksichtigt sind insbesondere die dauerhafte Inbox und verknüpften Apply-Pläne aus ADR 0054–0056, der begrenzte Scheduler und seine authentifizierte Abnahme aus ADR 0057/0058, Retry und starvation-freie lineare Root-Note-Ketten aus ADR 0059–0061 sowie dauerhafte und authentifiziert abgenommene Integritätsalarme aus ADR 0062/0063.
+Stand: Client-Schema v34. Berücksichtigt sind insbesondere die dauerhafte Inbox und verknüpften Apply-Pläne aus ADR 0054–0056, der begrenzte Scheduler und seine authentifizierte Abnahme aus ADR 0057/0058, Retry und starvation-freie lineare Root-Note-Ketten aus ADR 0059–0061 sowie dauerhafte und authentifiziert abgenommene Integritätsalarme aus ADR 0062/0063.
 
 Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt keine ADR-Entscheidung und erklärt M2 **nicht** für abgeschlossen.
 

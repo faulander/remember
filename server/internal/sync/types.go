@@ -81,11 +81,18 @@ type VersionState struct {
 
 type PreserveDeleteFolderRequest struct {
 	OperationID, ConflictOperationID, FolderID uuid.UUID
-	ExpectedRevision                           uint64
+	ExpectedRevision, KnownCursor              uint64
+	Version                                    uint64
+}
+type PreserveDeleteFolderClone struct {
+	OriginalFolderID, RecoveredFolderID uuid.UUID
+	CreateCursor, DeleteCursor          uint64
 }
 type PreserveDeleteFolderResult struct {
 	RecoveredFolderID              uuid.UUID
-	RecoveredCursor, DeletedCursor uint64
+	RecoveredCursor, DeletedCursor uint64 // v1 compatibility
+	FirstCursor, LastCursor        uint64
+	Clones                         []PreserveDeleteFolderClone
 }
 
 var ErrPreserveDeleteUnavailable = errors.New("folder preserve delete unavailable")

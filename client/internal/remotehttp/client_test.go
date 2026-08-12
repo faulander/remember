@@ -97,17 +97,17 @@ func TestPreserveDeleteFolderContract(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
-		if body["operation_id"] != operation.String() || body["conflict_operation_id"] != conflict.String() || body["folder_id"] != folder.String() || body["expected_revision"] != float64(2) {
+		if body["operation_id"] != operation.String() || body["conflict_operation_id"] != conflict.String() || body["folder_id"] != folder.String() || body["expected_revision"] != float64(2) || body["request_version"] != float64(2) || body["known_cursor"] != float64(9) {
 			t.Errorf("body=%v", body)
 		}
-		jsonResponse(w, map[string]any{"recovered_folder_id": recovered.String(), "recovered_cursor": 10, "deleted_cursor": 11})
+		jsonResponse(w, map[string]any{"recovered_folder_id": recovered.String(), "recovered_cursor": 10, "deleted_cursor": 11, "first_cursor": 10, "last_cursor": 11, "clones": []any{}})
 	}))
 	defer server.Close()
 	client, err := New(server.URL, nil, tokenSource())
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.PreserveAndDeleteEmptyFolder(context.Background(), operation, conflict, folder, 2)
+	result, err := client.PreserveAndDeleteEmptyFolder(context.Background(), operation, conflict, folder, 2, 9)
 	if err != nil || result.RecoveredFolderID != recovered || result.RecoveredCursor != 10 || result.DeletedCursor != 11 {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}

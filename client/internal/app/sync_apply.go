@@ -620,6 +620,17 @@ func stagedRemoteDeleteConflict(ctx context.Context, store *clientsync.Store, ch
 }
 
 func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.Store, planID uuid.UUID, index int, change clientsync.Change, objects map[uuid.UUID]localindex.Object, pathOwners map[string]uuid.UUID) (preparedNoteStep, error) {
+	if change.Mutation == clientsync.Delete {
+		if _, exists := objects[change.ObjectID]; !exists {
+			resolved, err := store.FolderPreserveDeleteMatches(ctx, change)
+			if err != nil {
+				return preparedNoteStep{}, err
+			}
+			if resolved {
+				return preparedNoteStep{index: index, change: change, deleted: true, locallyApplied: true, conflictDeferred: true}, nil
+			}
+		}
+	}
 	target, err := remoteNotePath(objects, change.ParentID, change.Name)
 	if err != nil {
 		return preparedNoteStep{}, err
@@ -630,11 +641,11 @@ func (c *LocalCore) preflightFolderStep(ctx context.Context, store *clientsync.S
 		return step, errors.New("remote folder path collision")
 	}
 	if change.Mutation == clientsync.Create {
-		matched, matchErr := store.FolderPreserveDeleteRecoveryCreateMatches(ctx, change)
+		matched, expectedParent, matchErr := store.FolderPreserveDeleteRecoveryCreateParent(ctx, change)
 		if matchErr != nil {
 			return step, matchErr
 		}
-		if matched && (change.ParentID == nil || *change.ParentID != clientsync.ConflictRecoveredID) {
+		if matched && (change.ParentID == nil || expectedParent == nil || *change.ParentID != *expectedParent) {
 			return step, errors.New("preserve delete recovery parent mismatch")
 		}
 		publication, err := store.FolderPublication(ctx, planID, index)
