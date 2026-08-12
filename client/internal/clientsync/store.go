@@ -268,6 +268,22 @@ func (s *Store) enqueueTx(ctx context.Context, tx *sql.Tx, mutations []Mutation)
 		if err := validateMutation(m); err != nil {
 			return err
 		}
+		if m.Kind == Move && m.ObjectType == Folder && m.ParentID != nil && *m.ParentID == ConflictRecoveredID && m.BaseRevision == 1 {
+			var raw string
+			err := tx.QueryRowContext(ctx, `SELECT r.new_operation_id FROM conflict_folder_divergent_move_recoveries r JOIN sync_outbox create_op ON create_op.operation_id=r.new_operation_id WHERE r.recovered_folder_id=? AND r.recovery_relative=? AND r.state='completed' AND create_op.object_id=r.recovered_folder_id AND create_op.mutation='create' AND create_op.status IN ('pending','attempted','accepted')`, m.ObjectID.String(), ConflictRootName+"/"+ConflictRecoveredName+"/"+m.Name).Scan(&raw)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil {
+				createID, parseErr := uuid.Parse(raw)
+				if parseErr != nil {
+					return errors.New("corrupt divergent recovery create operation")
+				}
+				if mutationDependsOn(m, createID) {
+					continue
+				}
+			}
+		}
 		projectedRevision, projectedDependency, durable, err := s.ProjectionTx(ctx, tx, m.ObjectID)
 		if err != nil {
 			return err
@@ -931,21 +947,11 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 }
 
 func (s *Store) PutFolderMutation(ctx context.Context, mutation FolderMutation) error {
-	reservedEcho := mutation.Mutation == Move && mutation.SourceRelative == mutation.TargetRelative && path.Dir(mutation.SourceRelative) == ConflictRootName+"/"+ConflictRecoveredName && naming.ValidateComponent(path.Base(mutation.SourceRelative)) == nil
-	validTarget := mutation.Mutation == Move && (naming.ValidateUserRelativePath(mutation.TargetRelative) == nil || reservedEcho) || mutation.Mutation == Delete && len(mutation.TargetRelative) > 0
-	if !validOperationID(mutation.PlanID) || mutation.StepIndex < 0 || !validObjectID(mutation.FolderID) || (mutation.Mutation != Move && mutation.Mutation != Delete) || (naming.ValidateUserRelativePath(mutation.SourceRelative) != nil && !reservedEcho) || !validTarget || mutation.Device == 0 || mutation.Inode == 0 || mutation.Device > math.MaxInt64 || mutation.Inode > math.MaxInt64 {
+	validTarget := mutation.Mutation == Move && naming.ValidateUserRelativePath(mutation.TargetRelative) == nil || mutation.Mutation == Delete && len(mutation.TargetRelative) > 0
+	if !validOperationID(mutation.PlanID) || mutation.StepIndex < 0 || !validObjectID(mutation.FolderID) || (mutation.Mutation != Move && mutation.Mutation != Delete) || naming.ValidateUserRelativePath(mutation.SourceRelative) != nil || !validTarget || mutation.Device == 0 || mutation.Inode == 0 || mutation.Device > math.MaxInt64 || mutation.Inode > math.MaxInt64 {
 		return errors.New("invalid folder mutation binding")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		if reservedEcho {
-			var bound int
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries WHERE recovered_folder_id=? AND recovery_relative=? AND state='completed')`, mutation.FolderID.String(), mutation.SourceRelative).Scan(&bound); err != nil {
-				return err
-			}
-			if bound != 1 {
-				return errors.New("reserved folder mutation lacks recovery provenance")
-			}
-		}
 		res, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_mutations(plan_id,step_index,folder_id,mutation_kind,source_relative,target_relative,device,inode)
 			SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM apply_steps WHERE plan_id=? AND step_index=? AND object_id=? AND mutation=? AND object_type='folder')`, mutation.PlanID.String(), mutation.StepIndex, mutation.FolderID.String(), mutation.Mutation, mutation.SourceRelative, mutation.TargetRelative, mutation.Device, mutation.Inode, mutation.PlanID.String(), mutation.StepIndex, mutation.FolderID.String(), mutation.Mutation)
 		if err != nil {
