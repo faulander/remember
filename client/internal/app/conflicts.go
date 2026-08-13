@@ -39,10 +39,17 @@ var testHookAfterDivergentCanonicalStageCreate func() error
 var testHookAfterDivergentCanonicalPublish func() error
 var testHookAfterDivergentCanonicalCleanup func() error
 
+func preserveDeleteNotes(in []remotehttp.PreserveDeleteNoteMove) []clientsync.FolderPreserveDeleteNoteMove {
+	out := make([]clientsync.FolderPreserveDeleteNoteMove, len(in))
+	for i, n := range in {
+		out[i] = clientsync.FolderPreserveDeleteNoteMove{NoteID: n.NoteID, SourceParentID: n.SourceParentID, TargetParentID: n.TargetParentID, MoveCursor: n.MoveCursor, SourceRevision: n.SourceRevision, TargetRevision: n.TargetRevision, Name: n.Name, BlobHash: append([]byte(nil), n.BlobHash...)}
+	}
+	return out
+}
 func preserveDeleteClones(in []remotehttp.PreserveDeleteFolderClone) []clientsync.FolderPreserveDeleteClone {
 	out := make([]clientsync.FolderPreserveDeleteClone, len(in))
 	for i, c := range in {
-		out[i] = clientsync.FolderPreserveDeleteClone{OriginalFolderID: c.OriginalFolderID, RecoveredFolderID: c.RecoveredFolderID, CreateCursor: c.CreateCursor, DeleteCursor: c.DeleteCursor}
+		out[i] = clientsync.FolderPreserveDeleteClone{OriginalFolderID: c.OriginalFolderID, RecoveredFolderID: c.RecoveredFolderID, CreateCursor: c.CreateCursor, DeleteCursor: c.DeleteCursor, SourceRevision: c.SourceRevision, Name: c.Name}
 	}
 	return out
 }
@@ -91,7 +98,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 		}
 		if m.ObjectType == clientsync.Folder && m.Kind == clientsync.Delete && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.Revision > m.BaseRevision && resolver != nil {
 			remote, ok := resolver.(interface {
-				PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error)
+				PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error)
 			})
 			if ok {
 				resolutionID, err := uuid.NewV7()
@@ -102,20 +109,35 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 				if err != nil {
 					return err
 				}
+				if knownCursor == 0 {
+					continue
+				}
 				resolution, err := store.PrepareFolderPreserveDelete(ctx, m.OperationID, resolutionID, knownCursor)
 				if err != nil {
 					return err
 				}
 				if resolution.State == "prepared" {
-					result, err := remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision, resolution.KnownCursor)
+					result, err := remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision, resolution.KnownCursor, resolution.RequestVersion)
+					var rejected *remotehttp.RejectedError
+					if err != nil && resolution.RequestVersion == 2 && errors.As(err, &rejected) && rejected.Code == "preserve_delete_unavailable" {
+						nextID, idErr := uuid.NewV7()
+						if idErr != nil {
+							return idErr
+						}
+						resolution, err = store.PromotePreparedFolderPreserveDeleteV3(ctx, m.OperationID, nextID, resolution.KnownCursor)
+						if err != nil {
+							return err
+						}
+						result, err = remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision, resolution.KnownCursor, resolution.RequestVersion)
+					}
 					if err != nil {
-						var rejected *remotehttp.RejectedError
+						rejected = nil
 						if errors.As(err, &rejected) && rejected.Code == "preserve_delete_unavailable" {
 							continue
 						}
 						return err
 					}
-					if err := store.CompleteFolderPreserveDelete(ctx, m.OperationID, result.RecoveredFolderID, result.FirstCursor, result.LastCursor, preserveDeleteClones(result.Clones)); err != nil {
+					if err := store.CompleteFolderPreserveDelete(ctx, m.OperationID, result.RecoveredFolderID, result.RecoveredFolderName, result.FirstCursor, result.LastCursor, preserveDeleteClones(result.Clones), preserveDeleteNotes(result.NoteMoves)); err != nil {
 						return err
 					}
 				}

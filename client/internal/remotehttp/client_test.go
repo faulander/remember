@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,7 +89,8 @@ func TestClientSubmitPullAndBlobContracts(t *testing.T) {
 
 func TestPreserveDeleteFolderContract(t *testing.T) {
 	operation, conflict := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	folder, recovered := uuid.New(), uuid.New()
+	folder, recovered, originalChild, recoveredChild, note := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	hash := sha256.Sum256([]byte("note"))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/sync/folder-preserve-delete" || r.Method != http.MethodPost {
 			t.Errorf("request=%s %s", r.Method, r.URL.Path)
@@ -97,18 +99,18 @@ func TestPreserveDeleteFolderContract(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
-		if body["operation_id"] != operation.String() || body["conflict_operation_id"] != conflict.String() || body["folder_id"] != folder.String() || body["expected_revision"] != float64(2) || body["request_version"] != float64(2) || body["known_cursor"] != float64(9) {
+		if body["operation_id"] != operation.String() || body["conflict_operation_id"] != conflict.String() || body["folder_id"] != folder.String() || body["expected_revision"] != float64(2) || body["request_version"] != float64(3) || body["known_cursor"] != float64(9) {
 			t.Errorf("body=%v", body)
 		}
-		jsonResponse(w, map[string]any{"recovered_folder_id": recovered.String(), "recovered_cursor": 10, "deleted_cursor": 11, "first_cursor": 10, "last_cursor": 11, "clones": []any{}})
+		jsonResponse(w, map[string]any{"recovered_folder_id": recovered.String(), "recovered_folder_name": "Recovered", "recovered_cursor": 10, "deleted_cursor": 14, "first_cursor": 10, "last_cursor": 14, "clones": []map[string]any{{"original_folder_id": originalChild.String(), "recovered_folder_id": recoveredChild.String(), "create_cursor": 11, "delete_cursor": 13, "source_revision": 1, "name": "Empty"}}, "note_moves": []map[string]any{{"note_id": note.String(), "move_cursor": 12, "source_revision": 2, "target_revision": 3, "source_parent_id": folder.String(), "target_parent_id": recovered.String(), "name": "N.md", "blob_hash": hex.EncodeToString(hash[:])}}})
 	}))
 	defer server.Close()
 	client, err := New(server.URL, nil, tokenSource())
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.PreserveAndDeleteEmptyFolder(context.Background(), operation, conflict, folder, 2, 9)
-	if err != nil || result.RecoveredFolderID != recovered || result.RecoveredCursor != 10 || result.DeletedCursor != 11 {
+	result, err := client.PreserveAndDeleteEmptyFolder(context.Background(), operation, conflict, folder, 2, 9, 3)
+	if err != nil || result.RecoveredFolderID != recovered || result.RecoveredFolderName != "Recovered" || result.RecoveredCursor != 10 || result.DeletedCursor != 14 || len(result.Clones) != 1 || result.Clones[0].SourceRevision != 1 || result.Clones[0].Name != "Empty" || len(result.NoteMoves) != 1 || result.NoteMoves[0].NoteID != note {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
@@ -248,3 +250,53 @@ func jsonResponse(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 func fmtHash(hash [32]byte) string { return fmt.Sprintf("%x", hash[:]) }
+
+func TestPreserveDeleteV1RequestAndV2ResponseRemainLegacy(t *testing.T) {
+	operation, conflict := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	folder, recovered := uuid.New(), uuid.New()
+	for _, version := range []uint64{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if version == 1 {
+					if _, ok := body["request_version"]; ok {
+						t.Errorf("v1 version leaked: %v", body)
+					}
+					jsonResponse(w, map[string]any{"recovered_folder_id": recovered.String(), "recovered_cursor": 10, "deleted_cursor": 11})
+				} else {
+					if body["request_version"] != float64(2) {
+						t.Errorf("v2 body=%v", body)
+					}
+					jsonResponse(w, map[string]any{"recovered_folder_id": recovered.String(), "recovered_cursor": 10, "deleted_cursor": 11, "first_cursor": 10, "last_cursor": 11, "clones": []any{}})
+				}
+			}))
+			defer server.Close()
+			client, _ := New(server.URL, nil, tokenSource())
+			known := uint64(0)
+			if version == 2 {
+				known = 9
+			}
+			result, err := client.PreserveAndDeleteEmptyFolder(context.Background(), operation, conflict, folder, 2, known, version)
+			if err != nil || result.RecoveredFolderID != recovered {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestPreserveDeleteV3ResponseLimit(t *testing.T) {
+	operation, conflict := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	folder := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"recovered_folder_id":"`+uuid.New().String()+`","recovered_folder_name":"Recovered","recovered_cursor":1,"deleted_cursor":2,"first_cursor":1,"last_cursor":2,"clones":[],"note_moves":[],"padding":"`+strings.Repeat("x", maxPreserveDeleteJSONBytes)+`"}`)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, nil, tokenSource())
+	if _, err := client.PreserveAndDeleteEmptyFolder(context.Background(), operation, conflict, folder, 2, 9, 3); !errors.Is(err, ErrInvalidResponse) {
+		t.Fatalf("oversize err=%v", err)
+	}
+}

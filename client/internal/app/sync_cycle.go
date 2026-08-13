@@ -30,7 +30,7 @@ type SyncRemote interface {
 	PutBlob(context.Context, [sha256.Size]byte, []byte) error
 	Submit(context.Context, clientsync.Mutation) (clientsync.Result, error)
 	Pull(context.Context, uint64, int) (remotehttp.PullPage, error)
-	PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error)
+	PreserveAndDeleteEmptyFolder(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uint64, uint64, uint64) (remotehttp.PreserveDeleteFolderResult, error)
 }
 
 // SyncOnce runs one bounded foreground cycle. Credentials remain owned by the
@@ -93,6 +93,50 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode}); err != nil {
 		return err
 	}
+	// Pull authenticated history before dependency-ready child deletes. If it
+	// proves that a pending subtree root was remotely moved, probe that root
+	// delete first so preserve-and-delete can atomically supersede exact child
+	// delete intents before any of them reaches the server.
+	if blocked, probeErr := store.PendingBlockedFolderDeletes(ctx); probeErr != nil {
+		return probeErr
+	} else if len(blocked) > 0 {
+		matched, lookErr := ingestPreserveDeleteProbeHistory(ctx, store, remote, blocked)
+		if lookErr != nil {
+			return lookErr
+		}
+		if !matched {
+			goto normalOutbox
+		}
+		probe, probeErr := store.PendingPreserveDeleteProbe(ctx)
+		if probeErr != nil {
+			return probeErr
+		}
+		if probe != nil {
+			if probeErr = store.MarkPreserveDeleteProbeAttempted(ctx, probe.Mutation.OperationID); probeErr != nil {
+				return probeErr
+			}
+			result, submitErr := remote.Submit(ctx, probe.Mutation)
+			if submitErr != nil {
+				return submitErr
+			}
+			if probeErr = store.RecordResult(ctx, probe.Mutation.OperationID, result); probeErr != nil {
+				return probeErr
+			}
+			if !result.Accepted {
+				if probeErr = c.stageSupportedConflicts(ctx, store, remote); probeErr != nil {
+					return probeErr
+				}
+				still, checkErr := store.HasUnresolvedOutbox(ctx)
+				if checkErr != nil {
+					return checkErr
+				}
+				if still {
+					return ErrUnresolvedOutbound
+				}
+			}
+		}
+	}
+normalOutbox:
 	for {
 		ready, err := store.ListReady(ctx, 1)
 		if err != nil {
@@ -130,6 +174,11 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 		if !result.Accepted {
 			if err := c.stageSupportedConflicts(ctx, store, remote); err != nil {
 				return err
+			}
+			// A rejected subtree-root delete must pull its canonical move before
+			// any queued descendant deletes can be submitted.
+			if item.Mutation.ObjectType == clientsync.Folder && item.Mutation.Kind == clientsync.Delete && result.Conflict == "base_revision_mismatch" {
+				break
 			}
 		}
 	}
@@ -232,6 +281,64 @@ func validatePullChanges(after uint64, page remotehttp.PullPage) (uint64, error)
 		return 0, remotehttp.ErrInvalidResponse
 	}
 	return expected, nil
+}
+
+func ingestPreserveDeleteProbeHistory(ctx context.Context, store *clientsync.Store, remote SyncRemote, blocked map[uuid.UUID]uint64) (bool, error) {
+	type held struct {
+		after uint64
+		page  remotehttp.PullPage
+	}
+	var pages []held
+	after, err := store.DownloadedCursor(ctx)
+	if err != nil {
+		return false, err
+	}
+	matched := false
+	for pageNumber := 0; pageNumber < maxForegroundPullPages; pageNumber++ {
+		page, err := remote.Pull(ctx, after, 100)
+		if err != nil {
+			return false, err
+		}
+		if len(page.Changes) == 0 {
+			if page.HasMore || page.NextCursor != after {
+				return false, remotehttp.ErrInvalidResponse
+			}
+			if !matched {
+				return false, nil
+			}
+			for _, h := range pages {
+				if err = store.IngestPullPage(ctx, h.after, h.page.NextCursor, h.page.Changes); err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+		}
+		if _, err = validatePullChanges(after, page); err != nil {
+			return false, err
+		}
+		for _, change := range page.Changes {
+			if base, ok := blocked[change.ObjectID]; ok && change.ObjectType == clientsync.Folder && change.Mutation == clientsync.Move && change.Revision > base {
+				matched = true
+			}
+		}
+		pages = append(pages, held{after, page})
+		after = page.NextCursor
+		if !page.HasMore {
+			if !matched {
+				return false, nil
+			}
+			for _, h := range pages {
+				if err = store.IngestPullPage(ctx, h.after, h.page.NextCursor, h.page.Changes); err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+		}
+	}
+	if matched {
+		return false, errors.New("preserve delete history page bound exceeded")
+	}
+	return false, nil
 }
 
 // ingestPullWhileOutboundBlocked only extends the durable downloaded frontier.

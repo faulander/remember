@@ -65,8 +65,8 @@ type interruptingRemote struct {
 	firstNext uint64
 }
 
-func (r *interruptingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e uint64) (remotehttp.PreserveDeleteFolderResult, error) {
-	return r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d, e)
+func (r *interruptingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e, v uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	return r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d, e, v)
 }
 func (r *interruptingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
 	r.afters = append(r.afters, after)
@@ -86,8 +86,8 @@ type recordingRemote struct {
 	afters []uint64
 }
 
-func (r *recordingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e uint64) (remotehttp.PreserveDeleteFolderResult, error) {
-	return r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d, e)
+func (r *recordingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e, v uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	return r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d, e, v)
 }
 func (r *recordingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
 	r.afters = append(r.afters, after)
@@ -271,8 +271,8 @@ type lostPreserveDeleteResponseRemote struct {
 	lost bool
 }
 
-func (r *lostPreserveDeleteResponseRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e uint64) (remotehttp.PreserveDeleteFolderResult, error) {
-	result, err := r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d, e)
+func (r *lostPreserveDeleteResponseRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e, v uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	result, err := r.Client.PreserveAndDeleteEmptyFolder(ctx, a, b, c, d, e, v)
 	if err == nil && !r.lost {
 		r.lost = true
 		return remotehttp.PreserveDeleteFolderResult{}, errors.New("simulated lost preserve-delete response")
@@ -280,7 +280,7 @@ func (r *lostPreserveDeleteResponseRemote) PreserveAndDeleteEmptyFolder(ctx cont
 	return result, err
 }
 
-func TestAuthenticatedEmptyFolderDeleteAgainstRemoteMoveConverges(t *testing.T) {
+func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testing.T) {
 	ctx := context.Background()
 	server, err := integrationtest.New(ctx, t.TempDir())
 	if err != nil {
@@ -307,9 +307,39 @@ func TestAuthenticatedEmptyFolderDeleteAgainstRemoteMoveConverges(t *testing.T) 
 	if _, err := a.CreateFolder(ctx, "F"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = a.CreateFolder(ctx, "F/Empty"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := a.CreateNote(ctx, "F/Note.md", "exact preserved body\n", []string{"one", "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notePath := filepath.Join(rootA, "F", "Note.md")
+	raw, err := os.ReadFile(notePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := bytes.LastIndex(raw, []byte("\n---\n"))
+	if marker < 0 {
+		t.Fatal("missing frontmatter close")
+	}
+	raw = append(append(append([]byte(nil), raw[:marker]...), []byte("\ncustom-preserved: exact")...), raw[marker:]...)
+	if err = os.WriteFile(notePath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectedNote := append([]byte(nil), raw...)
 	syncTimes(t, ctx, a, remoteA, 1)
 	syncTimes(t, ctx, b, remoteB, 1)
 	folderID := localFolderIDAtPath(t, ctx, rootA, "F")
+	if err = os.Remove(filepath.Join(rootA, "F", "Note.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Remove(filepath.Join(rootA, "F", "Empty")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(filepath.Join(rootA, "F")); err != nil {
 		t.Fatal(err)
 	}
@@ -360,9 +390,10 @@ func TestAuthenticatedEmptyFolderDeleteAgainstRemoteMoveConverges(t *testing.T) 
 		t.Fatalf("recovery missing: %#v", states)
 	}
 	recoveredPath := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + recoveredName
-	if info, err := os.Stat(filepath.Join(rootA, filepath.FromSlash(recoveredPath))); err != nil || !info.IsDir() {
-		t.Fatalf("A recovered missing: %v", err)
+	if info, err := os.Stat(filepath.Join(rootA, filepath.FromSlash(recoveredPath), "Empty")); err != nil || !info.IsDir() {
+		t.Fatalf("A recovered empty child: %v", err)
 	}
+	assertRememberNoteBytesAndID(t, ctx, a, recoveredPath+"/Note.md", expectedNote, note.ID)
 	if _, err := os.Stat(filepath.Join(rootA, "F")); !os.IsNotExist(err) {
 		t.Fatalf("A retained F: %v", err)
 	}
@@ -370,9 +401,10 @@ func TestAuthenticatedEmptyFolderDeleteAgainstRemoteMoveConverges(t *testing.T) 
 		t.Fatalf("A retained moved original: %v", err)
 	}
 	syncTimes(t, ctx, b, remoteB, 2)
-	if info, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredPath))); err != nil || !info.IsDir() {
-		t.Fatalf("B recovered missing: %v", err)
+	if info, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredPath), "Empty")); err != nil || !info.IsDir() {
+		t.Fatalf("B recovered empty child: %v", err)
 	}
+	assertRememberNoteBytesAndID(t, ctx, b, recoveredPath+"/Note.md", expectedNote, note.ID)
 	for _, old := range []string{"F", "RemoteMoved"} {
 		if _, err := os.Stat(filepath.Join(rootB, old)); !os.IsNotExist(err) {
 			t.Fatalf("B retained %s: %v", old, err)
@@ -386,9 +418,10 @@ func TestAuthenticatedEmptyFolderDeleteAgainstRemoteMoveConverges(t *testing.T) 
 	}
 	defer c.Close()
 	syncTimes(t, ctx, c, remoteC, 1)
-	if info, err := os.Stat(filepath.Join(rootC, filepath.FromSlash(recoveredPath))); err != nil || !info.IsDir() {
-		t.Fatalf("C recovered missing: %v", err)
+	if info, err := os.Stat(filepath.Join(rootC, filepath.FromSlash(recoveredPath), "Empty")); err != nil || !info.IsDir() {
+		t.Fatalf("C recovered empty child: %v", err)
 	}
+	assertRememberNoteBytesAndID(t, ctx, c, recoveredPath+"/Note.md", expectedNote, note.ID)
 	if _, err := os.Stat(filepath.Join(rootC, "RemoteMoved")); !os.IsNotExist(err) {
 		t.Fatalf("C retained original: %v", err)
 	}

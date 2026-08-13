@@ -1732,6 +1732,92 @@ func setBootstrap(t *testing.T, index *localindex.Index) {
 	}
 }
 
+func TestDirectNotePreserveDeleteResolutionSealsExactMappings(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	root, child, note, recoveredRoot, recoveredChild := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	conflict, resolution := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	create := uuid.Must(uuid.NewV7())
+	if err = store.Enqueue(ctx, []Mutation{{OperationID: create, Kind: Create, ObjectID: root, ObjectType: Folder, Name: "Root"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, create, Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	childCreate, noteCreate := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	hash := bytes.Repeat([]byte{7}, 32)
+	if err = store.Enqueue(ctx, []Mutation{{OperationID: childCreate, Kind: Create, ObjectID: child, ObjectType: Folder, ParentID: &root, Name: "Empty"}, {OperationID: noteCreate, Kind: Create, ObjectID: note, ObjectType: Note, ParentID: &root, Name: "N.md", BlobHash: hash}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, childCreate, Result{Accepted: true, Revision: 1, Cursor: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, noteCreate, Result{Accepted: true, Revision: 1, Cursor: 3}); err != nil {
+		t.Fatal(err)
+	}
+	childDelete, noteDelete := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err = store.Enqueue(ctx, []Mutation{{OperationID: childDelete, Kind: Delete, ObjectID: child, ObjectType: Folder, BaseRevision: 1}, {OperationID: noteDelete, Kind: Delete, ObjectID: note, ObjectType: Note, BaseRevision: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Enqueue(ctx, []Mutation{{OperationID: conflict, Kind: Delete, ObjectID: root, ObjectType: Folder, BaseRevision: 1, AdditionalDependencies: []uuid.UUID{childDelete, noteDelete}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, e := tx.Exec(`UPDATE sync_outbox SET status='attempted',attempted_at_ms=1 WHERE operation_id=?`, conflict.String())
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, conflict, Result{Conflict: "base_revision_mismatch", Canonical: &CanonicalState{ObjectType: Folder, Revision: 2, Name: "Moved"}}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := store.PrepareFolderPreserveDelete(ctx, conflict, resolution, 9)
+	if err != nil || prepared.RequestVersion != 3 {
+		t.Fatalf("prepared=%#v %v", prepared, err)
+	}
+	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 13, SourceRevision: 1, Name: "Empty"}}
+	notes := []FolderPreserveDeleteNoteMove{{NoteID: note, SourceParentID: root, TargetParentID: recoveredRoot, MoveCursor: 12, SourceRevision: 1, TargetRevision: 2, Name: "N.md", BlobHash: hash}}
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 14, clones, notes); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 14, clones, notes); err != nil {
+		t.Fatalf("replay=%v", err)
+	}
+	matched, err := store.FolderPreserveDeleteNoteMoveMatches(ctx, Change{Cursor: 12, Mutation: Move, ObjectID: note, ObjectType: Note, Revision: 2, ParentID: &recoveredRoot, Name: "N.md", BlobHash: hash})
+	if err != nil || !matched {
+		t.Fatalf("match=%t %v", matched, err)
+	}
+	for _, id := range []uuid.UUID{child, note} {
+		unresolved, e := store.HasUnresolvedLocalIntent(ctx, id)
+		if e != nil || unresolved {
+			t.Fatalf("unresolved %s=%t %v", id, unresolved, e)
+		}
+	}
+	for _, update := range []string{
+		`UPDATE sync_folder_preserve_delete_resolutions SET recovered_folder_id='changed' WHERE conflict_operation_id=?`,
+		`UPDATE sync_folder_preserve_delete_resolutions SET recovered_folder_name='changed' WHERE conflict_operation_id=?`,
+		`UPDATE sync_folder_preserve_delete_resolutions SET first_cursor=first_cursor+1 WHERE conflict_operation_id=?`,
+		`UPDATE sync_folder_preserve_delete_resolutions SET clone_count=clone_count+1 WHERE conflict_operation_id=?`,
+	} {
+		if err = index.WithTransaction(ctx, func(tx *sql.Tx) error {
+			_, e := tx.Exec(update, conflict.String())
+			return e
+		}); err == nil {
+			t.Fatalf("resolved row mutation accepted: %s", update)
+		}
+	}
+	wrong := append([]FolderPreserveDeleteNoteMove(nil), notes...)
+	wrong[0].Name = "X.md"
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 14, clones, wrong); err == nil {
+		t.Fatal("mismatched note replay accepted")
+	}
+}
+
 func TestDirectFolderPreserveDeleteResolutionBindsSpanAndClones(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "index.db")
@@ -1759,20 +1845,27 @@ func TestDirectFolderPreserveDeleteResolutionBindsSpanAndClones(t *testing.T) {
 	if err = store.RecordResult(ctx, conflict, Result{Conflict: "base_revision_mismatch", Canonical: &CanonicalState{ObjectType: Folder, Revision: 2, Name: "Moved"}}); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := store.PrepareFolderPreserveDelete(ctx, conflict, resolution, 9)
-	if err != nil || prepared.KnownCursor != 9 {
-		t.Fatalf("prepared=%#v err=%v", prepared, err)
-	}
-	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 12}}
-	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, 10, 13, clones); err != nil {
+	if err = index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, e := tx.Exec(`INSERT INTO sync_folder_preserve_delete_resolutions(conflict_operation_id,resolution_operation_id,folder_id,expected_revision,state,request_version,known_cursor) VALUES(?,?,?,2,'prepared',2,9)`, conflict.String(), resolution.String(), root.String())
+		return e
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, 10, 13, clones); err != nil {
+	promotedID := uuid.Must(uuid.NewV7())
+	prepared, err := store.PromotePreparedFolderPreserveDeleteV3(ctx, conflict, promotedID, 9)
+	if err != nil || prepared.KnownCursor != 9 || prepared.RequestVersion != 3 || prepared.ResolutionOperationID != promotedID {
+		t.Fatalf("promoted=%#v err=%v", prepared, err)
+	}
+	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 12, SourceRevision: 1, Name: "Child"}}
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 13, clones, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 13, clones, nil); err != nil {
 		t.Fatalf("replay=%v", err)
 	}
 	bad := append([]FolderPreserveDeleteClone(nil), clones...)
 	bad[0].DeleteCursor = 11
-	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, 10, 13, bad); err == nil {
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 13, bad, nil); err == nil {
 		t.Fatal("mismatched replay accepted")
 	}
 	if err = store.SetConfirmedCursor(ctx, 9); err != nil {
@@ -1809,5 +1902,14 @@ func TestDirectFolderPreserveDeleteResolutionBindsSpanAndClones(t *testing.T) {
 	matchedDelete, err := store.FolderPreserveDeleteMatches(ctx, Change{Cursor: 12, Mutation: Delete, ObjectID: child, ObjectType: Folder, Revision: 2, Deleted: true, Name: "Child", ParentID: &root})
 	if err != nil || !matchedDelete {
 		t.Fatalf("delete=%t err=%v", matchedDelete, err)
+	}
+	if matched, _, err = store.FolderPreserveDeleteRecoveryCreateParent(ctx, Change{Cursor: 11, Mutation: Create, ObjectID: recoveredChild, ObjectType: Folder, Revision: 1, ParentID: &recoveredRoot, Name: "Substituted"}); err != nil || matched {
+		t.Fatalf("substituted create match=%t err=%v", matched, err)
+	}
+	if matchedDelete, err = store.FolderPreserveDeleteMatches(ctx, Change{Cursor: 12, Mutation: Delete, ObjectID: child, ObjectType: Folder, Revision: 3, Deleted: true, Name: "Child", ParentID: &root}); err != nil || matchedDelete {
+		t.Fatalf("substituted delete match=%t err=%v", matchedDelete, err)
+	}
+	if matchedDelete, err = store.FolderPreserveDeleteMatches(ctx, Change{Cursor: 13, Mutation: Delete, ObjectID: root, ObjectType: Folder, Revision: 3, Deleted: true, Name: "Substituted"}); err != nil || matchedDelete {
+		t.Fatalf("substituted root delete match=%t err=%v", matchedDelete, err)
 	}
 }

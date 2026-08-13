@@ -10,6 +10,7 @@ import (
 	"math"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/faulander/remember/client/internal/localindex"
@@ -1013,18 +1014,34 @@ func (s *Store) PutFolderPublication(ctx context.Context, publication FolderPubl
 	expectedStage := fmt.Sprintf(".remember/apply/folders/%s/%d", publication.PlanID.String(), publication.StepIndex)
 	recoveredBase := path.Base(publication.TargetRelative)
 	recoveredTarget := !IsReservedConflictFolder(publication.FolderID) && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName+"/"+recoveredBase && naming.ValidateComponent(recoveredBase) == nil
-	validTarget := naming.ValidateUserRelativePath(publication.TargetRelative) == nil || (publication.FolderID == ConflictRootID && publication.TargetRelative == ConflictRootName) || (publication.FolderID == ConflictRecoveredID && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName) || recoveredTarget
+	preservedTarget := strings.HasPrefix(publication.TargetRelative, ConflictRootName+"/"+ConflictRecoveredName+"/")
+	if preservedTarget {
+		for _, part := range strings.Split(publication.TargetRelative, "/")[2:] {
+			if naming.ValidateComponent(part) != nil {
+				preservedTarget = false
+				break
+			}
+		}
+	}
+	validTarget := naming.ValidateUserRelativePath(publication.TargetRelative) == nil || (publication.FolderID == ConflictRootID && publication.TargetRelative == ConflictRootName) || (publication.FolderID == ConflictRecoveredID && publication.TargetRelative == ConflictRootName+"/"+ConflictRecoveredName) || recoveredTarget || preservedTarget
 	if !validOperationID(publication.PlanID) || publication.StepIndex < 0 || !validObjectID(publication.FolderID) || !validTarget || publication.StageRelative != expectedStage || zeroNonce || publication.Device > math.MaxInt64 || publication.Inode > math.MaxInt64 {
 		return errors.New("invalid folder publication")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var objectID, mutation, objectType, state string
 		var parent sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT object_id,mutation,object_type,state,parent_id FROM apply_steps WHERE plan_id=? AND step_index=?`, publication.PlanID.String(), publication.StepIndex).Scan(&objectID, &mutation, &objectType, &state, &parent); err != nil {
+		var cursor uint64
+		if err := tx.QueryRowContext(ctx, `SELECT object_id,mutation,object_type,state,parent_id,cursor FROM apply_steps WHERE plan_id=? AND step_index=?`, publication.PlanID.String(), publication.StepIndex).Scan(&objectID, &mutation, &objectType, &state, &parent, &cursor); err != nil {
 			return err
 		}
 		if objectID != publication.FolderID.String() || mutation != string(Create) || objectType != string(Folder) || state != "pending" || recoveredTarget && (!parent.Valid || parent.String != ConflictRecoveredID.String()) {
 			return errors.New("folder publication does not match pending create")
+		}
+		if preservedTarget && !recoveredTarget {
+			var exact int
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_folder_preserve_delete_resolutions p WHERE p.state='resolved' AND p.recovered_folder_id=? AND p.first_cursor=? UNION ALL SELECT 1 FROM sync_folder_preserve_delete_clones c JOIN sync_folder_preserve_delete_resolutions p ON p.conflict_operation_id=c.conflict_operation_id WHERE p.state='resolved' AND c.recovered_folder_id=? AND c.create_cursor=? UNION ALL SELECT 1 FROM apply_steps parent_step JOIN apply_folder_publications parent_pub ON parent_pub.plan_id=parent_step.plan_id AND parent_pub.step_index=parent_step.step_index WHERE parent_step.plan_id=? AND parent_step.object_id=? AND parent_step.mutation='create' AND parent_step.object_type='folder' AND parent_step.cursor<? AND parent_pub.target_relative LIKE ?)`, objectID, cursor, objectID, cursor, publication.PlanID.String(), parent.String, cursor, ConflictRootName+"/"+ConflictRecoveredName+"/%").Scan(&exact); err != nil || exact != 1 {
+				return errors.New("folder publication is not preserve-delete bound")
+			}
 		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_publications(plan_id,step_index,folder_id,target_relative,stage_relative,nonce,device,inode,cleanup_authorized) VALUES(?,?,?,?,?,?,?,?,0)`, publication.PlanID.String(), publication.StepIndex, publication.FolderID.String(), publication.TargetRelative, publication.StageRelative, publication.Nonce[:], publication.Device, publication.Inode)
 		return err

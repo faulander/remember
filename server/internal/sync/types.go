@@ -87,12 +87,22 @@ type PreserveDeleteFolderRequest struct {
 type PreserveDeleteFolderClone struct {
 	OriginalFolderID, RecoveredFolderID uuid.UUID
 	CreateCursor, DeleteCursor          uint64
+	SourceRevision                      uint64
+	Name                                string
+}
+type PreserveDeleteNoteMove struct {
+	NoteID, SourceParentID, TargetParentID     uuid.UUID
+	MoveCursor, SourceRevision, TargetRevision uint64
+	Name                                       string
+	BlobHash                                   []byte
 }
 type PreserveDeleteFolderResult struct {
 	RecoveredFolderID              uuid.UUID
+	RecoveredFolderName            string
 	RecoveredCursor, DeletedCursor uint64 // v1 compatibility
 	FirstCursor, LastCursor        uint64
 	Clones                         []PreserveDeleteFolderClone
+	NoteMoves                      []PreserveDeleteNoteMove
 }
 
 var ErrPreserveDeleteUnavailable = errors.New("folder preserve delete unavailable")

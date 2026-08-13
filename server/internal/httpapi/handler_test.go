@@ -558,8 +558,9 @@ func TestPreserveDeleteFolderHTTPBinding(t *testing.T) {
 	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
 	defer cleanup()
 	actor := newFakeSyncActor()
-	recovered := uuid.New()
-	actor.preserveResult = synccore.PreserveDeleteFolderResult{RecoveredFolderID: recovered, RecoveredCursor: 10, DeletedCursor: 11}
+	recovered, note, source := uuid.New(), uuid.New(), uuid.New()
+	hash := sha256.Sum256([]byte("note"))
+	actor.preserveResult = synccore.PreserveDeleteFolderResult{RecoveredFolderID: recovered, RecoveredFolderName: "Recovered", RecoveredCursor: 10, DeletedCursor: 12, FirstCursor: 10, LastCursor: 12, NoteMoves: []synccore.PreserveDeleteNoteMove{{NoteID: note, SourceParentID: source, TargetParentID: recovered, MoveCursor: 11, SourceRevision: 2, TargetRevision: 3, Name: "N.md", BlobHash: hash[:]}}}
 	api.syncForActor = func(user, device uuid.UUID) (SyncActorService, error) {
 		if user != testUserID || device != testDeviceID {
 			t.Fatalf("actor=%s/%s", user, device)
@@ -567,13 +568,13 @@ func TestPreserveDeleteFolderHTTPBinding(t *testing.T) {
 		return actor, nil
 	}
 	operation, conflict := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	folder := uuid.New()
-	body := map[string]any{"operation_id": operation.String(), "conflict_operation_id": conflict.String(), "folder_id": folder.String(), "expected_revision": 2}
+	folder := actor.preserveResult.NoteMoves[0].SourceParentID
+	body := map[string]any{"operation_id": operation.String(), "conflict_operation_id": conflict.String(), "folder_id": folder.String(), "expected_revision": 2, "request_version": 3, "known_cursor": 9}
 	response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/folder-preserve-delete", body, testAccess, http.StatusOK)
-	if actor.lastPreserve.OperationID != operation || actor.lastPreserve.ConflictOperationID != conflict || actor.lastPreserve.FolderID != folder || actor.lastPreserve.ExpectedRevision != 2 {
+	if actor.lastPreserve.OperationID != operation || actor.lastPreserve.ConflictOperationID != conflict || actor.lastPreserve.FolderID != folder || actor.lastPreserve.ExpectedRevision != 2 || actor.lastPreserve.Version != 3 || actor.lastPreserve.KnownCursor != 9 {
 		t.Fatalf("request=%#v", actor.lastPreserve)
 	}
-	if !strings.Contains(response.Body.String(), recovered.String()) {
+	if !strings.Contains(response.Body.String(), recovered.String()) || !strings.Contains(response.Body.String(), `"recovered_folder_name":"Recovered"`) || !strings.Contains(response.Body.String(), note.String()) || !strings.Contains(response.Body.String(), hex.EncodeToString(hash[:])) {
 		t.Fatalf("body=%s", response.Body.String())
 	}
 }

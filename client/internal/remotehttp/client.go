@@ -24,6 +24,7 @@ import (
 )
 
 const maxJSONBytes = 64 * 1024
+const maxPreserveDeleteJSONBytes = 16 * 1024 * 1024
 
 var (
 	ErrInvalidResponse = errors.New("invalid remote response")
@@ -61,20 +62,32 @@ func validUUIDv7(id uuid.UUID) bool {
 type PreserveDeleteFolderClone struct {
 	OriginalFolderID, RecoveredFolderID uuid.UUID
 	CreateCursor, DeleteCursor          uint64
+	SourceRevision                      uint64
+	Name                                string
+}
+type PreserveDeleteNoteMove struct {
+	NoteID, SourceParentID, TargetParentID     uuid.UUID
+	MoveCursor, SourceRevision, TargetRevision uint64
+	Name                                       string
+	BlobHash                                   []byte
 }
 type PreserveDeleteFolderResult struct {
 	RecoveredFolderID                                       uuid.UUID
+	RecoveredFolderName                                     string
 	RecoveredCursor, DeletedCursor, FirstCursor, LastCursor uint64
 	Clones                                                  []PreserveDeleteFolderClone
+	NoteMoves                                               []PreserveDeleteNoteMove
 }
 
-func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, conflictOperationID, folderID uuid.UUID, expectedRevision, knownCursor uint64) (PreserveDeleteFolderResult, error) {
-	if !validUUIDv7(operationID) || !validUUIDv7(conflictOperationID) || folderID == uuid.Nil || folderID.Variant() != uuid.RFC4122 || expectedRevision == 0 || expectedRevision > math.MaxInt64 || knownCursor > math.MaxInt64 {
+func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, conflictOperationID, folderID uuid.UUID, expectedRevision, knownCursor, requestVersion uint64) (PreserveDeleteFolderResult, error) {
+	if !validUUIDv7(operationID) || !validUUIDv7(conflictOperationID) || folderID == uuid.Nil || folderID.Variant() != uuid.RFC4122 || expectedRevision == 0 || expectedRevision > math.MaxInt64 || knownCursor > math.MaxInt64 || requestVersion < 1 || requestVersion > 3 || (requestVersion == 1) != (knownCursor == 0) {
 		return PreserveDeleteFolderResult{}, errors.New("invalid preserve delete request")
 	}
 	request := map[string]any{"operation_id": operationID.String(), "conflict_operation_id": conflictOperationID.String(), "folder_id": folderID.String(), "expected_revision": expectedRevision}
+	if requestVersion > 1 {
+		request["request_version"] = requestVersion
+	}
 	if knownCursor > 0 {
-		request["request_version"] = 2
 		request["known_cursor"] = knownCursor
 	}
 	body, _ := json.Marshal(request)
@@ -86,7 +99,7 @@ func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, 
 	if resp.StatusCode != http.StatusOK {
 		return PreserveDeleteFolderResult{}, classify(resp)
 	}
-	if knownCursor == 0 {
+	if requestVersion == 1 {
 		var old struct {
 			RecoveredFolderID string `json:"recovered_folder_id"`
 			RecoveredCursor   uint64 `json:"recovered_cursor"`
@@ -102,40 +115,90 @@ func (c *Client) PreserveAndDeleteEmptyFolder(ctx context.Context, operationID, 
 		return PreserveDeleteFolderResult{RecoveredFolderID: id, RecoveredCursor: old.RecoveredCursor, DeletedCursor: old.DeletedCursor, FirstCursor: old.RecoveredCursor, LastCursor: old.DeletedCursor}, nil
 	}
 	var out struct {
-		RecoveredFolderID string `json:"recovered_folder_id"`
-		RecoveredCursor   uint64 `json:"recovered_cursor"`
-		DeletedCursor     uint64 `json:"deleted_cursor"`
-		FirstCursor       uint64 `json:"first_cursor"`
-		LastCursor        uint64 `json:"last_cursor"`
-		Clones            []struct {
+		RecoveredFolderID   string `json:"recovered_folder_id"`
+		RecoveredFolderName string `json:"recovered_folder_name"`
+		RecoveredCursor     uint64 `json:"recovered_cursor"`
+		DeletedCursor       uint64 `json:"deleted_cursor"`
+		FirstCursor         uint64 `json:"first_cursor"`
+		LastCursor          uint64 `json:"last_cursor"`
+		Clones              []struct {
 			OriginalFolderID  string `json:"original_folder_id"`
 			RecoveredFolderID string `json:"recovered_folder_id"`
 			CreateCursor      uint64 `json:"create_cursor"`
 			DeleteCursor      uint64 `json:"delete_cursor"`
+			SourceRevision    uint64 `json:"source_revision"`
+			Name              string `json:"name"`
 		} `json:"clones"`
+		NoteMoves *[]struct {
+			NoteID         string `json:"note_id"`
+			MoveCursor     uint64 `json:"move_cursor"`
+			SourceRevision uint64 `json:"source_revision"`
+			TargetRevision uint64 `json:"target_revision"`
+			SourceParentID string `json:"source_parent_id"`
+			TargetParentID string `json:"target_parent_id"`
+			Name           string `json:"name"`
+			BlobHash       string `json:"blob_hash"`
+		} `json:"note_moves"`
 	}
-	if err := decodeJSON(resp, &out, "recovered_folder_id", "recovered_cursor", "deleted_cursor", "first_cursor", "last_cursor", "clones"); err != nil {
+	required := []string{"recovered_folder_id", "recovered_cursor", "deleted_cursor", "first_cursor", "last_cursor", "clones"}
+	if requestVersion == 3 {
+		required = append(required, "recovered_folder_name", "note_moves")
+	}
+	if err := decodeJSONLimit(resp, &out, maxPreserveDeleteJSONBytes, required...); err != nil {
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
 	id, err := uuid.Parse(out.RecoveredFolderID)
 	if err != nil || id == uuid.Nil || id.Variant() != uuid.RFC4122 || id == folderID || out.FirstCursor == 0 || out.LastCursor < out.FirstCursor || out.RecoveredCursor != out.FirstCursor || out.DeletedCursor != out.LastCursor || out.LastCursor > math.MaxInt64 {
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
-	n := uint64(len(out.Clones))
-	if n > (math.MaxInt64-2)/2 || out.LastCursor != out.FirstCursor+2*n+1 {
+	if requestVersion == 2 && (out.RecoveredFolderName != "" || out.NoteMoves != nil) {
 		return PreserveDeleteFolderResult{}, ErrInvalidResponse
 	}
-	result := PreserveDeleteFolderResult{RecoveredFolderID: id, RecoveredCursor: out.RecoveredCursor, DeletedCursor: out.DeletedCursor, FirstCursor: out.FirstCursor, LastCursor: out.LastCursor}
+	if requestVersion == 3 {
+		if err := naming.ValidateComponent(out.RecoveredFolderName); err != nil {
+			return PreserveDeleteFolderResult{}, ErrInvalidResponse
+		}
+	}
+	var noteMoves []struct {
+		NoteID         string `json:"note_id"`
+		MoveCursor     uint64 `json:"move_cursor"`
+		SourceRevision uint64 `json:"source_revision"`
+		TargetRevision uint64 `json:"target_revision"`
+		SourceParentID string `json:"source_parent_id"`
+		TargetParentID string `json:"target_parent_id"`
+		Name           string `json:"name"`
+		BlobHash       string `json:"blob_hash"`
+	}
+	if out.NoteMoves != nil {
+		noteMoves = *out.NoteMoves
+	}
+	n, m := uint64(len(out.Clones)), uint64(len(noteMoves))
+	if n+m > 10000 || out.LastCursor != out.FirstCursor+2*n+m+1 {
+		return PreserveDeleteFolderResult{}, ErrInvalidResponse
+	}
+	result := PreserveDeleteFolderResult{RecoveredFolderID: id, RecoveredFolderName: out.RecoveredFolderName, RecoveredCursor: out.RecoveredCursor, DeletedCursor: out.DeletedCursor, FirstCursor: out.FirstCursor, LastCursor: out.LastCursor}
 	seen := map[uuid.UUID]bool{folderID: true, id: true}
 	for index, raw := range out.Clones {
 		oldID, e1 := uuid.Parse(raw.OriginalFolderID)
 		newID, e2 := uuid.Parse(raw.RecoveredFolderID)
-		if e1 != nil || e2 != nil || oldID == uuid.Nil || newID == uuid.Nil || seen[oldID] || seen[newID] || raw.CreateCursor != out.FirstCursor+1+uint64(index) || raw.DeleteCursor != out.FirstCursor+1+n+uint64(index) {
+		invalidDescriptor := requestVersion == 3 && (raw.SourceRevision == 0 || naming.ValidateComponent(raw.Name) != nil)
+		if e1 != nil || e2 != nil || oldID == uuid.Nil || newID == uuid.Nil || seen[oldID] || seen[newID] || raw.CreateCursor != out.FirstCursor+1+uint64(index) || raw.DeleteCursor != out.FirstCursor+1+n+m+uint64(index) || invalidDescriptor {
 			return PreserveDeleteFolderResult{}, ErrInvalidResponse
 		}
 		seen[oldID] = true
 		seen[newID] = true
-		result.Clones = append(result.Clones, PreserveDeleteFolderClone{oldID, newID, raw.CreateCursor, raw.DeleteCursor})
+		result.Clones = append(result.Clones, PreserveDeleteFolderClone{OriginalFolderID: oldID, RecoveredFolderID: newID, CreateCursor: raw.CreateCursor, DeleteCursor: raw.DeleteCursor, SourceRevision: raw.SourceRevision, Name: raw.Name})
+	}
+	for index, raw := range noteMoves {
+		id, e1 := uuid.Parse(raw.NoteID)
+		source, e2 := uuid.Parse(raw.SourceParentID)
+		target, e3 := uuid.Parse(raw.TargetParentID)
+		hash, e4 := hex.DecodeString(raw.BlobHash)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil || id == uuid.Nil || seen[id] || source != folderID || target != result.RecoveredFolderID || len(hash) != sha256.Size || raw.MoveCursor != out.FirstCursor+1+n+uint64(index) || raw.SourceRevision == 0 || raw.TargetRevision != raw.SourceRevision+1 || raw.Name == "" {
+			return PreserveDeleteFolderResult{}, ErrInvalidResponse
+		}
+		seen[id] = true
+		result.NoteMoves = append(result.NoteMoves, PreserveDeleteNoteMove{NoteID: id, SourceParentID: source, TargetParentID: target, MoveCursor: raw.MoveCursor, SourceRevision: raw.SourceRevision, TargetRevision: raw.TargetRevision, Name: raw.Name, BlobHash: hash})
 	}
 	return result, nil
 }
@@ -425,15 +488,20 @@ func parseUUID(raw string, v7 bool) (uuid.UUID, error) {
 }
 
 func decodeJSON(resp *http.Response, target any, required ...string) error {
-	return decodeJSONNullable(resp, target, required, required)
+	return decodeJSONLimit(resp, target, maxJSONBytes, required...)
 }
-
+func decodeJSONLimit(resp *http.Response, target any, limit int64, required ...string) error {
+	return decodeJSONNullableLimit(resp, target, required, required, limit)
+}
 func decodeJSONNullable(resp *http.Response, target any, required, nonNull []string) error {
+	return decodeJSONNullableLimit(resp, target, required, nonNull, maxJSONBytes)
+}
+func decodeJSONNullableLimit(resp *http.Response, target any, required, nonNull []string, limit int64) error {
 	if !validJSONContentType(resp.Header.Values("Content-Type")) {
 		return ErrInvalidResponse
 	}
-	content, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBytes+1))
-	if err != nil || len(content) > maxJSONBytes || rejectDuplicates(content) != nil {
+	content, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil || int64(len(content)) > limit || rejectDuplicates(content) != nil {
 		return ErrInvalidResponse
 	}
 	var fields map[string]json.RawMessage

@@ -765,6 +765,148 @@ func TestPreserveAndDeleteDirectEmptyFoldersV2OrderingReplay(t *testing.T) {
 	}
 }
 
+func TestPreserveAndDeleteDirectNotesV3OrderingReplayAndBlobBinding(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	a := f.actors[0]
+	root, child, note := newID(t), newID(t), newID(t)
+	created := mustAccepted(t, a, createFolder(root, "Root", nil))
+	mustAccepted(t, a, createFolder(child, "Empty", &root))
+	mustAccepted(t, a, createNote(note, "Note.md", &root, f.blob))
+	moved := mustAccepted(t, a, moveObject(root, ObjectFolder, created.Revision, "Moved", nil))
+	conflictID := mustNewID()
+	conflict, _ := a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	if conflict.Conflict != ConflictBaseRevisionMismatch {
+		t.Fatalf("conflict=%#v", conflict)
+	}
+	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 3, KnownCursor: moved.Cursor}
+	got, err := a.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Clones) != 1 || len(got.NoteMoves) != 1 || got.LastCursor != got.FirstCursor+4 {
+		t.Fatalf("result=%#v", got)
+	}
+	nm := got.NoteMoves[0]
+	if nm.NoteID != note || nm.SourceParentID != root || nm.TargetParentID != got.RecoveredFolderID || nm.MoveCursor != got.FirstCursor+2 || !bytes.Equal(nm.BlobHash, f.blob) {
+		t.Fatalf("note=%#v", nm)
+	}
+	page, err := a.Pull(ctx, got.FirstCursor-1, 10)
+	if err != nil || len(page.Changes) != 5 {
+		t.Fatalf("page=%#v err=%v", page, err)
+	}
+	kinds := []MutationKind{MutationCreate, MutationCreate, MutationMove, MutationDelete, MutationDelete}
+	for i, k := range kinds {
+		if page.Changes[i].Mutation != k {
+			t.Fatalf("change %d=%#v", i, page.Changes[i])
+		}
+	}
+	if page.Changes[2].ObjectID != note || page.Changes[2].ParentID == nil || *page.Changes[2].ParentID != got.RecoveredFolderID || !bytes.Equal(page.Changes[2].BlobHash, f.blob) {
+		t.Fatalf("move=%#v", page.Changes[2])
+	}
+	replay, err := a.PreserveAndDeleteEmptyFolder(ctx, req)
+	if err != nil || len(replay.NoteMoves) != 1 || replay.NoteMoves[0].MoveCursor != nm.MoveCursor {
+		t.Fatalf("replay=%#v err=%v", replay, err)
+	}
+	var status string
+	var count int
+	if err = f.db.QueryRow(`SELECT status,note_count FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], req.OperationID[:]).Scan(&status, &count); err != nil || status != "completed" || count != 1 {
+		t.Fatalf("seal=%s/%d %v", status, count, err)
+	}
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET request_hash=zeroblob(32) WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], req.OperationID[:]); err == nil {
+		t.Fatal("sealed request hash mutated")
+	}
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_note_moves SET target_parent_id=source_parent_id WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], req.OperationID[:]); err == nil {
+		t.Fatal("sealed note descriptor mutated")
+	}
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_clones SET create_cursor=delete_cursor WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], req.OperationID[:]); err == nil {
+		t.Fatal("sealed clone descriptor mutated")
+	}
+	insertPreparing := func(operation, device uuid.UUID, recoveredName string) {
+		t.Helper()
+		if _, insertErr := f.db.Exec(`INSERT INTO sync_folder_preserve_delete_resolutions(user_id,device_id,resolution_operation_id,request_hash,conflict_operation_id,folder_id,expected_revision,recovered_folder_id,recovered_folder_name,recovered_cursor,deleted_cursor,status,created_at_ms,request_version,known_cursor,first_cursor,last_cursor,clone_count,note_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,'preparing',1,3,?,?,?,?,?)`, f.users[0][:], device[:], operation[:], bytes.Repeat([]byte{9}, 32), req.ConflictOperationID[:], req.FolderID[:], req.ExpectedRevision, got.RecoveredFolderID[:], recoveredName, got.FirstCursor, got.LastCursor, req.KnownCursor, got.FirstCursor, got.LastCursor, len(got.Clones), len(got.NoteMoves)); insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+	insertClone := func(operation uuid.UUID, clone PreserveDeleteFolderClone) error {
+		_, insertErr := f.db.Exec(`INSERT INTO sync_folder_preserve_delete_clones(user_id,resolution_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name) VALUES(?,?,?,?,?,?,?,?,?)`, f.users[0][:], operation[:], 0, clone.OriginalFolderID[:], clone.RecoveredFolderID[:], clone.CreateCursor, clone.DeleteCursor, clone.SourceRevision, clone.Name)
+		return insertErr
+	}
+	insertNote := func(operation uuid.UUID, item PreserveDeleteNoteMove) error {
+		_, insertErr := f.db.Exec(`INSERT INTO sync_folder_preserve_delete_note_moves(user_id,resolution_operation_id,ordinal,note_id,move_cursor,source_revision,target_revision,source_parent_id,target_parent_id,name,blob_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, f.users[0][:], operation[:], 0, item.NoteID[:], item.MoveCursor, item.SourceRevision, item.TargetRevision, item.SourceParentID[:], item.TargetParentID[:], item.Name, item.BlobHash)
+		return insertErr
+	}
+
+	missing := mustNewID()
+	insertPreparing(missing, f.devices[0], got.RecoveredFolderName)
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET status='completed' WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], missing[:]); err == nil {
+		t.Fatal("incomplete mapping sealed")
+	}
+	wrongNote := mustNewID()
+	insertPreparing(wrongNote, f.devices[0], got.RecoveredFolderName)
+	badNote := nm
+	badNote.SourceRevision++
+	badNote.TargetRevision++
+	if err = insertNote(wrongNote, badNote); err == nil {
+		t.Fatal("wrong note source artifact accepted")
+	}
+	wrongClone := mustNewID()
+	insertPreparing(wrongClone, f.devices[0], got.RecoveredFolderName)
+	badClone := got.Clones[0]
+	badClone.Name = "Wrong"
+	if err = insertClone(wrongClone, badClone); err == nil {
+		t.Fatal("wrong clone artifact accepted")
+	}
+	otherDevice := mustNewID()
+	if _, err = f.db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms) VALUES(?,?,'Other','active',1,1)`, f.users[0][:], otherDevice[:]); err != nil {
+		t.Fatal(err)
+	}
+	wrongActor := mustNewID()
+	insertPreparing(wrongActor, otherDevice, got.RecoveredFolderName)
+	if err = insertClone(wrongActor, got.Clones[0]); err == nil {
+		t.Fatal("wrong-device artifact accepted")
+	}
+	wrongRoot := mustNewID()
+	insertPreparing(wrongRoot, f.devices[0], "Wrong")
+	if err = insertClone(wrongRoot, got.Clones[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err = insertNote(wrongRoot, nm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET status='completed' WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], wrongRoot[:]); err == nil {
+		t.Fatal("wrong root artifact sealed")
+	}
+	rebound := mustNewID()
+	insertPreparing(rebound, f.devices[0], got.RecoveredFolderName)
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET status='completed',device_id=? WHERE user_id=? AND resolution_operation_id=?`, otherDevice[:], f.users[0][:], rebound[:]); err == nil {
+		t.Fatal("resolution actor rebound while sealing")
+	}
+}
+
+func TestPreserveAndDeleteDirectNotesV3RejectsUnavailableBlob(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	a := f.actors[0]
+	root, note := newID(t), newID(t)
+	created := mustAccepted(t, a, createFolder(root, "Root", nil))
+	mustAccepted(t, a, createNote(note, "N.md", &root, f.blob))
+	moved := mustAccepted(t, a, moveObject(root, ObjectFolder, created.Revision, "Moved", nil))
+	conflictID := mustNewID()
+	a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	if _, err := f.db.Exec(`UPDATE content_blobs SET available=0 WHERE hash=?`, f.blob); err != nil {
+		t.Fatal(err)
+	}
+	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 3, KnownCursor: moved.Cursor}
+	if _, err := a.PreserveAndDeleteEmptyFolder(ctx, req); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM sync_folder_preserve_delete_resolutions WHERE user_id=?`, f.users[0][:]).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("persisted=%d %v", n, err)
+	}
+}
+
 func TestPreserveAndDeleteDirectEmptyFoldersV2RejectsLateChildNoteAndNested(t *testing.T) {
 	for _, tc := range []string{"late-child", "note", "nested"} {
 		t.Run(tc, func(t *testing.T) {
@@ -802,6 +944,24 @@ func TestPreserveAndDeleteDirectEmptyFoldersV2RejectsLateChildNoteAndNested(t *t
 				t.Fatalf("accepted %s: %v", tc, err)
 			}
 		})
+	}
+}
+
+func TestPreserveAndDeleteV3RejectsNestedPostFrontierHistory(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	a := f.actors[0]
+	root, child, nested := newID(t), newID(t), newID(t)
+	created := mustAccepted(t, a, createFolder(root, "Root", nil))
+	mustAccepted(t, a, createFolder(child, "Child", &root))
+	mustAccepted(t, a, createFolder(nested, "Nested", &child))
+	moved := mustAccepted(t, a, moveObject(root, ObjectFolder, created.Revision, "Moved", nil))
+	mustAccepted(t, a, deleteObject(nested, ObjectFolder, 1))
+	conflictID := mustNewID()
+	a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 3, KnownCursor: moved.Cursor}
+	if _, err := a.PreserveAndDeleteEmptyFolder(ctx, req); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+		t.Fatalf("nested post-frontier history accepted: %v", err)
 	}
 }
 

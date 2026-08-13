@@ -40,18 +40,19 @@ func (e *applyIntegrityError) Error() string { return e.cause.Error() }
 func (e *applyIntegrityError) Unwrap() error { return e.cause }
 
 type preparedNoteStep struct {
-	index             int
-	change            clientsync.Change
-	relative, source  string
-	trash             string
-	expected, content []byte
-	exists, deleted   bool
-	locallyApplied    bool
-	conflictDeferred  bool
-	folderPublication *clientsync.FolderPublication
-	folderMutation    bool
-	folderDevice      uint64
-	folderInode       uint64
+	index                  int
+	change                 clientsync.Change
+	relative, source       string
+	trash                  string
+	expected, content      []byte
+	exists, deleted        bool
+	locallyApplied         bool
+	conflictDeferred       bool
+	folderPublication      *clientsync.FolderPublication
+	folderMutation         bool
+	folderDevice           uint64
+	folderInode            uint64
+	resolutionMaterialized bool
 }
 
 // ExecuteActiveApplyPlan resumes the one durable remote ApplyPlan. This slice
@@ -404,8 +405,31 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 					return nil, errors.New("remote update target changed since reconciliation")
 				}
 			case clientsync.Move:
-				if !objectExists || object.Type != localindex.ObjectNote {
-					return nil, errors.New("remote move object is absent")
+				if !objectExists {
+					matched, matchErr := store.FolderPreserveDeleteNoteMoveMatches(ctx, change)
+					if matchErr != nil {
+						return nil, matchErr
+					}
+					if !matched {
+						return nil, errors.New("remote move object is absent")
+					}
+					if !vacatedPaths[portablePathKey(target)] {
+						current, readErr := repository.ReadRooted(c.root, target, clientsync.MaxBlobBytes)
+						if readErr == nil {
+							if !bytes.Equal(current, blob) {
+								return nil, errors.New("preserve delete note target occupied")
+							}
+							step.exists = true
+						} else if !errors.Is(readErr, os.ErrNotExist) {
+							return nil, readErr
+						}
+					}
+					step.expected = blob
+					step.resolutionMaterialized = true
+					break
+				}
+				if object.Type != localindex.ObjectNote {
+					return nil, errors.New("remote move object type mismatch")
 				}
 				step.source = object.RelativePath
 				step.expected, err = repository.ReadRooted(c.root, step.source, clientsync.MaxBlobBytes)
@@ -1059,6 +1083,9 @@ func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {
 	case clientsync.Move:
 		if step.exists {
 			return nil
+		}
+		if step.resolutionMaterialized {
+			return repository.CreateRooted(c.root, step.relative, step.content, validateAppliedNote(step.change.ObjectID))
 		}
 		return repository.MoveRootedExpected(c.root, step.source, step.relative, step.expected)
 	case clientsync.Delete:

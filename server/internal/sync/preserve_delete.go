@@ -34,7 +34,11 @@ func preserveRequestHash(r PreserveDeleteFolderRequest) [32]byte {
 	binary.BigEndian.PutUint64(b[48:56], r.ExpectedRevision)
 	binary.BigEndian.PutUint64(b[56:64], version)
 	binary.BigEndian.PutUint64(b[64:72], r.KnownCursor)
-	copy(b[72:], []byte("presdel2"))
+	if version == 3 {
+		copy(b[72:], []byte("presdel3"))
+	} else {
+		copy(b[72:], []byte("presdel2"))
+	}
 	return sha256.Sum256(b[:])
 }
 
@@ -76,8 +80,8 @@ func (a *ActorService) PreserveAndDeleteEmptyFolder(ctx context.Context, r Prese
 		version = 1
 	}
 	r.Version = version
-	if version == 2 {
-		return a.preserveAndDeleteDirectEmptyFolders(ctx, r)
+	if version == 2 || version == 3 {
+		return a.preserveAndDeleteDirectChildren(ctx, r)
 	}
 	if version != 1 || r.KnownCursor != 0 {
 		return PreserveDeleteFolderResult{}, ErrInvalidInput
@@ -218,7 +222,7 @@ func (a *ActorService) preserveAndDeleteEmptyFolderV1(ctx context.Context, r Pre
 	return PreserveDeleteFolderResult{RecoveredFolderID: recoveredID, RecoveredCursor: recoveredCursor, DeletedCursor: deletedCursor, FirstCursor: recoveredCursor, LastCursor: deletedCursor}, nil
 }
 
-func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, r PreserveDeleteFolderRequest) (PreserveDeleteFolderResult, error) {
+func (a *ActorService) preserveAndDeleteDirectChildren(ctx context.Context, r PreserveDeleteFolderRequest) (PreserveDeleteFolderResult, error) {
 	if !validV7(r.OperationID) || !validV7(r.ConflictOperationID) || !validObjectID(r.FolderID) || r.ExpectedRevision == 0 || r.KnownCursor == 0 {
 		return PreserveDeleteFolderResult{}, ErrInvalidInput
 	}
@@ -233,17 +237,20 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 	}
 	var stored, recovered, device []byte
 	var version, known, first, last uint64
-	err = tx.QueryRowContext(ctx, `SELECT request_hash,recovered_folder_id,device_id,request_version,known_cursor,first_cursor,last_cursor FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, a.userID[:], r.OperationID[:]).Scan(&stored, &recovered, &device, &version, &known, &first, &last)
+	var status string
+	var recoveredName sql.NullString
+	var cloneCount, noteCount int
+	err = tx.QueryRowContext(ctx, `SELECT request_hash,recovered_folder_id,recovered_folder_name,device_id,request_version,known_cursor,first_cursor,last_cursor,status,clone_count,note_count FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, a.userID[:], r.OperationID[:]).Scan(&stored, &recovered, &recoveredName, &device, &version, &known, &first, &last, &status, &cloneCount, &noteCount)
 	if err == nil {
-		if len(stored) != 32 || len(device) != 16 || subtle.ConstantTimeCompare(device, a.deviceID[:]) != 1 || subtle.ConstantTimeCompare(stored, hash[:]) != 1 || version != 2 || known != r.KnownCursor {
+		if len(stored) != 32 || len(device) != 16 || subtle.ConstantTimeCompare(device, a.deviceID[:]) != 1 || subtle.ConstantTimeCompare(stored, hash[:]) != 1 || version != r.Version || known != r.KnownCursor || status != "completed" || (version == 3 && (!recoveredName.Valid || recoveredName.String == "")) {
 			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
 		}
 		root, e := uuid.FromBytes(recovered)
 		if e != nil {
 			return PreserveDeleteFolderResult{}, e
 		}
-		result := PreserveDeleteFolderResult{RecoveredFolderID: root, RecoveredCursor: first, DeletedCursor: last, FirstCursor: first, LastCursor: last}
-		rows, e := tx.QueryContext(ctx, `SELECT original_folder_id,recovered_folder_id,create_cursor,delete_cursor FROM sync_folder_preserve_delete_clones WHERE user_id=? AND resolution_operation_id=? ORDER BY ordinal`, a.userID[:], r.OperationID[:])
+		result := PreserveDeleteFolderResult{RecoveredFolderID: root, RecoveredFolderName: recoveredName.String, RecoveredCursor: first, DeletedCursor: last, FirstCursor: first, LastCursor: last}
+		rows, e := tx.QueryContext(ctx, `SELECT original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name FROM sync_folder_preserve_delete_clones WHERE user_id=? AND resolution_operation_id=? ORDER BY ordinal`, a.userID[:], r.OperationID[:])
 		if e != nil {
 			return PreserveDeleteFolderResult{}, e
 		}
@@ -251,7 +258,9 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 		for rows.Next() {
 			var oldb, newb []byte
 			var c, d uint64
-			if e = rows.Scan(&oldb, &newb, &c, &d); e != nil {
+			var sourceRevision sql.NullInt64
+			var cloneName sql.NullString
+			if e = rows.Scan(&oldb, &newb, &c, &d, &sourceRevision, &cloneName); e != nil {
 				return PreserveDeleteFolderResult{}, e
 			}
 			oldID, e := uuid.FromBytes(oldb)
@@ -262,10 +271,48 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 			if e != nil {
 				return PreserveDeleteFolderResult{}, e
 			}
-			result.Clones = append(result.Clones, PreserveDeleteFolderClone{oldID, newID, c, d})
+			if version == 3 && (!sourceRevision.Valid || sourceRevision.Int64 <= 0 || !cloneName.Valid || cloneName.String == "") {
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			result.Clones = append(result.Clones, PreserveDeleteFolderClone{OriginalFolderID: oldID, RecoveredFolderID: newID, CreateCursor: c, DeleteCursor: d, SourceRevision: uint64(sourceRevision.Int64), Name: cloneName.String})
 		}
-		if e = rows.Err(); e != nil {
+		if e = rows.Err(); e != nil || len(result.Clones) != cloneCount {
+			if e != nil {
+				return PreserveDeleteFolderResult{}, e
+			}
+			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+		}
+		noteRows, e := tx.QueryContext(ctx, `SELECT note_id,move_cursor,source_revision,target_revision,source_parent_id,target_parent_id,name,blob_hash FROM sync_folder_preserve_delete_note_moves WHERE user_id=? AND resolution_operation_id=? ORDER BY ordinal`, a.userID[:], r.OperationID[:])
+		if e != nil {
 			return PreserveDeleteFolderResult{}, e
+		}
+		for noteRows.Next() {
+			var idb, sourceb, targetb, hash []byte
+			var item PreserveDeleteNoteMove
+			if e = noteRows.Scan(&idb, &item.MoveCursor, &item.SourceRevision, &item.TargetRevision, &sourceb, &targetb, &item.Name, &hash); e != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, e
+			}
+			if item.NoteID, e = uuid.FromBytes(idb); e != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, e
+			}
+			if item.SourceParentID, e = uuid.FromBytes(sourceb); e != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, e
+			}
+			if item.TargetParentID, e = uuid.FromBytes(targetb); e != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, e
+			}
+			item.BlobHash = append([]byte(nil), hash...)
+			result.NoteMoves = append(result.NoteMoves, item)
+		}
+		if e = noteRows.Close(); e != nil || len(result.NoteMoves) != noteCount {
+			if e != nil {
+				return PreserveDeleteFolderResult{}, e
+			}
+			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
 		}
 		if e = tx.Commit(); e != nil {
 			return PreserveDeleteFolderResult{}, e
@@ -299,7 +346,7 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 	}
 	var late int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM sync_object_versions v JOIN sync_change_log l ON l.user_id=v.user_id AND l.operation_id=v.operation_id WHERE v.user_id=? AND (v.object_id=? OR v.object_id IN(SELECT child.object_id FROM sync_object_versions child WHERE child.user_id=v.user_id AND child.parent_id=?)) AND l.cursor>? LIMIT 1`, a.userID[:], r.FolderID[:], r.FolderID[:], r.KnownCursor).Scan(&late)
+	err = tx.QueryRowContext(ctx, `WITH RECURSIVE subtree(object_id) AS (SELECT ? UNION SELECT DISTINCT v.object_id FROM sync_object_versions v JOIN subtree p ON v.parent_id=p.object_id WHERE v.user_id=?) SELECT 1 FROM sync_object_versions v JOIN subtree s ON s.object_id=v.object_id JOIN sync_change_log l ON l.user_id=v.user_id AND l.operation_id=v.operation_id WHERE v.user_id=? AND l.cursor>? LIMIT 1`, r.FolderID[:], a.userID[:], a.userID[:], r.KnownCursor).Scan(&late)
 	if err == nil {
 		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 	}
@@ -310,7 +357,7 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 	if err != nil {
 		return PreserveDeleteFolderResult{}, err
 	}
-	var children []objectState
+	var children, notes []objectState
 	for rows.Next() {
 		var b []byte
 		if err = rows.Scan(&b); err != nil {
@@ -327,22 +374,40 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 			rows.Close()
 			return PreserveDeleteFolderResult{}, e
 		}
-		if child.Type != ObjectFolder {
+		switch child.Type {
+		case ObjectFolder:
+			var nested int
+			e = tx.QueryRowContext(ctx, `SELECT 1 FROM sync_objects WHERE user_id=? AND parent_id=? AND deleted=0 LIMIT 1`, a.userID[:], id[:]).Scan(&nested)
+			if e == nil {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+			}
+			if !errors.Is(e, sql.ErrNoRows) {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, e
+			}
+			children = append(children, child)
+		case ObjectNote:
+			if r.Version != 3 || len(child.BlobHash) != sha256.Size {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+			}
+			var available int
+			e = tx.QueryRowContext(ctx, `SELECT b.available FROM content_blobs b JOIN user_content_blobs ub ON ub.hash=b.hash WHERE ub.user_id=? AND b.hash=?`, a.userID[:], child.BlobHash).Scan(&available)
+			if errors.Is(e, sql.ErrNoRows) || available != 1 {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+			}
+			if e != nil {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, e
+			}
+			notes = append(notes, child)
+		default:
 			rows.Close()
 			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 		}
-		var nested int
-		e = tx.QueryRowContext(ctx, `SELECT 1 FROM sync_objects WHERE user_id=? AND parent_id=? AND deleted=0 LIMIT 1`, a.userID[:], id[:]).Scan(&nested)
-		if e == nil {
-			rows.Close()
-			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
-		}
-		if !errors.Is(e, sql.ErrNoRows) {
-			rows.Close()
-			return PreserveDeleteFolderResult{}, e
-		}
-		children = append(children, child)
-		if len(children) > 10000 {
+		if len(children)+len(notes) > 10000 {
 			rows.Close()
 			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 		}
@@ -377,7 +442,15 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 		if e != nil {
 			return PreserveDeleteFolderResult{}, e
 		}
-		clones[i] = PreserveDeleteFolderClone{OriginalFolderID: child.ID, RecoveredFolderID: newID, CreateCursor: cursor}
+		clones[i] = PreserveDeleteFolderClone{OriginalFolderID: child.ID, RecoveredFolderID: newID, CreateCursor: cursor, SourceRevision: child.Revision, Name: child.Name}
+	}
+	noteMoves := make([]PreserveDeleteNoteMove, len(notes))
+	for i, note := range notes {
+		cursor, e := a.movePreservedNote(ctx, tx, note, rootClone, now)
+		if e != nil {
+			return PreserveDeleteFolderResult{}, e
+		}
+		noteMoves[i] = PreserveDeleteNoteMove{NoteID: note.ID, SourceParentID: r.FolderID, TargetParentID: rootClone, MoveCursor: cursor, SourceRevision: note.Revision, TargetRevision: note.Revision + 1, Name: note.Name, BlobHash: append([]byte(nil), note.BlobHash...)}
 	}
 	for i, child := range children {
 		cursor, e := a.deletePreservedFolder(ctx, tx, child, now)
@@ -390,18 +463,36 @@ func (a *ActorService) preserveAndDeleteDirectEmptyFolders(ctx context.Context, 
 	if err != nil {
 		return PreserveDeleteFolderResult{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_resolutions(user_id,device_id,resolution_operation_id,request_hash,conflict_operation_id,folder_id,expected_revision,recovered_folder_id,recovered_cursor,deleted_cursor,status,created_at_ms,request_version,known_cursor,first_cursor,last_cursor,clone_count) VALUES(?,?,?,?,?,?,?,?,?,?,'completed',?,2,?,?,?,?)`, a.userID[:], a.deviceID[:], r.OperationID[:], hash[:], r.ConflictOperationID[:], r.FolderID[:], r.ExpectedRevision, rootClone[:], first, last, now, r.KnownCursor, first, last, len(clones)); err != nil {
+	status = "completed"
+	if r.Version == 3 {
+		status = "preparing"
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_resolutions(user_id,device_id,resolution_operation_id,request_hash,conflict_operation_id,folder_id,expected_revision,recovered_folder_id,recovered_folder_name,recovered_cursor,deleted_cursor,status,created_at_ms,request_version,known_cursor,first_cursor,last_cursor,clone_count,note_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, a.userID[:], a.deviceID[:], r.OperationID[:], hash[:], r.ConflictOperationID[:], r.FolderID[:], r.ExpectedRevision, rootClone[:], name, first, last, status, now, r.Version, r.KnownCursor, first, last, len(clones), len(noteMoves)); err != nil {
 		return PreserveDeleteFolderResult{}, err
 	}
 	for i, clone := range clones {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_clones(user_id,resolution_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor) VALUES(?,?,?,?,?,?,?)`, a.userID[:], r.OperationID[:], i, clone.OriginalFolderID[:], clone.RecoveredFolderID[:], clone.CreateCursor, clone.DeleteCursor); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_clones(user_id,resolution_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name) VALUES(?,?,?,?,?,?,?,?,?)`, a.userID[:], r.OperationID[:], i, clone.OriginalFolderID[:], clone.RecoveredFolderID[:], clone.CreateCursor, clone.DeleteCursor, clone.SourceRevision, clone.Name); err != nil {
 			return PreserveDeleteFolderResult{}, err
+		}
+	}
+	for i, note := range noteMoves {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_note_moves(user_id,resolution_operation_id,ordinal,note_id,move_cursor,source_revision,target_revision,source_parent_id,target_parent_id,name,blob_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, a.userID[:], r.OperationID[:], i, note.NoteID[:], note.MoveCursor, note.SourceRevision, note.TargetRevision, note.SourceParentID[:], note.TargetParentID[:], note.Name, note.BlobHash); err != nil {
+			return PreserveDeleteFolderResult{}, err
+		}
+	}
+	if r.Version == 3 {
+		result, e := tx.ExecContext(ctx, `UPDATE sync_folder_preserve_delete_resolutions SET status='completed' WHERE user_id=? AND resolution_operation_id=? AND status='preparing'`, a.userID[:], r.OperationID[:])
+		if e != nil {
+			return PreserveDeleteFolderResult{}, e
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 		}
 	}
 	if err = tx.Commit(); err != nil {
 		return PreserveDeleteFolderResult{}, err
 	}
-	return PreserveDeleteFolderResult{RecoveredFolderID: rootClone, RecoveredCursor: first, DeletedCursor: last, FirstCursor: first, LastCursor: last, Clones: clones}, nil
+	return PreserveDeleteFolderResult{RecoveredFolderID: rootClone, RecoveredFolderName: name, RecoveredCursor: first, DeletedCursor: last, FirstCursor: first, LastCursor: last, Clones: clones, NoteMoves: noteMoves}, nil
 }
 
 func (a *ActorService) createPreservedFolder(ctx context.Context, tx *sql.Tx, id, parent uuid.UUID, name, key string, now int64) (uint64, error) {
@@ -457,5 +548,36 @@ func (a *ActorService) deletePreservedFolder(ctx context.Context, tx *sql.Tx, cu
 		return 0, err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO sync_change_log(user_id,cursor,object_id,revision,operation_id,mutation,created_at_ms) VALUES(?,?,?,?,?,'delete',?)`, a.userID[:], cursor, current.ID[:], revision, op[:], now)
+	return cursor, err
+}
+
+func (a *ActorService) movePreservedNote(ctx context.Context, tx *sql.Tx, current objectState, parent uuid.UUID, now int64) (uint64, error) {
+	op, err := uuid.NewV7()
+	if err != nil {
+		return 0, err
+	}
+	revision := current.Revision + 1
+	result, err := tx.ExecContext(ctx, `UPDATE sync_objects SET revision=?,parent_id=?,parent_key=?,updated_at_ms=? WHERE user_id=? AND object_id=? AND revision=? AND deleted=0 AND object_type='note'`, revision, parent[:], parent[:], now, a.userID[:], current.ID[:], current.Revision)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return 0, ErrPreserveDeleteUnavailable
+	}
+	cursor, err := allocateCursor(ctx, tx, a.userID)
+	if err != nil {
+		return 0, err
+	}
+	intent, hash, err := canonicalize(Mutation{OperationID: op, Kind: MutationMove, ObjectID: current.ID, ObjectType: ObjectNote, BaseRevision: current.Revision, ParentID: &parent, Name: current.Name})
+	if err != nil {
+		return 0, err
+	}
+	if err = a.insertOperation(ctx, tx, intent, hash, now, SubmitResult{Accepted: true, Revision: revision, Cursor: cursor}); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sync_object_versions(user_id,object_id,revision,operation_id,object_type,parent_id,name,name_key,blob_hash,deleted,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,0,?)`, a.userID[:], current.ID[:], revision, op[:], ObjectNote, parent[:], current.Name, current.NameKey, current.BlobHash, now); err != nil {
+		return 0, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO sync_change_log(user_id,cursor,object_id,revision,operation_id,mutation,created_at_ms) VALUES(?,?,?,?,?,'move',?)`, a.userID[:], cursor, current.ID[:], revision, op[:], now)
 	return cursor, err
 }

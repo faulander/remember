@@ -24,8 +24,8 @@ In **einer** SQLite-Transaktion:
 2. Der ursprüngliche Request muss ein authentifiziertes Folder-Delete desselben Nutzers/Geräts mit `base_revision_mismatch` und byteidentisch persistierter kanonischer Revision sein.
 3. Die aktuelle ursprüngliche Folder-UUID muss noch aktiv sein und exakt diese Revision besitzen. Andernfalls entsteht ein neues sichtbares `canonical_changed`; der Client darf nicht raten.
 4. Der Server liest den vollständigen aktuell aktiven Subtree descriptor-unabhängig aus seiner relationalen Parent-Topologie. Maximal 10.000 Objekte und 256 Ebenen sind zulässig; größere Subtrees bleiben sichtbar fail-closed.
-5. Unter `ConflictRecoveredID` wird ein neuer Recovery-Root mit serverseitig erzeugter UUIDv7 und deterministischem Konfliktnamen angelegt. Für jeden Descendant wird eine neue UUIDv7 erzeugt. Typ, Name und Note-Blob-Hash werden exakt kopiert; Parent-IDs werden auf die neue DAG abgebildet. Damit bleiben sämtliche Benutzerbytes erhalten, ohne eine aktive UUID zweimal zu verwenden.
-6. Danach werden alle Originalobjekte child-first tombstoned. Jeder Clone-Create und jedes Original-Delete erhält eine eigene unveränderliche Objektversion und Cursorzeile. Die gesamte Cursor-Spanne wird gemeinsam mit der Resolution gespeichert.
+5. Unter `ConflictRecoveredID` wird ein neuer Recovery-Root mit serverseitig erzeugter UUIDv7 und deterministischem Konfliktnamen angelegt. Folder-Descendants erhalten neue UUIDv7 und werden in die Recovery-DAG abgebildet. **Revision durch ADR 0075:** Notes behalten ihre UUID sowie exakten Blob-Bytes/-Hash und werden atomar in den zugehörigen Recovery-Folder verschoben; sie werden nicht geklont oder rekeyed.
+6. Danach werden die Original-Folder child-first tombstoned. Jeder Folder-Clone, Note-Move und Folder-Delete erhält eine eigene unveränderliche Objektversion und Cursorzeile. Die gesamte Cursor-Spanne wird gemeinsam mit einer versiegelten heterogenen Mapping-Menge gespeichert.
 7. Commit erfolgt nur, wenn Clone-DAG, Blob-Referenzen, Pfad-Eindeutigkeit, Tombstones und Resolution vollständig geschrieben sind. Jeder Fehler rollt alles zurück.
 
 Der Server liefert Recovery-Root-ID und zusammenhängende Cursor-Spanne. Replay liefert exakt dasselbe Ergebnis. Die Operation ist ausschließlich für den Eigentümer-Tenant zulässig; Nutzer-/Geräteidentität stammt aus der Session, nie aus dem Body.
@@ -34,8 +34,9 @@ Der Server liefert Recovery-Root-ID und zusammenhängende Cursor-Spanne. Replay 
 
 Der Client darf die Resolution nur für den exakt gebundenen ungelösten Folder-Delete-Konflikt anfordern. Danach zieht er ausschließlich den normalen Change-Log:
 
-- Clone-Creates erscheinen parent-first unter `_Konflikte/Wiederhergestellt`;
-- Original-Deletes erscheinen child-first;
+- Folder-Clone-Creates erscheinen parent-first unter `_Konflikte/Wiederhergestellt`;
+- Note-Moves behalten UUID und Blob unverändert;
+- Original-Folder-Deletes erscheinen child-first;
 - `confirmed_cursor` rückt nur nach vollständig angewendetem Präfix vor;
 - lokaler bereits fehlender Original-Subtree wird als idempotent gelöscht behandelt;
 - es gibt keinen lokalen Snapshot, keine Pfadrekonstruktion und keine automatische Textmutation.

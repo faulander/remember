@@ -86,5 +86,6 @@
 | [0072](adr/0072-m2-client-empty-preserve-delete-foundation.md) | Dauerhafte Client-Resolution und HTTP-Clientfundament für leere Folder |
 | [0073](adr/0073-m2-authenticated-empty-folder-preserve-delete.md) | Authentifizierte A/B-/Cold-C-Konvergenz für leere Folder Delete/Remote-Move |
 | [0074](adr/0074-m2-direct-empty-folder-preserve-delete.md) | Versioniertes Preserve-and-delete für direkte leere Child-Folder |
+| [0075](adr/0075-m2-direct-note-preserve-delete.md) | Identitätserhaltendes Preserve-and-delete für direkte Notes |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.
