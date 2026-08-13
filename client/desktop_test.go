@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +13,8 @@ import (
 	"time"
 
 	coreapp "github.com/faulander/remember/client/internal/app"
+	"github.com/faulander/remember/client/internal/remotehttp"
+	"github.com/google/uuid"
 )
 
 func TestStateFromCoreExposesOnlyRenderableMetadata(t *testing.T) {
@@ -87,6 +92,72 @@ func TestDesktopNoteLifecycleAndStateTagsWithoutBody(t *testing.T) {
 	final, err := app.DeleteNote(DeleteNoteRequest{RelativePath: moved.Note.RelativePath, ExpectedRevision: moved.Note.Revision})
 	if err != nil || len(final.Objects) != 0 {
 		t.Fatalf("DeleteNote() objects=%#v, %v", final.Objects, err)
+	}
+}
+
+func TestDesktopLoginSyncAndLogout(t *testing.T) {
+	root := t.TempDir()
+	user, device, sessionID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	pulls, logouts := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/login":
+			var body map[string]string
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil || body["email"] != "person@example.com" || body["password"] != "secret" || body["device_name"] != "Desktop" {
+				t.Errorf("login request = %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"principal": map[string]string{"user_id": user.String(), "device_id": device.String(), "session_id": sessionID.String()},
+				"tokens": map[string]string{
+					"access_token": "access", "refresh_token": "refresh",
+					"access_expires_at":  time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339Nano),
+					"refresh_expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+				},
+			})
+		case "/v1/sync/changes":
+			pulls++
+			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer access" || r.URL.Query().Get("after") != "0" {
+				t.Errorf("pull request = %s %s auth=%q", r.Method, r.URL.String(), r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"changes":[],"has_more":false,"next_cursor":0}`))
+		case "/v1/auth/logout":
+			logouts++
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer access" {
+				t.Errorf("logout request auth=%q", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"status":"revoked"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	app := NewDesktopApp()
+	app.emit = func(context.Context, string, ...interface{}) {}
+	app.startup(context.Background())
+	defer app.shutdown(context.Background())
+	if _, err := app.InitializeRoot(root); err != nil {
+		t.Fatal(err)
+	}
+	view, err := app.Login(LoginRequest{ServerURL: server.URL, Email: "person@example.com", Password: "secret", DeviceName: "Desktop"})
+	if err != nil || view.UserID != user.String() || view.DeviceID != device.String() || view.SessionID != sessionID.String() {
+		t.Fatalf("Login() = %#v, %v", view, err)
+	}
+	if _, err := app.SyncNow(); err != nil {
+		t.Fatal(err)
+	}
+	if pulls != 1 {
+		t.Fatalf("pulls = %d", pulls)
+	}
+	if err := app.Logout(); err != nil {
+		t.Fatal(err)
+	}
+	if logouts != 1 {
+		t.Fatalf("logouts = %d", logouts)
+	}
+	if _, err := app.SyncNow(); !errors.Is(err, remotehttp.ErrReauthRequired) {
+		t.Fatalf("post-logout SyncNow() error = %v", err)
 	}
 }
 

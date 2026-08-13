@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import {
-    CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, MoveNote, OpenRoot,
-    ReadNote, Refresh, SaveNote, SelectRoot, NormalizeTags,
+    CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, Login, Logout, MoveNote, OpenRoot,
+    ReadNote, Refresh, SaveNote, SelectRoot, NormalizeTags, SyncNow,
   } from '../wailsjs/go/main/DesktopApp';
   import { EventsOn } from '../wailsjs/runtime/runtime';
   import type { main } from '../wailsjs/go/models';
@@ -62,6 +62,12 @@
   let syncSequence = 0;
   let appearanceMode: AppearanceMode = 'system';
   let theme: Theme = 'remember';
+  let session: main.SessionView | null = null;
+  let loginOpen = false;
+  let loginServer = 'http://127.0.0.1:8080';
+  let loginEmail = '';
+  let loginPassword = '';
+  let loginDevice = 'Remember Desktop';
 
   $: notes = state?.objects.filter((object) => object.type === 'note') ?? [];
   $: folders = state?.objects.filter((object) => object.type === 'folder').map((object) => object.relativePath).sort() ?? [];
@@ -165,6 +171,46 @@
 
   async function refresh() {
     await run(async () => { applyState(await Refresh()); await syncSelectedFromDisk(); });
+  }
+
+  function openLogin() {
+    loginPassword = '';
+    loginOpen = true;
+  }
+
+  function closeLogin() {
+    loginPassword = '';
+    loginOpen = false;
+  }
+
+  async function loginCurrent() {
+    if (!loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()) return;
+    await run(async () => {
+      session = await Login({
+        serverUrl: loginServer.trim(), email: loginEmail.trim(),
+        password: loginPassword, deviceName: loginDevice.trim(),
+      });
+      loginPassword = '';
+      loginOpen = false;
+      notice = 'Serververbindung hergestellt.';
+    });
+  }
+
+  async function logoutCurrent() {
+    await run(async () => {
+      await Logout();
+      session = null;
+      notice = 'Serversitzung beendet.';
+    });
+  }
+
+  async function syncNow() {
+    if (!state || !session) return;
+    await run(async () => {
+      applyState(await SyncNow());
+      await syncSelectedFromDisk();
+      notice = 'Synchronisierung abgeschlossen.';
+    });
   }
 
   async function changeRoot() {
@@ -444,7 +490,7 @@
     <div class="header-actions">
       <label><span>Theme</span><select value={theme} on:change={(event) => changeTheme(event.currentTarget.value)}>{#each themes as item}<option value={item.value}>{item.label}</option>{/each}</select></label>
       <label><span>Darstellung</span><select value={appearanceMode} on:change={(event) => changeMode(event.currentTarget.value)}>{#each modes as item}<option value={item.value}>{item.label}</option>{/each}</select></label>
-      {#if state}<button class="button ghost" on:click={refresh} disabled={busy}>Aktualisieren</button><button class="button ghost" on:click={changeRoot} disabled={busy}>Ordner wechseln</button>{/if}
+      {#if state}<button class="button ghost" on:click={refresh} disabled={busy}>Aktualisieren</button>{#if session}<button class="button primary" on:click={syncNow} disabled={busy}>Synchronisieren</button><button class="button ghost" on:click={logoutCurrent} disabled={busy}>Abmelden</button>{:else}<button class="button primary" on:click={openLogin} disabled={busy}>Verbinden</button>{/if}<button class="button ghost" on:click={changeRoot} disabled={busy}>Ordner wechseln</button>{/if}
     </div>
   </header>
 
@@ -530,7 +576,7 @@
       </section>
     {/if}
   </main>
-  <footer><span><span class="online-dot"></span> Lokal aktiv</span>{#if state}<code title={state.root}>{state.root}</code>{/if}<span>Keine Cloud-Verbindung erforderlich</span></footer>
+  <footer><span><span class:online-dot={session} class:offline-dot={!session}></span>{session ? 'Server verbunden' : 'Lokal aktiv'}</span>{#if state}<code title={state.root}>{state.root}</code>{/if}<span>{session ? 'Manuelle Synchronisierung' : 'Keine Serversitzung'}</span></footer>
 </div>
 
 {#if contextMenu}<div bind:this={contextMenuElement} class="context-menu" role="menu" tabindex="-1" aria-label={`Aktionen für ${contextMenu.folder}`} style={`left:${contextMenu.x}px;top:${contextMenu.y}px`} on:keydown={onContextMenuKeydown}><strong role="presentation">{contextMenu.folder}</strong><button role="menuitem" disabled={dirty} on:click={() => openCreateNote(contextMenu!.folder)}>＋ Neue Notiz hier</button><button role="menuitem" on:click={() => openCreateFolder(contextMenu!.folder)}>▰ Neuer Unterordner</button></div>{/if}
@@ -538,3 +584,4 @@
 {#if folderOpen}<dialog use:openDialog class="modal" aria-labelledby="folder-title" on:close={() => folderOpen = false}><form on:submit|preventDefault={createFolderCurrent}><h2 id="folder-title">Neuer Ordner</h2><p>Wird angelegt in <code>{folderParent || 'Hauptordner'}</code>.</p><label>Name<input bind:value={folderName} placeholder="Neuer Ordner" /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => folderOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !folderName.trim()}>Ordner erstellen</button></div></form></dialog>{/if}
 {#if moveOpen}<dialog use:openDialog class="modal" aria-labelledby="move-title" on:close={() => moveOpen = false}><form on:submit|preventDefault={moveCurrent}><h2 id="move-title">Notiz umbenennen oder verschieben</h2><label>Name<input bind:value={moveName} /></label><label>Ordner<select bind:value={moveFolder}><option value="">Hauptordner</option>{#each folders as folder}<option value={folder}>{folder}</option>{/each}</select></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => moveOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !moveName.trim()}>Übernehmen</button></div></form></dialog>{/if}
 {#if deleteOpen && note}<dialog use:openDialog class="modal" aria-labelledby="delete-title" on:close={() => deleteOpen = false}><h2 id="delete-title">„{noteTitle}“ löschen?</h2><p>{dirty ? 'Ungespeicherte Änderungen werden verworfen. ' : ''}Die Datei wird wiederherstellbar nach <code>.remember/trash</code> verschoben.</p><div class="modal-actions"><button class="button ghost" on:click={() => deleteOpen = false}>Abbrechen</button><button class="button danger" on:click={deleteCurrent} disabled={busy}>In Papierkorb verschieben</button></div></dialog>{/if}
+{#if loginOpen}<dialog use:openDialog class="modal" aria-labelledby="login-title" on:close={closeLogin}><form on:submit|preventDefault={loginCurrent}><h2 id="login-title">Mit Remember verbinden</h2><p class="form-hint">Die Sitzung bleibt nur bis zum Schließen der App im Arbeitsspeicher. Es werden keine Zugangsdaten im lokalen Index gespeichert.</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label><label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete="current-password" required /></label><label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()}>Verbinden</button></div></form></dialog>{/if}

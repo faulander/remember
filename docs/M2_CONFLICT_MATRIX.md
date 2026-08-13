@@ -1,6 +1,6 @@
-# M2-Konfliktmatrix – Audit bis ADR 0063
+# M2-Konfliktmatrix – Audit bis ADR 0075
 
-Stand: Client-Schema v34. Berücksichtigt sind insbesondere die dauerhafte Inbox und verknüpften Apply-Pläne aus ADR 0054–0056, der begrenzte Scheduler und seine authentifizierte Abnahme aus ADR 0057/0058, Retry und starvation-freie lineare Root-Note-Ketten aus ADR 0059–0061 sowie dauerhafte und authentifiziert abgenommene Integritätsalarme aus ADR 0062/0063.
+Stand: Client-Schema v35. Berücksichtigt sind insbesondere die dauerhafte Inbox und verknüpften Apply-Pläne aus ADR 0054–0056, Scheduler/Retry/Integritätsalarme aus ADR 0057–0063, divergente Root-Folder-Move-Recovery aus ADR 0064–0068 sowie die atomare Folder-Delete/Remote-Move-Recovery für direkte Notes und direkte leere Child-Folder aus ADR 0069–0075.
 
 Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt keine ADR-Entscheidung und erklärt M2 **nicht** für abgeschlossen.
 
@@ -70,7 +70,7 @@ Diese Datei ist die explizite Abgrenzung des aktuellen M2-Stands. Sie ersetzt ke
 
 | PRD-Kriterium | Auditstatus | Begründung |
 |---|---|---|
-| [M2-AC-001](PRD.md#m2-ac-001) – zwei Offline-Geräte konvergieren ohne stillen Datenverlust | **Teilweise, nicht abgenommen** | Die oben als **Konvergiert** markierten Zellen erfüllen dies automatisiert. Der weiterhin fail-closed behandelte Folder-Delete/Remote-Move und bewusst begrenzte rekursive Strukturzellen verhindern eine pauschale M2-Abnahme. Fail-closed bedeutet keinen stillen Verlust, aber auch keine automatische Konvergenz. |
+| [M2-AC-001](PRD.md#m2-ac-001) – zwei Offline-Geräte konvergieren ohne stillen Datenverlust | **Teilweise, nicht abgenommen** | Die oben als **Konvergiert** markierten Zellen erfüllen dies automatisiert. Nested Folder, Notes unter Child-Foldern und weitere bewusst begrenzte rekursive Strukturzellen bleiben fail-closed und verhindern eine pauschale M2-Abnahme. Fail-closed bedeutet keinen stillen Verlust, aber auch keine automatische Konvergenz. |
 | [M2-AC-002](PRD.md#m2-ac-002) – definierte Konfliktmatrix besteht Tests | **Teilweise, nicht abgenommen** | Note-Kernmatrix und mehrere Folder-Zellen sind getestet. Die Matrix ist jetzt explizit, enthält aber weiterhin Fail-closed- und protokoll-blockierte Zellen. |
 | [M2-AC-003](PRD.md#m2-ac-003) – Requests/Wiederaufnahme erzeugen keine Duplikate | **Erfüllt im automatisierten M2-Core** | Idempotente Serveroperationen, stabile Operations-IDs, Replay-Mismatch-Schutz, persistente Apply-Pläne und Pull-Seiten-Wiederaufnahme sind getestet. |
 | [M2-AC-004](PRD.md#m2-ac-004) – fehlender/hashinkonsistenter Blob wird erkannt und alarmiert | **Erfüllt und authentifiziert abgenommen** | ADR 0062/0063 persistieren sichtbare Desktop-Issues für beide Fehlercodes, bewahren Plan und Cursor über Restart und setzen nach Wiederherstellung ohne Duplikat fort. |
@@ -84,6 +84,6 @@ Priorisiert, ohne externe Zielhardware:
 1. Den authentifiziert abgenommenen engen Scheduler für lineare Root-Note-Update/-Delete-Ketten aus ADR 0057/0058 auf weitere beweisbar unabhängige Objektformen erweitern; der technische Retry abgebrochener unveränderlicher Planlinks ist durch ADR 0059 vorhanden, eine UI-/Operator-Steuerung bleibt offen.
 2. Rekursive Folder-Create- und Folder-Move/Remote-Delete-Recovery für vollständig manifestierte Nested-Folder-DAGs entwerfen und implementieren; Note-Moves/-Deletes sowie attempted/branched Historien zunächst weiter fail-closed lassen.
 3. Rekursive oder nichtlineare divergente Folder-Subtrees bleiben separat fail-closed; eine Erweiterung erfordert vollständige Manifest-/DAG- und Source-Restoration-Abnahme.
-4. ADR 0069 serverseitig, als strikten HTTP-Transport und anschließend als crash-fortsetzbaren Client-Apply mit A/B/Restart/Cold-C implementieren.
+4. Die noch fehlende rekursive ADR-0069-DAG für Nested Folder und Notes unter Child-Foldern als versiegeltes Serverprotokoll, strikten HTTP-Transport und crash-fortsetzbaren Client-Apply mit A/B/Restart/Cold-C implementieren; direkte Notes und direkte leere Child-Folder sind durch ADR 0074/0075 abgedeckt.
 
 Nicht als lokal automatisierbar gezählt werden reale Windows-/Linux-Gerätetests, Codesigning, Reverse-Proxy-/Deployment-Abnahme und der derzeit nicht erreichbare Remote-Docker-Kontext.

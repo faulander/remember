@@ -8,6 +8,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Added
 
+- Der Wails-Desktop-Client kann eine nicht persistierte Serversitzung per Login öffnen, Access-Tokens über rotierende Refresh-Tokens im Arbeitsspeicher erneuern, einen begrenzten Vordergrund-Sync auslösen und die Sitzung serverseitig widerrufen; Zugangsdaten und Tokens werden weder an das Frontend zurückgegeben noch in den lokalen Index geschrieben.
 - ADR 0075 und Protokoll v3 bewahren aktive direkte Notes bei Folder Delete/Remote-Move unter derselben Note-UUID und mit exaktem Blob; Servermigration 008 und Client-Schema v35 versiegeln Recovery-Root-, Folder-Clone- und Note-Move-Deskriptoren, superseden nur exakt gebundene lokale Delete-Intents und promoten vorbereitete v2-Versuche ausschließlich nach authentifizierter expliziter Ablehnung dauerhaft mit neuer Operations-ID.
 - ADR 0074 erweitert Preserve-and-delete transaktional auf aktuelle direkte leere Child-Folder; versionierter Replay-Hash, bestätigte Cursor-Grenze, zusammenhängende Spanne und Clone-Mapping bleiben dauerhaft gebunden.
 - Client-Schema v34 bindet die leere Preserve-and-Delete-Historie exakt und schließt nur die konkrete aufgelöste Konfliktoperation aus ungelösten Intents aus.

@@ -210,12 +210,20 @@ type PullPage struct {
 }
 
 func New(rawBase string, transport *http.Client, tokens AccessTokenSource) (*Client, error) {
-	u, err := url.Parse(rawBase)
-	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Host == "" || (u.Path != "" && u.Path != "/") || (u.Scheme != "https" && !(u.Scheme == "http" && loopbackHost(u.Hostname()))) {
-		return nil, errors.New("invalid remote base URL")
+	u, client, err := remoteEndpoint(rawBase, transport)
+	if err != nil {
+		return nil, err
 	}
 	if tokens == nil {
 		return nil, errors.New("nil access token source")
+	}
+	return &Client{base: u, http: client, tokens: tokens}, nil
+}
+
+func remoteEndpoint(rawBase string, transport *http.Client) (*url.URL, *http.Client, error) {
+	u, err := url.Parse(rawBase)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Host == "" || (u.Path != "" && u.Path != "/") || (u.Scheme != "https" && !(u.Scheme == "http" && loopbackHost(u.Hostname()))) {
+		return nil, nil, errors.New("invalid remote base URL")
 	}
 	if transport == nil {
 		transport = &http.Client{Timeout: 30 * time.Second}
@@ -226,7 +234,7 @@ func New(rawBase string, transport *http.Client, tokens AccessTokenSource) (*Cli
 		clone.Timeout = 30 * time.Second
 	}
 	u.Path = ""
-	return &Client{base: u, http: &clone, tokens: tokens}, nil
+	return u, &clone, nil
 }
 
 func loopbackHost(host string) bool {

@@ -48,6 +48,7 @@ Neben `/healthz` und `/readyz` stellt der Server derzeit den begrenzten M2-Auth-
 - `DELETE /v1/sessions/{uuidv7}`
 - `PUT|GET /v1/blobs/{sha256}`
 - `POST /v1/sync/operations`
+- `POST /v1/sync/folder-preserve-delete`
 - `GET /v1/sync/changes?after={cursor}&limit={n}`
 
 Sync-Operationen sind einzeln und idempotent; fachliche Konflikte bleiben erfolgreiche Antworten. Pull verwendet benutzerspezifische Cursor und höchstens 500 Änderungen pro Seite.

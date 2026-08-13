@@ -16,6 +16,7 @@ import (
 	"github.com/faulander/remember/client/internal/localindex"
 	"github.com/faulander/remember/client/internal/naming"
 	"github.com/faulander/remember/client/internal/reconcile"
+	"github.com/faulander/remember/client/internal/remotehttp"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -82,6 +83,22 @@ type DeleteNoteRequest struct {
 	ExpectedRevision string `json:"expectedRevision"`
 }
 
+// LoginRequest starts one non-persistent authenticated desktop session.
+type LoginRequest struct {
+	ServerURL  string `json:"serverUrl"`
+	Email      string `json:"email"`
+	Password   string `json:"password"`
+	DeviceName string `json:"deviceName"`
+}
+
+// SessionView contains public identifiers only; credentials never cross the bridge.
+type SessionView struct {
+	ServerURL string `json:"serverUrl"`
+	UserID    string `json:"userId"`
+	DeviceID  string `json:"deviceId"`
+	SessionID string `json:"sessionId"`
+}
+
 // ClientState is the complete render state sent to Svelte.
 type ClientState struct {
 	Generation      uint64       `json:"generation"`
@@ -101,6 +118,7 @@ type DesktopApp struct {
 	shuttingDown bool
 	operations   sync.WaitGroup
 	rootOps      sync.Mutex
+	authOps      sync.Mutex
 	stateMu      sync.Mutex
 
 	core        *coreapp.LocalCore
@@ -109,6 +127,9 @@ type DesktopApp struct {
 	generation  uint64
 	revision    uint64
 	emit        func(context.Context, string, ...interface{})
+	session     *remotehttp.Session
+	remote      *remotehttp.Client
+	serverURL   string
 }
 
 func NewDesktopApp() *DesktopApp {
@@ -131,8 +152,11 @@ func (a *DesktopApp) shutdown(context.Context) {
 
 	a.operations.Wait()
 	a.rootOps.Lock()
-	defer a.rootOps.Unlock()
 	_, _ = a.detachCoreLocked()
+	a.rootOps.Unlock()
+	a.mu.Lock()
+	a.session, a.remote, a.serverURL = nil, nil, ""
+	a.mu.Unlock()
 }
 
 // SelectRoot opens a native directory chooser and performs no filesystem
@@ -390,6 +414,97 @@ func (a *DesktopApp) DeleteNote(request DeleteNoteRequest) (ClientState, error) 
 		return ClientState{}, err
 	}
 	return a.snapshotCurrentState(ctx, core, report)
+}
+
+// Login starts a session held only in memory for this app process.
+func (a *DesktopApp) Login(request LoginRequest) (SessionView, error) {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return SessionView{}, err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+
+	a.mu.Lock()
+	active := a.session != nil
+	a.mu.Unlock()
+	if active {
+		return SessionView{}, errors.New("already signed in")
+	}
+	serverURL := strings.TrimSuffix(strings.TrimSpace(request.ServerURL), "/")
+	session, err := remotehttp.Login(ctx, serverURL, nil, request.Email, request.Password, request.DeviceName)
+	if err != nil {
+		return SessionView{}, err
+	}
+	remote, err := remotehttp.New(serverURL, nil, session)
+	if err != nil {
+		_ = session.Logout(ctx)
+		return SessionView{}, err
+	}
+	principal := session.Principal()
+	a.mu.Lock()
+	a.session, a.remote, a.serverURL = session, remote, serverURL
+	a.mu.Unlock()
+	return SessionView{
+		ServerURL: serverURL,
+		UserID:    principal.UserID.String(), DeviceID: principal.DeviceID.String(), SessionID: principal.SessionID.String(),
+	}, nil
+}
+
+// SyncNow runs one bounded authenticated foreground synchronization cycle.
+func (a *DesktopApp) SyncNow() (ClientState, error) {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return ClientState{}, err
+	}
+	defer done()
+	a.rootOps.Lock()
+	defer a.rootOps.Unlock()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+
+	core, err := a.currentCore()
+	if err != nil {
+		return ClientState{}, err
+	}
+	a.mu.Lock()
+	remote := a.remote
+	a.mu.Unlock()
+	if remote == nil {
+		return ClientState{}, remotehttp.ErrReauthRequired
+	}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		return ClientState{}, err
+	}
+	return a.refreshLocked(ctx, core)
+}
+
+// Logout revokes the active remote session before removing local credentials.
+func (a *DesktopApp) Logout() error {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+
+	a.mu.Lock()
+	session := a.session
+	a.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	if err := session.Logout(ctx); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if a.session == session {
+		a.session, a.remote, a.serverURL = nil, nil, ""
+	}
+	a.mu.Unlock()
+	return nil
 }
 
 // NormalizeTags applies the canonical Go Unicode-folding tag policy for UI edits.
