@@ -64,6 +64,58 @@ func TestSessionLoginRefreshAndLogout(t *testing.T) {
 	}
 }
 
+func TestSessionListsRenamesAndRevokesSessions(t *testing.T) {
+	t.Parallel()
+	user, device, currentSession := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	otherDevice, otherSession := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	created := time.Now().Add(-time.Hour).UTC()
+	expires := time.Now().Add(time.Hour).UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/login":
+			writeSessionLoginResponse(t, w, user, device, currentSession, "access", "refresh", time.Now().Add(time.Minute), expires)
+		case "/v1/sessions":
+			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer access" {
+				t.Errorf("list request = %s auth=%q", r.Method, r.Header.Get("Authorization"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"sessions": []map[string]any{
+				{"session_id": currentSession.String(), "device_id": device.String(), "device_name": "Dieser Mac", "status": "active", "created_at": created.Format(time.RFC3339Nano), "expires_at": expires.Format(time.RFC3339Nano), "revoked_at": nil, "current": true},
+				{"session_id": otherSession.String(), "device_id": otherDevice.String(), "device_name": "MacBook", "status": "active", "created_at": created.Format(time.RFC3339Nano), "expires_at": expires.Format(time.RFC3339Nano), "revoked_at": nil, "current": false},
+			}})
+		case "/v1/devices/" + device.String():
+			var body map[string]string
+			if r.Method != http.MethodPatch || r.Header.Get("Authorization") != "Bearer access" || json.NewDecoder(r.Body).Decode(&body) != nil || body["display_name"] != "Arbeitsplatz" {
+				t.Errorf("rename request = %s %#v", r.Method, body)
+			}
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/sessions/" + otherSession.String():
+			if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer access" {
+				t.Errorf("revoke request = %s auth=%q", r.Method, r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	session, err := Login(context.Background(), server.URL, nil, "person@example.com", "secret", "Dieser Mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := session.ListSessions(context.Background())
+	if err != nil || len(items) != 2 || !items[0].Current || items[1].SessionID != otherSession {
+		t.Fatalf("ListSessions() = %#v, %v", items, err)
+	}
+	if err := session.RenameDevice(context.Background(), device, "Arbeitsplatz"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.RevokeSession(context.Background(), otherSession); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSessionResumeRotatesAndPersistsRefreshCredential(t *testing.T) {
 	t.Parallel()
 	principal := Principal{UserID: uuid.Must(uuid.NewV7()), DeviceID: uuid.Must(uuid.NewV7()), SessionID: uuid.Must(uuid.NewV7())}

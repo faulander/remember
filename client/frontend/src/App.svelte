@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import {
-    CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, Login, Logout, MoveNote, OpenRoot,
-    ReadNote, Refresh, RestoreSession, SaveNote, SelectRoot, NormalizeTags, SyncNow,
+    CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, ListSessions, Login, Logout, MoveNote, OpenRoot,
+    ReadNote, Refresh, RenameCurrentDevice, RestoreSession, RevokeSession, SaveNote, SelectRoot, NormalizeTags, SyncNow,
   } from '../wailsjs/go/main/DesktopApp';
   import { EventsOn } from '../wailsjs/runtime/runtime';
   import type { main } from '../wailsjs/go/models';
@@ -68,6 +68,9 @@
   let loginEmail = '';
   let loginPassword = '';
   let loginDevice = 'Remember Desktop';
+  let accountOpen = false;
+  let managedSessions: main.ManagedSessionView[] = [];
+  let currentDeviceName = '';
 
   $: notes = state?.objects.filter((object) => object.type === 'note') ?? [];
   $: folders = state?.objects.filter((object) => object.type === 'folder').map((object) => object.relativePath).sort() ?? [];
@@ -205,8 +208,43 @@
     await run(async () => {
       await Logout();
       session = null;
+      accountOpen = false;
+      managedSessions = [];
       notice = 'Serversitzung beendet.';
     });
+  }
+
+  async function openAccount() {
+    accountOpen = true;
+    managedSessions = [];
+    await run(async () => {
+      managedSessions = await ListSessions();
+      currentDeviceName = managedSessions.find((item) => item.current)?.deviceName ?? '';
+    });
+  }
+
+  async function renameCurrentDevice() {
+    if (!currentDeviceName.trim()) return;
+    const name = currentDeviceName.trim();
+    await run(async () => {
+      await RenameCurrentDevice(name);
+      managedSessions = managedSessions.map((item) => item.current ? { ...item, deviceName: name } : item);
+      notice = 'Gerätename aktualisiert.';
+    });
+  }
+
+  async function revokeManagedSession(item: main.ManagedSessionView) {
+    if (item.current || item.status !== 'active' || !window.confirm(`Sitzung auf „${item.deviceName}“ widerrufen?`)) return;
+    await run(async () => {
+      await RevokeSession(item.sessionId);
+      managedSessions = managedSessions.filter((candidate) => candidate.sessionId !== item.sessionId);
+      notice = 'Sitzung widerrufen.';
+    });
+  }
+
+  function formatSessionDate(raw: string): string {
+    const value = new Date(raw);
+    return Number.isNaN(value.getTime()) ? raw : new Intl.DateTimeFormat('de-DE', { dateStyle: 'medium', timeStyle: 'short' }).format(value);
   }
 
   async function syncNow() {
@@ -495,7 +533,7 @@
     <div class="header-actions">
       <label><span>Theme</span><select value={theme} on:change={(event) => changeTheme(event.currentTarget.value)}>{#each themes as item}<option value={item.value}>{item.label}</option>{/each}</select></label>
       <label><span>Darstellung</span><select value={appearanceMode} on:change={(event) => changeMode(event.currentTarget.value)}>{#each modes as item}<option value={item.value}>{item.label}</option>{/each}</select></label>
-      {#if state}<button class="button ghost" on:click={refresh} disabled={busy}>Aktualisieren</button>{#if session}<button class="button primary" on:click={syncNow} disabled={busy}>Synchronisieren</button><button class="button ghost" on:click={logoutCurrent} disabled={busy}>Abmelden</button>{:else}<button class="button primary" on:click={openLogin} disabled={busy}>Verbinden</button>{/if}<button class="button ghost" on:click={changeRoot} disabled={busy}>Ordner wechseln</button>{/if}
+      {#if state}<button class="button ghost" on:click={refresh} disabled={busy}>Aktualisieren</button>{#if session}<button class="button primary" on:click={syncNow} disabled={busy}>Synchronisieren</button><button class="button ghost" on:click={openAccount} disabled={busy}>Sitzungen</button><button class="button ghost" on:click={logoutCurrent} disabled={busy}>Abmelden</button>{:else}<button class="button primary" on:click={openLogin} disabled={busy}>Verbinden</button>{/if}<button class="button ghost" on:click={changeRoot} disabled={busy}>Ordner wechseln</button>{/if}
     </div>
   </header>
 
@@ -590,3 +628,4 @@
 {#if moveOpen}<dialog use:openDialog class="modal" aria-labelledby="move-title" on:close={() => moveOpen = false}><form on:submit|preventDefault={moveCurrent}><h2 id="move-title">Notiz umbenennen oder verschieben</h2><label>Name<input bind:value={moveName} /></label><label>Ordner<select bind:value={moveFolder}><option value="">Hauptordner</option>{#each folders as folder}<option value={folder}>{folder}</option>{/each}</select></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => moveOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !moveName.trim()}>Übernehmen</button></div></form></dialog>{/if}
 {#if deleteOpen && note}<dialog use:openDialog class="modal" aria-labelledby="delete-title" on:close={() => deleteOpen = false}><h2 id="delete-title">„{noteTitle}“ löschen?</h2><p>{dirty ? 'Ungespeicherte Änderungen werden verworfen. ' : ''}Die Datei wird wiederherstellbar nach <code>.remember/trash</code> verschoben.</p><div class="modal-actions"><button class="button ghost" on:click={() => deleteOpen = false}>Abbrechen</button><button class="button danger" on:click={deleteCurrent} disabled={busy}>In Papierkorb verschieben</button></div></dialog>{/if}
 {#if loginOpen}<dialog use:openDialog class="modal" aria-labelledby="login-title" on:close={closeLogin}><form on:submit|preventDefault={loginCurrent}><h2 id="login-title">Mit Remember verbinden</h2><p class="form-hint">Der rotierende Sitzungsschlüssel wird ausschließlich in der sicheren Schlüsselablage des Betriebssystems gespeichert. Passwort und Zugriffstoken bleiben im Arbeitsspeicher.</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label><label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete="current-password" required /></label><label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()}>Verbinden</button></div></form></dialog>{/if}
+{#if accountOpen}<dialog use:openDialog class="modal account-modal" aria-labelledby="account-title" on:close={() => accountOpen = false}><h2 id="account-title">Sitzungen</h2><p class="form-hint">Angemeldete Geräte und Sitzungen dieses Remember-Kontos.</p>{#if managedSessions.length}<form class="device-name-form" on:submit|preventDefault={renameCurrentDevice}><label>Dieses Gerät<input bind:value={currentDeviceName} autocomplete="off" required /></label><button class="button ghost" disabled={busy || !currentDeviceName.trim()}>Umbenennen</button></form><ul class="session-list">{#each managedSessions as item (item.sessionId)}<li><div><strong>{item.deviceName}</strong>{#if item.current}<span class="session-badge">Dieses Gerät</span>{/if}<small>{item.status === 'active' ? 'Aktiv' : 'Widerrufen'} · erstellt <time datetime={item.createdAt}>{formatSessionDate(item.createdAt)}</time></small><small>Läuft ab <time datetime={item.expiresAt}>{formatSessionDate(item.expiresAt)}</time></small></div>{#if !item.current && item.status === 'active'}<button class="button danger" on:click={() => revokeManagedSession(item)} disabled={busy}>Widerrufen</button>{/if}</li>{/each}</ul>{:else if busy}<p class="form-hint">Sitzungen werden geladen …</p>{/if}<div class="modal-actions"><button class="button ghost" on:click={() => accountOpen = false}>Schließen</button></div></dialog>{/if}

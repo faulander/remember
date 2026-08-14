@@ -102,6 +102,18 @@ type SessionView struct {
 	SessionID string `json:"sessionId"`
 }
 
+// ManagedSessionView describes one server session without exposing credentials.
+type ManagedSessionView struct {
+	SessionID  string  `json:"sessionId"`
+	DeviceID   string  `json:"deviceId"`
+	DeviceName string  `json:"deviceName"`
+	Status     string  `json:"status"`
+	CreatedAt  string  `json:"createdAt"`
+	ExpiresAt  string  `json:"expiresAt"`
+	RevokedAt  *string `json:"revokedAt"`
+	Current    bool    `json:"current"`
+}
+
 // ClientState is the complete render state sent to Svelte.
 type ClientState struct {
 	Generation      uint64       `json:"generation"`
@@ -544,6 +556,84 @@ func sessionView(serverURL string, principal remotehttp.Principal) SessionView {
 		ServerURL: serverURL,
 		UserID:    principal.UserID.String(), DeviceID: principal.DeviceID.String(), SessionID: principal.SessionID.String(),
 	}
+}
+
+// ListSessions returns every session belonging to the authenticated account.
+func (a *DesktopApp) ListSessions() ([]ManagedSessionView, error) {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+	a.mu.Lock()
+	session := a.session
+	a.mu.Unlock()
+	if session == nil {
+		return nil, remotehttp.ErrReauthRequired
+	}
+	items, err := session.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ManagedSessionView, 0, len(items))
+	for _, item := range items {
+		view := ManagedSessionView{
+			SessionID: item.SessionID.String(), DeviceID: item.DeviceID.String(),
+			DeviceName: item.DeviceName, Status: item.Status, CreatedAt: item.CreatedAt.UTC().Format(time.RFC3339Nano),
+			ExpiresAt: item.ExpiresAt.UTC().Format(time.RFC3339Nano), Current: item.Current,
+		}
+		if item.RevokedAt != nil {
+			value := item.RevokedAt.UTC().Format(time.RFC3339Nano)
+			view.RevokedAt = &value
+		}
+		result = append(result, view)
+	}
+	return result, nil
+}
+
+// RenameCurrentDevice updates the server-visible name of this device.
+func (a *DesktopApp) RenameCurrentDevice(name string) error {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+	a.mu.Lock()
+	session := a.session
+	a.mu.Unlock()
+	if session == nil {
+		return remotehttp.ErrReauthRequired
+	}
+	return session.RenameDevice(ctx, session.Principal().DeviceID, name)
+}
+
+// RevokeSession revokes another account session; the current session uses Logout.
+func (a *DesktopApp) RevokeSession(rawID string) error {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+	id, err := uuid.Parse(rawID)
+	if err != nil {
+		return errors.New("invalid session id")
+	}
+	a.mu.Lock()
+	session := a.session
+	a.mu.Unlock()
+	if session == nil {
+		return remotehttp.ErrReauthRequired
+	}
+	if id == session.Principal().SessionID {
+		return errors.New("use logout for current session")
+	}
+	return session.RevokeSession(ctx, id)
 }
 
 // SyncNow runs one bounded authenticated foreground synchronization cycle.

@@ -59,7 +59,7 @@ func Login(ctx context.Context, rawBase string, transport *http.Client, email, p
 	if err != nil {
 		return nil, errors.New("encode login request")
 	}
-	resp, err := sessionRequest(ctx, client, base, "/v1/auth/login", body, "")
+	resp, err := sessionRequest(ctx, client, base, http.MethodPost, "/v1/auth/login", body, "")
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +168,7 @@ func (s *Session) refreshLocked(ctx context.Context, allowUnknownExpiry bool) er
 	if err != nil {
 		return errors.New("encode refresh request")
 	}
-	resp, err := sessionRequest(ctx, s.http, s.base, "/v1/auth/refresh", body, "")
+	resp, err := sessionRequest(ctx, s.http, s.base, http.MethodPost, "/v1/auth/refresh", body, "")
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := sessionRequest(ctx, s.http, s.base, "/v1/auth/logout", nil, token)
+	resp, err := sessionRequest(ctx, s.http, s.base, http.MethodPost, "/v1/auth/logout", nil, token)
 	if err != nil {
 		return err
 	}
@@ -243,6 +243,122 @@ func (s *Session) Logout(ctx context.Context) error {
 	s.clearLocked()
 	s.mu.Unlock()
 	return nil
+}
+
+type SessionInfo struct {
+	SessionID  uuid.UUID
+	DeviceID   uuid.UUID
+	DeviceName string
+	Status     string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	RevokedAt  *time.Time
+	Current    bool
+}
+
+func (s *Session) ListSessions(ctx context.Context) ([]SessionInfo, error) {
+	resp, err := s.authorizedRequest(ctx, http.MethodGet, "/v1/sessions", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifySessionError(resp, "invalid_session")
+	}
+	var out struct {
+		Sessions []struct {
+			SessionID  string  `json:"session_id"`
+			DeviceID   string  `json:"device_id"`
+			DeviceName string  `json:"device_name"`
+			Status     string  `json:"status"`
+			CreatedAt  string  `json:"created_at"`
+			ExpiresAt  string  `json:"expires_at"`
+			RevokedAt  *string `json:"revoked_at"`
+			Current    *bool   `json:"current"`
+		} `json:"sessions"`
+	}
+	if err := decodeJSON(resp, &out, "sessions"); err != nil || out.Sessions == nil {
+		return nil, ErrInvalidResponse
+	}
+	result := make([]SessionInfo, 0, len(out.Sessions))
+	seen, current := make(map[uuid.UUID]bool, len(out.Sessions)), 0
+	principal := s.Principal()
+	for _, raw := range out.Sessions {
+		sessionID, sessionErr := uuid.Parse(raw.SessionID)
+		deviceID, deviceErr := uuid.Parse(raw.DeviceID)
+		createdAt, createdErr := time.Parse(time.RFC3339Nano, raw.CreatedAt)
+		expiresAt, expiresErr := time.Parse(time.RFC3339Nano, raw.ExpiresAt)
+		if sessionErr != nil || deviceErr != nil || createdErr != nil || expiresErr != nil || !validUUIDv7(sessionID) || !validUUIDv7(deviceID) || seen[sessionID] || strings.TrimSpace(raw.DeviceName) == "" || len(raw.DeviceName) > 400 || raw.Current == nil || !createdAt.Before(expiresAt) || (raw.Status != "active" && raw.Status != "revoked") {
+			return nil, ErrInvalidResponse
+		}
+		item := SessionInfo{SessionID: sessionID, DeviceID: deviceID, DeviceName: raw.DeviceName, Status: raw.Status, CreatedAt: createdAt, ExpiresAt: expiresAt, Current: *raw.Current}
+		if raw.RevokedAt != nil {
+			value, err := time.Parse(time.RFC3339Nano, *raw.RevokedAt)
+			if err != nil {
+				return nil, ErrInvalidResponse
+			}
+			item.RevokedAt = &value
+		}
+		if (item.Status == "revoked") != (item.RevokedAt != nil) {
+			return nil, ErrInvalidResponse
+		}
+		if item.Current {
+			if item.SessionID != principal.SessionID || item.DeviceID != principal.DeviceID || item.Status != "active" {
+				return nil, ErrInvalidResponse
+			}
+			current++
+		}
+		seen[item.SessionID] = true
+		result = append(result, item)
+	}
+	if current != 1 {
+		return nil, ErrInvalidResponse
+	}
+	return result, nil
+}
+
+func (s *Session) RenameDevice(ctx context.Context, deviceID uuid.UUID, name string) error {
+	if !validUUIDv7(deviceID) {
+		return errors.New("invalid device id")
+	}
+	body, err := json.Marshal(map[string]string{"display_name": name})
+	if err != nil {
+		return errors.New("encode device request")
+	}
+	return s.sessionMutation(ctx, http.MethodPatch, "/v1/devices/"+deviceID.String(), body)
+}
+
+func (s *Session) RevokeSession(ctx context.Context, sessionID uuid.UUID) error {
+	if !validUUIDv7(sessionID) {
+		return errors.New("invalid session id")
+	}
+	return s.sessionMutation(ctx, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil)
+}
+
+func (s *Session) sessionMutation(ctx context.Context, method, path string, body []byte) error {
+	resp, err := s.authorizedRequest(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return classifySessionError(resp, "invalid_session")
+	}
+	var out struct {
+		Status string `json:"status"`
+	}
+	if err := decodeJSON(resp, &out, "status"); err != nil || out.Status != "ok" {
+		return ErrInvalidResponse
+	}
+	return nil
+}
+
+func (s *Session) authorizedRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	token, err := s.AccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sessionRequest(ctx, s.http, s.base, method, path, body, token)
 }
 
 type sessionTokens struct {
@@ -278,10 +394,10 @@ func parsePrincipal(userRaw, deviceRaw, sessionRaw string) (Principal, error) {
 	return Principal{UserID: user, DeviceID: device, SessionID: session}, nil
 }
 
-func sessionRequest(ctx context.Context, client *http.Client, base *url.URL, path string, body []byte, bearer string) (*http.Response, error) {
+func sessionRequest(ctx context.Context, client *http.Client, base *url.URL, method, path string, body []byte, bearer string) (*http.Response, error) {
 	u := *base
 	u.Path = path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, errors.New("build authentication request")
 	}
@@ -323,6 +439,8 @@ func classifySessionError(resp *http.Response, unauthorizedCode string) error {
 	case resp.StatusCode == http.StatusUnauthorized && out.Error == unauthorizedCode:
 		return ErrReauthRequired
 	case resp.StatusCode == http.StatusBadRequest && out.Error == "invalid_request":
+		return &RejectedError{Status: resp.StatusCode, Code: out.Error}
+	case resp.StatusCode == http.StatusNotFound && out.Error == "not_found":
 		return &RejectedError{Status: resp.StatusCode, Code: out.Error}
 	case resp.StatusCode == http.StatusTooManyRequests && out.Error == "rate_limited":
 		return ErrRetryable

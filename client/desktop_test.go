@@ -99,7 +99,8 @@ func TestDesktopNoteLifecycleAndStateTagsWithoutBody(t *testing.T) {
 func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	root := t.TempDir()
 	user, device, sessionID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	pulls, logouts := 0, 0
+	otherDevice, otherSession := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	pulls, logouts, renames, revokes := 0, 0, 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -116,6 +117,24 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 					"refresh_expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
 				},
 			})
+		case "/v1/sessions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"sessions": []map[string]any{
+				{"session_id": sessionID.String(), "device_id": device.String(), "device_name": "Desktop", "status": "active", "created_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), "revoked_at": nil, "current": true},
+				{"session_id": otherSession.String(), "device_id": otherDevice.String(), "device_name": "Notebook", "status": "active", "created_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), "revoked_at": nil, "current": false},
+			}})
+		case "/v1/devices/" + device.String():
+			renames++
+			var body map[string]string
+			if r.Method != http.MethodPatch || json.NewDecoder(r.Body).Decode(&body) != nil || body["display_name"] != "Arbeitsplatz" {
+				t.Errorf("rename request = %s %#v", r.Method, body)
+			}
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/sessions/" + otherSession.String():
+			revokes++
+			if r.Method != http.MethodDelete {
+				t.Errorf("revoke method = %s", r.Method)
+			}
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case "/v1/sync/changes":
 			pulls++
 			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer access" || r.URL.Query().Get("after") != "0" {
@@ -149,6 +168,19 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	}
 	if !credentials.exists || credentials.credential.RefreshToken != "refresh" || credentials.credential.ServerURL != server.URL {
 		t.Fatalf("persisted credential = %#v, exists=%v", credentials.credential, credentials.exists)
+	}
+	sessions, err := app.ListSessions()
+	if err != nil || len(sessions) != 2 || !sessions[0].Current || sessions[1].SessionID != otherSession.String() {
+		t.Fatalf("ListSessions() = %#v, %v", sessions, err)
+	}
+	if err := app.RenameCurrentDevice("Arbeitsplatz"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.RevokeSession(otherSession.String()); err != nil {
+		t.Fatal(err)
+	}
+	if renames != 1 || revokes != 1 {
+		t.Fatalf("renames=%d revokes=%d", renames, revokes)
 	}
 	if _, err := app.SyncNow(); err != nil {
 		t.Fatal(err)
