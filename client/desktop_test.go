@@ -100,10 +100,25 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	root := t.TempDir()
 	user, device, sessionID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
 	otherDevice, otherSession := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	pulls, logouts, renames, revokes, deviceRevokes := 0, 0, 0, 0, 0
+	pulls, logouts, renames, revokes, deviceRevokes, registrations, verifications := 0, 0, 0, 0, 0, 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/v1/auth/register":
+			registrations++
+			var body map[string]string
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body["email"] != "person@example.com" || body["password"] != "correct horse battery staple" {
+				t.Errorf("registration request = %#v", body)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"verification_required"}`))
+		case "/v1/auth/verify-email":
+			verifications++
+			var body map[string]string
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body["token"] != strings.Repeat("A", 43) {
+				t.Errorf("verification request = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"status":"verified"}`))
 		case "/v1/auth/login":
 			var body map[string]string
 			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil || body["email"] != "person@example.com" || body["password"] != "secret" || body["device_name"] != "Desktop" {
@@ -167,6 +182,15 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	defer app.shutdown(context.Background())
 	if _, err := app.InitializeRoot(root); err != nil {
 		t.Fatal(err)
+	}
+	if err := app.RegisterAccount(RegisterRequest{ServerURL: server.URL + "/", Email: "person@example.com", Password: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.VerifyEmail(VerifyEmailRequest{ServerURL: server.URL + "/", Token: " " + strings.Repeat("A", 43) + " "}); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 1 || verifications != 1 {
+		t.Fatalf("registrations=%d verifications=%d", registrations, verifications)
 	}
 	view, err := app.Login(LoginRequest{ServerURL: server.URL, Email: "person@example.com", Password: "secret", DeviceName: "Desktop"})
 	if err != nil || view.UserID != user.String() || view.DeviceID != device.String() || view.SessionID != sessionID.String() {

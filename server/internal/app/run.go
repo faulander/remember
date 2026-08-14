@@ -12,10 +12,12 @@ import (
 	"github.com/faulander/remember/server/internal/blob"
 	"github.com/faulander/remember/server/internal/config"
 	"github.com/faulander/remember/server/internal/database"
+	"github.com/faulander/remember/server/internal/emaildelivery"
 	"github.com/faulander/remember/server/internal/httpapi"
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
 	synccore "github.com/faulander/remember/server/internal/sync"
+	"github.com/faulander/remember/server/internal/verificationtoken"
 	"github.com/google/uuid"
 )
 
@@ -71,7 +73,15 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 		logger.Warn("blob_orphans_detected", "event_code", "BLOB_ORPHANS_DETECTED", "count", audit.Orphans)
 	}
 
-	identityService, err := identity.NewProductionService(db)
+	var verificationTokens *verificationtoken.Codec
+	if cfg.EmailDeliveryEnabled() {
+		verificationTokens, err = verificationtoken.NewCodec(cfg.EmailTokenKey)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("open email verification token seal: %w", err)
+		}
+	}
+	identityService, err := identity.NewProductionService(db, verificationTokens)
 	if err != nil {
 		listener.Close()
 		return fmt.Errorf("open identity service: %w", err)
@@ -81,6 +91,23 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 		listener.Close()
 		return fmt.Errorf("open session service: %w", err)
 	}
+	var verificationDispatcher *emaildelivery.Dispatcher
+	if cfg.EmailDeliveryEnabled() {
+		sender, err := emaildelivery.NewSMTPSender(emaildelivery.SMTPConfig{
+			Address: cfg.SMTPAddress, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
+			From: cfg.SMTPFrom, Timeout: cfg.SMTPTimeout,
+		})
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("open email verification sender: %w", err)
+		}
+		verificationDispatcher, err = emaildelivery.NewDispatcher(db, sender, nil, verificationTokens)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("open email verification dispatcher: %w", err)
+		}
+		go verificationDispatcher.Run(ctx, logger)
+	}
 	syncService, err := synccore.NewService(db, nil)
 	if err != nil {
 		listener.Close()
@@ -88,7 +115,9 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger, listener
 	}
 	state := &httpapi.State{}
 	handler, err := httpapi.New(db, state, logger, httpapi.Dependencies{
-		Sessions: sessionService,
+		Identity:            identityService,
+		RegistrationEnabled: verificationDispatcher != nil,
+		Sessions:            sessionService,
 		BlobForUser: func(userID uuid.UUID) (httpapi.BlobUserService, error) {
 			return blobs.ForUser(userID)
 		},

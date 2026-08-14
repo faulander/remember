@@ -14,6 +14,82 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestPublicRegistrationAndEmailVerification(t *testing.T) {
+	t.Parallel()
+	var registrations, verifications int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/register":
+			registrations++
+			var body map[string]string
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "" || json.NewDecoder(r.Body).Decode(&body) != nil || body["email"] != "person@example.com" || body["password"] != "correct horse battery staple" {
+				t.Errorf("registration request = %s auth=%q body=%#v", r.Method, r.Header.Get("Authorization"), body)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"verification_required"}`))
+		case "/v1/auth/verify-email":
+			verifications++
+			var body map[string]string
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body["token"] != strings.Repeat("A", 43) {
+				t.Errorf("verification request = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"status":"verified"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	if err := Register(context.Background(), server.URL, nil, "person@example.com", "correct horse battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEmail(context.Background(), server.URL, nil, strings.Repeat("A", 43)); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 1 || verifications != 1 {
+		t.Fatalf("registrations=%d verifications=%d", registrations, verifications)
+	}
+}
+
+func TestPublicIdentityRejections(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, path, code string
+		status           int
+		retryable        bool
+	}{
+		{"registration disabled", "/v1/auth/register", "registration_unavailable", http.StatusServiceUnavailable, false},
+		{"invalid verification", "/v1/auth/verify-email", "invalid_verification", http.StatusBadRequest, false},
+		{"registration limited", "/v1/auth/register", "rate_limited", http.StatusTooManyRequests, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.status)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": test.code})
+			}))
+			defer server.Close()
+			var err error
+			if test.path == "/v1/auth/register" {
+				err = Register(context.Background(), server.URL, nil, "person@example.com", "correct horse battery staple")
+			} else {
+				err = VerifyEmail(context.Background(), server.URL, nil, strings.Repeat("A", 43))
+			}
+			if test.retryable {
+				if !errors.Is(err, ErrRetryable) {
+					t.Fatalf("error = %v, want retryable", err)
+				}
+				return
+			}
+			var rejected *RejectedError
+			if !errors.As(err, &rejected) || rejected.Status != test.status || rejected.Code != test.code {
+				t.Fatalf("error = %#v", err)
+			}
+		})
+	}
+}
+
 func TestSessionLoginRefreshAndLogout(t *testing.T) {
 	t.Parallel()
 	user, device, sessionID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())

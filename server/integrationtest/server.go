@@ -16,6 +16,7 @@ import (
 	"github.com/faulander/remember/server/internal/identity"
 	"github.com/faulander/remember/server/internal/session"
 	synccore "github.com/faulander/remember/server/internal/sync"
+	"github.com/faulander/remember/server/internal/verificationtoken"
 	"github.com/google/uuid"
 )
 
@@ -40,7 +41,12 @@ func New(ctx context.Context, root string) (*Server, error) {
 	if err != nil {
 		return fail(err)
 	}
-	ident, err := identity.NewProductionService(db)
+	tokenCodec, err := verificationtoken.NewCodec(make([]byte, verificationtoken.KeySize))
+	if err != nil {
+		blobs.Close()
+		return fail(err)
+	}
+	ident, err := identity.NewProductionService(db, tokenCodec)
 	if err != nil {
 		blobs.Close()
 		return fail(err)

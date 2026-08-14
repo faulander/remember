@@ -99,6 +99,48 @@ func TestAuthAndManagementSuccessContracts(t *testing.T) {
 	}
 }
 
+func TestRegistrationAndVerificationContracts(t *testing.T) {
+	t.Parallel()
+	handler, _, api, cleanup := newHandlerTest(t, nil)
+	defer cleanup()
+	identities := &fakeIdentity{}
+	api.identity, api.registrationEnabled = identities, true
+	password := "correct horse battery staple"
+	response := jsonRequest(t, handler, http.MethodPost, "/v1/auth/register", map[string]string{
+		"email": "Person@example.com", "password": password,
+	}, "", http.StatusAccepted)
+	if response.Body.String() != "{\"status\":\"verification_required\"}\n" || strings.Contains(response.Body.String(), password) || strings.Contains(response.Body.String(), identities.registration.VerificationToken) {
+		t.Fatalf("registration response = %s", response.Body.String())
+	}
+	for range registrationKeyLimit - 1 {
+		jsonRequest(t, handler, http.MethodPost, "/v1/auth/register", map[string]string{
+			"email": "person@example.com", "password": password,
+		}, "", http.StatusAccepted)
+	}
+	rateLimited := jsonRequest(t, handler, http.MethodPost, "/v1/auth/register", map[string]string{
+		"email": "PERSON@example.com", "password": password,
+	}, "", http.StatusTooManyRequests)
+	assertError(t, rateLimited, http.StatusTooManyRequests, "rate_limited")
+	if identities.email != "person@example.com" || identities.password != password || identities.registerCalls != registrationKeyLimit {
+		t.Fatalf("registration calls=%d email=%q password_match=%v", identities.registerCalls, identities.email, identities.password == password)
+	}
+	token := strings.Repeat("A", 43)
+	verified := jsonRequest(t, handler, http.MethodPost, "/v1/auth/verify-email", map[string]string{"token": token}, "", http.StatusOK)
+	if verified.Body.String() != "{\"status\":\"verified\"}\n" || identities.verifiedToken != token {
+		t.Fatalf("verification response=%s token=%q", verified.Body.String(), identities.verifiedToken)
+	}
+	identities.verifyErr = identity.ErrInvalidVerificationToken
+	invalid := jsonRequest(t, handler, http.MethodPost, "/v1/auth/verify-email", map[string]string{"token": strings.Repeat("B", 43)}, "", http.StatusBadRequest)
+	assertError(t, invalid, http.StatusBadRequest, "invalid_verification")
+	api.registrationEnabled = false
+	unavailable := jsonRequest(t, handler, http.MethodPost, "/v1/auth/register", map[string]string{"email": "new@example.com", "password": password}, "", http.StatusServiceUnavailable)
+	assertError(t, unavailable, http.StatusServiceUnavailable, "registration_unavailable")
+	api.registrationEnabled = true
+	identities.registerErr = identity.ErrRegistrationUnavailable
+	unavailable = jsonRequest(t, handler, http.MethodPost, "/v1/auth/register", map[string]string{"email": "other@example.com", "password": password}, "", http.StatusServiceUnavailable)
+	assertError(t, unavailable, http.StatusServiceUnavailable, "registration_unavailable")
+}
+
 func TestStrictJSONMediaBodyAndMethods(t *testing.T) {
 	t.Parallel()
 	handler, _, _, cleanup := newHandlerTest(t, nil)
@@ -888,6 +930,27 @@ func assertJSONPath(t *testing.T, response *httptest.ResponseRecorder, object, k
 	if got := fmt.Sprint(container[key]); got != want {
 		t.Fatalf("%s.%s=%q want=%q", object, key, got, want)
 	}
+}
+
+type fakeIdentity struct {
+	registration                   identity.Registration
+	email, password, verifiedToken string
+	registerCalls                  int
+	registerErr, verifyErr         error
+}
+
+func (f *fakeIdentity) Register(_ context.Context, email, password string) (identity.Registration, error) {
+	f.email, f.password = email, password
+	f.registerCalls++
+	if f.registration == (identity.Registration{}) {
+		f.registration = identity.Registration{Created: true, UserID: testUserID, VerificationToken: strings.Repeat("S", 43)}
+	}
+	return f.registration, f.registerErr
+}
+
+func (f *fakeIdentity) VerifyEmail(_ context.Context, token string) error {
+	f.verifiedToken = token
+	return f.verifyErr
 }
 
 type fakeSessions struct {

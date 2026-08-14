@@ -11,19 +11,27 @@ import (
 )
 
 const (
-	loginKeyLimit      = 10
-	loginGlobalLimit   = 100
-	loginWindow        = 15 * time.Minute
-	refreshKeyLimit    = 30
-	refreshGlobalLimit = 300
-	refreshWindow      = time.Minute
-	maxLimiterKeys     = 4096
-	maxConcurrentLogin = 4
+	loginKeyLimit           = 10
+	loginGlobalLimit        = 100
+	loginWindow             = 15 * time.Minute
+	refreshKeyLimit         = 30
+	refreshGlobalLimit      = 300
+	refreshWindow           = time.Minute
+	maxLimiterKeys          = 4096
+	maxConcurrentLogin      = 4
+	registrationKeyLimit    = 5
+	registrationGlobalLimit = 100
+	registrationWindow      = time.Hour
+	verificationKeyLimit    = 10
+	verificationGlobalLimit = 300
+	verificationWindow      = time.Minute
 )
 
 var (
-	loginKeyDomain   = []byte("remember:http-login-limit:v1\x00")
-	refreshKeyDomain = []byte("remember:http-refresh-limit:v1\x00")
+	loginKeyDomain        = []byte("remember:http-login-limit:v1\x00")
+	refreshKeyDomain      = []byte("remember:http-refresh-limit:v1\x00")
+	registrationKeyDomain = []byte("remember:http-registration-limit:v1\x00")
+	verificationKeyDomain = []byte("remember:http-verification-limit:v1\x00")
 )
 
 type Clock interface{ Now() time.Time }
@@ -98,16 +106,22 @@ func positiveDuration(value time.Duration) time.Duration {
 }
 
 type abuseLimiters struct {
-	loginKey, loginGlobal     *fixedWindowLimiter
-	refreshKey, refreshGlobal *fixedWindowLimiter
+	loginKey, loginGlobal               *fixedWindowLimiter
+	refreshKey, refreshGlobal           *fixedWindowLimiter
+	registrationKey, registrationGlobal *fixedWindowLimiter
+	verificationKey, verificationGlobal *fixedWindowLimiter
 }
 
 func newAbuseLimiters(clock Clock) *abuseLimiters {
 	return &abuseLimiters{
-		loginKey:      newFixedWindowLimiter(clock, loginKeyLimit, loginWindow, maxLimiterKeys),
-		loginGlobal:   newFixedWindowLimiter(clock, loginGlobalLimit, loginWindow, 1),
-		refreshKey:    newFixedWindowLimiter(clock, refreshKeyLimit, refreshWindow, maxLimiterKeys),
-		refreshGlobal: newFixedWindowLimiter(clock, refreshGlobalLimit, refreshWindow, 1),
+		loginKey:           newFixedWindowLimiter(clock, loginKeyLimit, loginWindow, maxLimiterKeys),
+		loginGlobal:        newFixedWindowLimiter(clock, loginGlobalLimit, loginWindow, 1),
+		refreshKey:         newFixedWindowLimiter(clock, refreshKeyLimit, refreshWindow, maxLimiterKeys),
+		refreshGlobal:      newFixedWindowLimiter(clock, refreshGlobalLimit, refreshWindow, 1),
+		registrationKey:    newFixedWindowLimiter(clock, registrationKeyLimit, registrationWindow, maxLimiterKeys),
+		registrationGlobal: newFixedWindowLimiter(clock, registrationGlobalLimit, registrationWindow, 1),
+		verificationKey:    newFixedWindowLimiter(clock, verificationKeyLimit, verificationWindow, maxLimiterKeys),
+		verificationGlobal: newFixedWindowLimiter(clock, verificationGlobalLimit, verificationWindow, 1),
 	}
 }
 
@@ -127,6 +141,24 @@ func (l *abuseLimiters) allowRefresh(token string) (bool, time.Duration) {
 		return false, retry
 	}
 	return l.refreshKey.allow(limitKey(refreshKeyDomain, token))
+}
+
+func (l *abuseLimiters) allowRegistration(email string) (bool, time.Duration) {
+	normalized := strings.ToLower(strings.TrimSpace(email))
+	if canonical, err := identity.CanonicalizeEmail(email); err == nil {
+		normalized = canonical.Canonical
+	}
+	if allowed, retry := l.registrationGlobal.allow(globalLimitKey()); !allowed {
+		return false, retry
+	}
+	return l.registrationKey.allow(limitKey(registrationKeyDomain, normalized))
+}
+
+func (l *abuseLimiters) allowVerification(token string) (bool, time.Duration) {
+	if allowed, retry := l.verificationGlobal.allow(globalLimitKey()); !allowed {
+		return false, retry
+	}
+	return l.verificationKey.allow(limitKey(verificationKeyDomain, token))
 }
 
 func limitKey(domain []byte, value string) [sha256.Size]byte {

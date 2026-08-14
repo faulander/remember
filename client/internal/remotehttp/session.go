@@ -48,6 +48,44 @@ type Session struct {
 	refreshDirty     bool
 }
 
+func Register(ctx context.Context, rawBase string, transport *http.Client, email, password string) error {
+	return publicIdentityMutation(ctx, rawBase, transport, "/v1/auth/register", map[string]string{
+		"email": email, "password": password,
+	}, http.StatusAccepted, "verification_required")
+}
+
+func VerifyEmail(ctx context.Context, rawBase string, transport *http.Client, token string) error {
+	return publicIdentityMutation(ctx, rawBase, transport, "/v1/auth/verify-email", map[string]string{
+		"token": token,
+	}, http.StatusOK, "verified")
+}
+
+func publicIdentityMutation(ctx context.Context, rawBase string, transport *http.Client, path string, values map[string]string, status int, expected string) error {
+	base, client, err := remoteEndpoint(rawBase, transport)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(values)
+	if err != nil {
+		return errors.New("encode identity request")
+	}
+	resp, err := sessionRequest(ctx, client, base, http.MethodPost, path, body, "")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != status {
+		return classifySessionError(resp, "")
+	}
+	var out struct {
+		Status string `json:"status"`
+	}
+	if err := decodeJSON(resp, &out, "status"); err != nil || out.Status != expected {
+		return ErrInvalidResponse
+	}
+	return nil
+}
+
 // Login authenticates one device and returns an in-memory session suitable as
 // a Client AccessTokenSource.
 func Login(ctx context.Context, rawBase string, transport *http.Client, email, password, deviceName string) (*Session, error) {
@@ -447,12 +485,16 @@ func classifySessionError(resp *http.Response, unauthorizedCode string) error {
 		return ErrReauthRequired
 	case resp.StatusCode == http.StatusBadRequest && out.Error == "invalid_request":
 		return &RejectedError{Status: resp.StatusCode, Code: out.Error}
+	case resp.StatusCode == http.StatusBadRequest && out.Error == "invalid_verification":
+		return &RejectedError{Status: resp.StatusCode, Code: out.Error}
 	case resp.StatusCode == http.StatusNotFound && out.Error == "not_found":
 		return &RejectedError{Status: resp.StatusCode, Code: out.Error}
 	case resp.StatusCode == http.StatusTooManyRequests && out.Error == "rate_limited":
 		return ErrRetryable
 	case resp.StatusCode == http.StatusInternalServerError && out.Error == "internal_error":
 		return ErrRetryable
+	case resp.StatusCode == http.StatusServiceUnavailable && (out.Error == "registration_unavailable" || out.Error == "verification_unavailable"):
+		return &RejectedError{Status: resp.StatusCode, Code: out.Error}
 	default:
 		return ErrInvalidResponse
 	}

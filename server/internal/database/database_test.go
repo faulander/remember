@@ -50,8 +50,8 @@ func TestOpenConfiguresSQLiteAndMigrateIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 8 {
-		t.Errorf("migration count = %d, want 8", count)
+	if count != 9 {
+		t.Errorf("migration count = %d, want 9", count)
 	}
 
 	info, err := os.Stat(path)

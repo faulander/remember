@@ -15,12 +15,12 @@ Remember ist eine plattformübergreifende Local-first-Anwendung für persönlich
 - begrenzter HTTP-Transport für Authentifizierung, Sitzungs-/Geräteverwaltung, Blob-Bytes und idempotenten Cursor-Sync
 - descriptor-rekursive exakte Subtree-Verifikation auf Darwin/Linux als Sicherheitsgrundlage für spätere Nested-Folder-Recovery; Windows bleibt dafür fail-closed
 - lokaler Index v35 mit crash-sicherer Outbox, exakter Blob-Staging-Ablage, Konflikt-/Rebase-/No-op-/Folder-Restore-/Folder-Move-Revert-/Folder-Intent-/Blob-Cleanup-Journalen, descriptor-gebundener Löschung technischer Bytes und resumierbarem Notiz-/Folder-Apply
-- strikter Client-HTTP-Transport und im Desktop verdrahteter manueller Vordergrund-Sync für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen; kurzlebige Access-Tokens bleiben im Arbeitsspeicher, rotierende Refresh-Tokens werden ausschließlich in macOS Keychain, Linux Secret Service beziehungsweise Windows Credential Manager gespeichert und beim App-Start vor Verwendung erneuert; angemeldete Geräte und Sitzungen sind im Desktop gruppiert sichtbar, das aktuelle Gerät kann umbenannt und andere Sitzungen einzeln oder samt Gerät widerrufen werden
+- strikter Client-HTTP-Transport und im Desktop verdrahteter manueller Vordergrund-Sync für Notiz-CRUD sowie identitätsgebundene Folder-Create/-Move/-Delete-Operationen; kurzlebige Access-Tokens bleiben im Arbeitsspeicher, rotierende Refresh-Tokens werden ausschließlich in macOS Keychain, Linux Secret Service beziehungsweise Windows Credential Manager gespeichert und beim App-Start vor Verwendung erneuert; der Desktop registriert neue Konten und bestätigt E-Mail-Codes, angemeldete Geräte und Sitzungen sind gruppiert sichtbar, das aktuelle Gerät kann umbenannt und andere Sitzungen einzeln oder samt Gerät widerrufen werden
 - automatisierter Mehrgeräte-Konvergenztest über echte Login-, Blob- und Sync-HTTP-Routen einschließlich leerer und direct-note-haltiger divergenter Folder-Move-Recovery mit A/B/Restart/Cold-C, Serverneustart, kaltem History-Bootstrap, dauerhafter Pull-Seiten-Wiederaufnahme, sichtbarer Update-Konfliktkopie, bidirektionalen Note-Move/Delete-Konflikten, Direct-Note-Folder-Recovery mit linearen Updates, leerem beziehungsweise direct-note-haltigem Folder-Move gegen Remote-Delete, äquivalenten Root-/Nested-Note-Moves, divergentem Same-Parent-Note-Move sowie Note-/Folder-Move/-Delete
 - direkte Notes und direkte leere Child-Folder werden bei Folder Delete gegen einen konkurrierenden Remote-Move atomar unter `_Konflikte/Wiederhergestellt` bewahrt; Notes behalten UUID, Tags, benutzerdefiniertes YAML und exakte Bytes, während Nested Subtrees weiter fail-closed bleiben
 - lokale Schema-v35-Sync-Inbox mit atomarem Seiten-Ingest, exaktem Crash-Replay und einem begrenzten Scheduler, der bei ungelöstem Outbox-Konflikt unabhängige lineare Root-Note-Update/-Delete-Ketten über unveränderlich gebundene Einzelpläne anwendet, ohne den bestätigten Präfix zu überspringen; dies ist über echte Auth-/Blob-/Sync-Routen mit A/B und kaltem C hinter einem ungelösten divergenten Folder-Move abgenommen. Fehlende und hashinkonsistente Remote-Blobs werden dauerhaft als sichtbare Issues alarmiert und nach Wiederherstellung fortgesetzt; leere divergente Folder-Moves sowie direkte lokal erstellte Notes mit linearen nie versuchten Update-Ketten werden verlustfrei am kanonischen Serverpfad vorbei gerettet; Strukturänderungen und vollständige Objektisolation bleiben für `SYNC-012` offen
 
-Öffentliche Registrierung, Reminder und weitere Folder-/Strukturkonflikte folgen in späteren Schnitten.
+Reminder, Recovery und weitere Folder-/Strukturkonflikte folgen in späteren Schnitten.
 
 ## Repository
 
@@ -93,7 +93,7 @@ Die Entwicklungsstandards binden nur an `127.0.0.1:8080`. Konfiguration, Dockerb
 ## Sicherheitsgrenzen
 
 - Der Serverprozess terminiert kein TLS und darf nicht direkt öffentlich exponiert werden.
-- Öffentliche Registrierung und Recovery sind noch nicht freigegeben; Blob- und Sync-Routen erfordern gültige Sitzungen, Blob-Bytes unterliegen zusätzlich einer Benutzerquota.
+- Öffentliche Registrierung ist nur bei vollständig konfiguriertem SMTPS-Versand und separatem Token-Seal-Schlüssel aktiv; Recovery ist noch nicht freigegeben. Blob- und Sync-Routen erfordern gültige Sitzungen, Blob-Bytes unterliegen zusätzlich einer Benutzerquota.
 - Refresh-Tokens liegen ausschließlich im Betriebssystem-Schlüsselspeicher des Clients; ist dieser nicht verfügbar, bleibt Login ohne Klartext-Fallback fail-closed.
 - Der Blob-Speicher benötigt ein lokales Dateisystem; Netzwerkdateisysteme werden nicht unterstützt.
 

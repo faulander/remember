@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,8 @@ func TestLoadDefaults(t *testing.T) {
 		cfg.BlobRoot != "data/blobs" || cfg.StagingPath != "data/staging" {
 		t.Errorf("defaults = %#v", cfg)
 	}
-	if cfg.ShutdownTimeout != 15*time.Second || cfg.DatabaseBusy != 5*time.Second || cfg.UserBlobQuotaBytes != 1<<30 {
+	if cfg.ShutdownTimeout != 15*time.Second || cfg.DatabaseBusy != 5*time.Second || cfg.UserBlobQuotaBytes != 1<<30 ||
+		cfg.EmailDeliveryEnabled() || cfg.SMTPTimeout != 10*time.Second {
 		t.Errorf("timeout defaults = %#v", cfg)
 	}
 }
@@ -37,6 +39,12 @@ func TestLoadOverrides(t *testing.T) {
 		EnvShutdownTimeout:   "9s",
 		EnvDatabaseBusy:      "750ms",
 		EnvUserBlobQuota:     "536870912",
+		EnvSMTPAddress:       "smtp.example.com:465",
+		EnvSMTPUsername:      "remember",
+		EnvSMTPPassword:      "smtp-secret",
+		EnvSMTPFrom:          "remember@example.com",
+		EnvSMTPTimeout:       "7s",
+		EnvEmailTokenKey:     base64.RawURLEncoding.EncodeToString(make([]byte, EmailTokenKeyBytes)),
 	}
 	cfg, err := Load(func(name string) (string, bool) {
 		value, ok := values[name]
@@ -49,13 +57,15 @@ func TestLoadOverrides(t *testing.T) {
 		cfg.BlobRoot != values[EnvBlobRoot] || cfg.StagingPath != values[EnvStagingPath] {
 		t.Errorf("overrides = %#v", cfg)
 	}
-	if cfg.DatabaseBusy != 750*time.Millisecond || cfg.ShutdownTimeout != 9*time.Second || cfg.UserBlobQuotaBytes != 536870912 {
-		t.Errorf("duration overrides = %#v", cfg)
+	if cfg.DatabaseBusy != 750*time.Millisecond || cfg.ShutdownTimeout != 9*time.Second || cfg.UserBlobQuotaBytes != 536870912 ||
+		!cfg.EmailDeliveryEnabled() || cfg.SMTPTimeout != 7*time.Second || cfg.SMTPPassword != "smtp-secret" {
+		t.Errorf("duration and SMTP overrides = %#v", cfg)
 	}
 }
 
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	t.Parallel()
+	tokenKey := base64.RawURLEncoding.EncodeToString(make([]byte, EmailTokenKeyBytes))
 
 	tests := map[string]map[string]string{
 		"empty address":        {EnvListenAddr: ""},
@@ -75,6 +85,12 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		"negative blob quota":  {EnvUserBlobQuota: "-1"},
 		"noncanonical quota":   {EnvUserBlobQuota: "01"},
 		"quota above maximum":  {EnvUserBlobQuota: "1099511627777"},
+		"partial SMTP":         {EnvSMTPAddress: "smtp.example.com:465"},
+		"bad email token key":  {EnvEmailTokenKey: "not-a-key"},
+		"bad SMTP address":     {EnvSMTPAddress: "smtp", EnvSMTPUsername: "user", EnvSMTPPassword: "secret", EnvSMTPFrom: "remember@example.com", EnvEmailTokenKey: tokenKey},
+		"bad SMTP sender":      {EnvSMTPAddress: "smtp.example.com:465", EnvSMTPUsername: "user", EnvSMTPPassword: "secret", EnvSMTPFrom: "Display <remember@example.com>", EnvEmailTokenKey: tokenKey},
+		"bad SMTP username":    {EnvSMTPAddress: "smtp.example.com:465", EnvSMTPUsername: "user\nname", EnvSMTPPassword: "secret", EnvSMTPFrom: "remember@example.com", EnvEmailTokenKey: tokenKey},
+		"bad SMTP password":    {EnvSMTPAddress: "smtp.example.com:465", EnvSMTPUsername: "user", EnvSMTPPassword: "secret\x00value", EnvSMTPFrom: "remember@example.com", EnvEmailTokenKey: tokenKey},
 	}
 	for name, values := range tests {
 		t.Run(name, func(t *testing.T) {

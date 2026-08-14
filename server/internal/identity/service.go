@@ -12,6 +12,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/faulander/remember/server/internal/verificationtoken"
+
 	"github.com/google/uuid"
 )
 
@@ -26,6 +28,7 @@ const (
 var (
 	ErrInvalidVerificationToken = errors.New("invalid verification token")
 	ErrInvalidCredentials       = errors.New("invalid credentials")
+	ErrRegistrationUnavailable  = errors.New("registration unavailable")
 )
 
 var verificationDomain = []byte("remember:email-verification:v1\x00")
@@ -39,20 +42,21 @@ func (systemClock) Now() time.Time { return time.Now() }
 
 // Service contains no HTTP, delivery, session, or sync behavior.
 type Service struct {
-	db       *sql.DB
-	password *PasswordHasher
-	clock    Clock
-	random   io.Reader
+	db                 *sql.DB
+	password           *PasswordHasher
+	clock              Clock
+	random             io.Reader
+	verificationTokens *verificationtoken.Codec
 }
 
-func NewService(db *sql.DB, password *PasswordHasher, clock Clock, random io.Reader) (*Service, error) {
+func NewService(db *sql.DB, password *PasswordHasher, clock Clock, random io.Reader, verificationTokens *verificationtoken.Codec) (*Service, error) {
 	if db == nil || password == nil || random == nil {
 		return nil, errors.New("identity service dependency is nil")
 	}
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &Service{db: db, password: password, clock: clock, random: random}, nil
+	return &Service{db: db, password: password, clock: clock, random: random, verificationTokens: verificationTokens}, nil
 }
 
 // Registration is secret-bearing and may only be passed to a delivery port.
@@ -65,6 +69,9 @@ type Registration struct {
 // Register creates a pending account and one verification token. Existing
 // addresses return an empty, non-error result and are never modified.
 func (s *Service) Register(ctx context.Context, emailInput, passwordInput string) (Registration, error) {
+	if s.verificationTokens == nil {
+		return Registration{}, ErrRegistrationUnavailable
+	}
 	email, err := CanonicalizeEmail(emailInput)
 	if err != nil {
 		return Registration{}, err
@@ -84,6 +91,10 @@ func (s *Service) Register(ctx context.Context, emailInput, passwordInput string
 	}
 	token := base64.RawURLEncoding.EncodeToString(rawToken)
 	tokenHash := hashVerificationToken(rawToken)
+	tokenNonce, tokenCiphertext, err := s.verificationTokens.Seal(s.random, userID, rawToken)
+	if err != nil {
+		return Registration{}, fmt.Errorf("seal verification token: %w", err)
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -114,6 +125,15 @@ func (s *Service) Register(ctx context.Context, emailInput, passwordInput string
 	)
 	if err != nil {
 		return Registration{}, fmt.Errorf("insert verification token: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO email_verification_outbox(
+			user_id, recipient, token_nonce, token_ciphertext, created_at_ms, next_attempt_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?)`,
+		userID[:], email.Delivery, tokenNonce, tokenCiphertext, now.UnixMilli(), now.UnixMilli(),
+	)
+	if err != nil {
+		return Registration{}, fmt.Errorf("queue email verification: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Registration{}, fmt.Errorf("commit registration: %w", err)
@@ -245,10 +265,10 @@ func hashVerificationToken(raw []byte) [sha256.Size]byte {
 }
 
 // NewProductionService constructs the internal core with production crypto.
-func NewProductionService(db *sql.DB) (*Service, error) {
+func NewProductionService(db *sql.DB, verificationTokens *verificationtoken.Codec) (*Service, error) {
 	hasher, err := NewPasswordHasher(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	return NewService(db, hasher, systemClock{}, rand.Reader)
+	return NewService(db, hasher, systemClock{}, rand.Reader, verificationTokens)
 }

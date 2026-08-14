@@ -8,6 +8,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Added
 
+- Öffentliche Registrierung und E-Mail-Verifikation sind über begrenzte, strikt decodierte HTTP-Routen und einen transaktionalen Zustell-Outbox verfügbar, sobald SMTPS und ein separater 256-Bit-Token-Seal-Schlüssel vollständig konfiguriert sind. Verifikationstokens bleiben in der Verifikationstabelle domain-separiert gehasht und liegen im Outbox nur benutzergebunden AES-256-GCM-versiegelt vor; der Desktop führt Registrierung und Codebestätigung ohne Rückgabe von Geheimnissen an das Frontend aus.
 - Der Wails-Desktop-Client kann eine Serversitzung per Login öffnen, Access-Tokens über rotierende Refresh-Tokens erneuern, einen begrenzten Vordergrund-Sync auslösen und die Sitzung serverseitig widerrufen. Refresh-Tokens werden ohne Klartext-Fallback ausschließlich in macOS Keychain, Linux Secret Service beziehungsweise Windows Credential Manager gespeichert, bei Wiederaufnahme vor Verwendung rotiert und nach jeder Rotation vor Tokenfreigabe erneut versiegelt; Passwort und Access-Token bleiben im Arbeitsspeicher und Tokens werden nie an das Frontend zurückgegeben. Die Sitzungsverwaltung gruppiert alle Sitzungen nach Gerät, erlaubt das Umbenennen des aktuellen Geräts und widerruft andere Sitzungen einzeln oder ein anderes Gerät samt aller seiner Sitzungen.
 - ADR 0075 und Protokoll v3 bewahren aktive direkte Notes bei Folder Delete/Remote-Move unter derselben Note-UUID und mit exaktem Blob; Servermigration 008 und Client-Schema v35 versiegeln Recovery-Root-, Folder-Clone- und Note-Move-Deskriptoren, superseden nur exakt gebundene lokale Delete-Intents und promoten vorbereitete v2-Versuche ausschließlich nach authentifizierter expliziter Ablehnung dauerhaft mit neuer Operations-ID.
 - ADR 0074 erweitert Preserve-and-delete transaktional auf aktuelle direkte leere Child-Folder; versionierter Replay-Hash, bestätigte Cursor-Grenze, zusammenhängende Spanne und Clone-Mapping bleiben dauerhaft gebunden.
@@ -49,13 +50,13 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 - Descriptor-verankerte lokale Dateioperationen auf Darwin/Linux mit Schutz vor Symlink-Rennen.
 - Bereinigte Markdown-Vorschau ohne aktive Inhalte, gefährliche Links oder Bilder.
-- Domain-separierte Hashspeicherung für Verifikations-, Access- und Refresh-Tokens.
+- Domain-separierte Hashspeicherung für Verifikations-, Access- und Refresh-Tokens; noch nicht zugestellte Verifikationstokens sind zusätzlich benutzergebunden im Outbox versiegelt.
 - Strikte Tenant-Bindung für Sync, Blobs, Geräte und Sitzungen.
 - Keine Geheimnisse, dynamischen IDs oder Requestinhalte in HTTP-Logs.
 
 ### Known limitations
 
-- Noch keine öffentliche Registrierung, Recovery oder Kontolöschung.
+- Noch keine Recovery oder Kontolöschung.
 - Crash-sichere, sichtbare und synchronisierte Konfliktkopien für konkurrierende Notiz-Updates und lokale Edits gegen kanonische Remote-Deletes einschließlich descriptor-gebundener technischer Bereinigung.
 - Edit-vs-Delete-Apply überspringt authentifizierte kanonische Zwischen-Updates/-Moves, erhält die lokalen Bytes im recoverable Trash und nimmt Abstürze über Pull-Seitengrenzen wieder auf.
 - Lokale Deletes gegen Remote-Edits retten zuerst den authentifizierten kanonischen Blob als synchronisierte Konfliktkopie und enqueueen den Tombstone anschließend atomar auf der neuen Revision.

@@ -912,15 +912,16 @@ Die App installiert keinen separaten Hintergrunddienst. Ist der Prozess beendet,
 
 ## 17.2 E-Mail-Verifikation und Recovery
 
-Tokens sind:
+Verifikationstokens sind:
 
 - kryptografisch zufällig,
-- kurzlebig,
+- 24 Stunden gültig,
 - einmal verwendbar,
-- serverseitig nur gehasht gespeichert,
+- in der Verifikationstabelle domain-separiert gehasht,
+- bis zur Zustellung im transaktionalen Outbox ausschließlich benutzergebunden mit einem separaten 256-Bit-Servergeheimnis AEAD-versiegelt,
 - an Zweck und Konto gebunden.
 
-Antworten und Timing werden so gestaltet, dass Account Enumeration erschwert wird.
+Registrierungsantworten und Fehler werden so gestaltet, dass Account Enumeration erschwert wird. Feste globale und geheimnisgebundene Rate Limits begrenzen Registrierung und Verifikation; der öffentliche Registrierungsweg bleibt ohne vollständig konfigurierten SMTPS-Adapter und Token-Seal-Schlüssel deaktiviert.
 
 ## 17.3 Sitzungstokens
 

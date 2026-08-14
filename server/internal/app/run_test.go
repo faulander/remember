@@ -19,6 +19,7 @@ import (
 	"github.com/faulander/remember/server/internal/config"
 	"github.com/faulander/remember/server/internal/database"
 	"github.com/faulander/remember/server/internal/identity"
+	"github.com/faulander/remember/server/internal/verificationtoken"
 )
 
 func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
@@ -38,7 +39,11 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 	if err := database.Migrate(context.Background(), setupDB); err != nil {
 		t.Fatal(err)
 	}
-	identityService, err := identity.NewProductionService(setupDB)
+	tokenCodec, err := verificationtoken.NewCodec(make([]byte, verificationtoken.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityService, err := identity.NewProductionService(setupDB, tokenCodec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,8 +232,8 @@ func TestServeReadyPersistentAndGracefulShutdown(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 8 {
-		t.Errorf("migration count after restart = %d, want 8", count)
+	if count != 9 {
+		t.Errorf("migration count after restart = %d, want 9", count)
 	}
 }
 

@@ -2,7 +2,8 @@
   import { onMount, tick } from 'svelte';
   import {
     CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, ListSessions, Login, Logout, MoveNote, OpenRoot,
-    ReadNote, Refresh, RenameCurrentDevice, RestoreSession, RevokeDevice, RevokeSession, SaveNote, SelectRoot, NormalizeTags, SyncNow,
+    ReadNote, Refresh, RegisterAccount, RenameCurrentDevice, RestoreSession, RevokeDevice, RevokeSession, SaveNote,
+    SelectRoot, NormalizeTags, SyncNow, VerifyEmail,
   } from '../wailsjs/go/main/DesktopApp';
   import { EventsOn } from '../wailsjs/runtime/runtime';
   import type { main } from '../wailsjs/go/models';
@@ -19,6 +20,7 @@
   type StateEvent = { generation: number; revision: number; state?: main.ClientState; error?: string };
   type ViewMode = 'edit' | 'preview' | 'split';
   type ManagedDevice = { deviceId: string; deviceName: string; current: boolean; sessions: main.ManagedSessionView[] };
+  type AuthMode = 'login' | 'register' | 'verify';
 
   const modes: { value: AppearanceMode; label: string }[] = [
     { value: 'system', label: 'System' }, { value: 'light', label: 'Hell' }, { value: 'dark', label: 'Dunkel' },
@@ -65,9 +67,12 @@
   let theme: Theme = 'remember';
   let session: main.SessionView | null = null;
   let loginOpen = false;
+  let authMode: AuthMode = 'login';
   let loginServer = 'http://127.0.0.1:8080';
   let loginEmail = '';
   let loginPassword = '';
+  let loginPasswordConfirm = '';
+  let verificationToken = '';
   let loginDevice = 'Remember Desktop';
   let accountOpen = false;
   let managedSessions: main.ManagedSessionView[] = [];
@@ -184,13 +189,22 @@
     await run(async () => { session = await RestoreSession(); });
   }
   function openLogin() {
-    loginPassword = '';
+    setAuthMode('login');
     loginOpen = true;
   }
 
   function closeLogin() {
     loginPassword = '';
+    loginPasswordConfirm = '';
+    verificationToken = '';
     loginOpen = false;
+  }
+
+  function setAuthMode(mode: AuthMode) {
+    authMode = mode;
+    loginPassword = '';
+    loginPasswordConfirm = '';
+    verificationToken = '';
   }
 
   async function loginCurrent() {
@@ -203,6 +217,27 @@
       loginPassword = '';
       loginOpen = false;
       notice = 'Serververbindung hergestellt.';
+    });
+  }
+
+  async function registerCurrent() {
+    if (!loginServer.trim() || !loginEmail.trim() || loginPassword.length < 15 || loginPassword !== loginPasswordConfirm) return;
+    await run(async () => {
+      await RegisterAccount({ serverUrl: loginServer.trim(), email: loginEmail.trim(), password: loginPassword });
+      loginPassword = '';
+      loginPasswordConfirm = '';
+      authMode = 'verify';
+      notice = 'Registrierung angenommen. Der Verifizierungscode wurde per E-Mail versendet.';
+    });
+  }
+
+  async function verifyEmailCurrent() {
+    if (!loginServer.trim() || !verificationToken.trim()) return;
+    await run(async () => {
+      await VerifyEmail({ serverUrl: loginServer.trim(), token: verificationToken.trim() });
+      verificationToken = '';
+      authMode = 'login';
+      notice = 'E-Mail bestätigt. Du kannst dich jetzt anmelden.';
     });
   }
 
@@ -653,5 +688,5 @@
 {#if folderOpen}<dialog use:openDialog class="modal" aria-labelledby="folder-title" on:close={() => folderOpen = false}><form on:submit|preventDefault={createFolderCurrent}><h2 id="folder-title">Neuer Ordner</h2><p>Wird angelegt in <code>{folderParent || 'Hauptordner'}</code>.</p><label>Name<input bind:value={folderName} placeholder="Neuer Ordner" /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => folderOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !folderName.trim()}>Ordner erstellen</button></div></form></dialog>{/if}
 {#if moveOpen}<dialog use:openDialog class="modal" aria-labelledby="move-title" on:close={() => moveOpen = false}><form on:submit|preventDefault={moveCurrent}><h2 id="move-title">Notiz umbenennen oder verschieben</h2><label>Name<input bind:value={moveName} /></label><label>Ordner<select bind:value={moveFolder}><option value="">Hauptordner</option>{#each folders as folder}<option value={folder}>{folder}</option>{/each}</select></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => moveOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !moveName.trim()}>Übernehmen</button></div></form></dialog>{/if}
 {#if deleteOpen && note}<dialog use:openDialog class="modal" aria-labelledby="delete-title" on:close={() => deleteOpen = false}><h2 id="delete-title">„{noteTitle}“ löschen?</h2><p>{dirty ? 'Ungespeicherte Änderungen werden verworfen. ' : ''}Die Datei wird wiederherstellbar nach <code>.remember/trash</code> verschoben.</p><div class="modal-actions"><button class="button ghost" on:click={() => deleteOpen = false}>Abbrechen</button><button class="button danger" on:click={deleteCurrent} disabled={busy}>In Papierkorb verschieben</button></div></dialog>{/if}
-{#if loginOpen}<dialog use:openDialog class="modal" aria-labelledby="login-title" on:close={closeLogin}><form on:submit|preventDefault={loginCurrent}><h2 id="login-title">Mit Remember verbinden</h2><p class="form-hint">Der rotierende Sitzungsschlüssel wird ausschließlich in der sicheren Schlüsselablage des Betriebssystems gespeichert. Passwort und Zugriffstoken bleiben im Arbeitsspeicher.</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label><label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete="current-password" required /></label><label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()}>Verbinden</button></div></form></dialog>{/if}
+{#if loginOpen}<dialog use:openDialog class="modal auth-modal" aria-labelledby="login-title" on:close={closeLogin}><div class="auth-tabs" aria-label="Kontozugang">{#each [{ mode: 'login', label: 'Anmelden' }, { mode: 'register', label: 'Registrieren' }, { mode: 'verify', label: 'Code bestätigen' }] as item}<button type="button" class:active={authMode === item.mode} aria-pressed={authMode === item.mode} on:click={() => setAuthMode(item.mode as AuthMode)}>{item.label}</button>{/each}</div><form on:submit|preventDefault={authMode === 'login' ? loginCurrent : authMode === 'register' ? registerCurrent : verifyEmailCurrent}><h2 id="login-title">{authMode === 'login' ? 'Mit Remember verbinden' : authMode === 'register' ? 'Remember-Konto erstellen' : 'E-Mail bestätigen'}</h2><p class="form-hint">{authMode === 'login' ? 'Der rotierende Sitzungsschlüssel wird ausschließlich in der sicheren Schlüsselablage des Betriebssystems gespeichert.' : authMode === 'register' ? 'Remember sendet einen 24 Stunden gültigen Verifizierungscode an deine E-Mail-Adresse.' : 'Füge den Verifizierungscode aus der Remember-E-Mail ein.'}</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label>{#if authMode !== 'verify'}<label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete={authMode === 'login' ? 'current-password' : 'new-password'} minlength={authMode === 'register' ? 15 : undefined} required /></label>{/if}{#if authMode === 'login'}<label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label>{:else if authMode === 'register'}<label>Passwort bestätigen<input type="password" bind:value={loginPasswordConfirm} autocomplete="new-password" minlength="15" required /></label><p class="form-hint">Mindestens 15 Zeichen. Das Passwort wird nur für die Registrierung übertragen.</p>{:else}<label>Verifizierungscode<input class="verification-token" bind:value={verificationToken} autocomplete="one-time-code" maxlength="43" spellcheck="false" required /></label>{/if}<div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || (authMode === 'login' && (!loginEmail.trim() || !loginPassword || !loginDevice.trim())) || (authMode === 'register' && (!loginEmail.trim() || loginPassword.length < 15 || loginPassword !== loginPasswordConfirm)) || (authMode === 'verify' && !verificationToken.trim())}>{authMode === 'login' ? 'Verbinden' : authMode === 'register' ? 'Konto erstellen' : 'Code bestätigen'}</button></div></form></dialog>{/if}
 {#if accountOpen}<dialog use:openDialog class="modal account-modal" aria-labelledby="account-title" on:close={() => accountOpen = false}><h2 id="account-title">Geräte und Sitzungen</h2><p class="form-hint">Angemeldete Geräte und Sitzungen dieses Remember-Kontos.</p>{#if managedDevices.length}<form class="device-name-form" on:submit|preventDefault={renameCurrentDevice}><label>Dieses Gerät<input bind:value={currentDeviceName} autocomplete="off" required /></label><button class="button ghost" disabled={busy || !currentDeviceName.trim()}>Umbenennen</button></form><ul class="device-list">{#each managedDevices as device (device.deviceId)}<li class="device-card"><div class="device-card-head"><div><strong>{device.deviceName}</strong>{#if device.current}<span class="session-badge">Dieses Gerät</span>{/if}<small>{device.sessions.length} {device.sessions.length === 1 ? 'Sitzung' : 'Sitzungen'}</small></div>{#if !device.current}<button class="button danger" on:click={() => revokeManagedDevice(device)} disabled={busy}>Gerät widerrufen</button>{/if}</div><ul class="session-list">{#each device.sessions as item (item.sessionId)}<li><div><small>{item.status === 'active' ? 'Aktiv' : 'Widerrufen'} · erstellt <time datetime={item.createdAt}>{formatSessionDate(item.createdAt)}</time></small><small>Läuft ab <time datetime={item.expiresAt}>{formatSessionDate(item.expiresAt)}</time></small></div>{#if !item.current && item.status === 'active'}<button class="button ghost session-revoke" aria-label={`Sitzung auf ${device.deviceName} widerrufen`} on:click={() => revokeManagedSession(item)} disabled={busy}>Sitzung widerrufen</button>{/if}</li>{/each}</ul></li>{/each}</ul>{:else if busy}<p class="form-hint">Sitzungen werden geladen …</p>{/if}<div class="modal-actions"><button class="button ghost" on:click={() => accountOpen = false}>Schließen</button></div></dialog>{/if}

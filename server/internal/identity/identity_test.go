@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/faulander/remember/server/internal/database"
+	"github.com/faulander/remember/server/internal/verificationtoken"
 	"github.com/google/uuid"
 )
 
@@ -187,6 +188,15 @@ func TestRegisterDuplicateAndVerifySingleUse(t *testing.T) {
 	if len(storedToken) != 32 || bytes.Contains(storedToken, []byte(created.VerificationToken)) {
 		t.Error("verification token was not stored as a fixed hash")
 	}
+	var queuedRecipient string
+	var queuedNonce, queuedCiphertext []byte
+	if err := db.QueryRow("SELECT recipient,token_nonce,token_ciphertext FROM email_verification_outbox WHERE user_id=?", created.UserID[:]).Scan(&queuedRecipient, &queuedNonce, &queuedCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if queuedRecipient != "User@example.com" || len(queuedNonce) != 12 || len(queuedCiphertext) != 48 ||
+		bytes.Contains(queuedNonce, []byte(created.VerificationToken)) || bytes.Contains(queuedCiphertext, []byte(created.VerificationToken)) {
+		t.Errorf("queued verification recipient=%q nonce=%d ciphertext=%d", queuedRecipient, len(queuedNonce), len(queuedCiphertext))
+	}
 	if err := db.QueryRow("SELECT password_hash FROM users WHERE id = ?", created.UserID[:]).Scan(&originalPasswordHash); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +208,7 @@ func TestRegisterDuplicateAndVerifySingleUse(t *testing.T) {
 	if duplicate.Created || duplicate.UserID != uuid.Nil || duplicate.VerificationToken != "" {
 		t.Errorf("duplicate leaked registration data: %#v", duplicate)
 	}
-	var userCount, tokenCount int
+	var userCount, tokenCount, outboxCount int
 	var passwordHashAfter string
 	if err := db.QueryRow("SELECT COUNT(*), MIN(password_hash) FROM users").Scan(&userCount, &passwordHashAfter); err != nil {
 		t.Fatal(err)
@@ -206,8 +216,11 @@ func TestRegisterDuplicateAndVerifySingleUse(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM email_verifications").Scan(&tokenCount); err != nil {
 		t.Fatal(err)
 	}
-	if userCount != 1 || tokenCount != 1 || passwordHashAfter != originalPasswordHash {
-		t.Errorf("duplicate changed account: users=%d tokens=%d", userCount, tokenCount)
+	if err := db.QueryRow("SELECT COUNT(*) FROM email_verification_outbox").Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if userCount != 1 || tokenCount != 1 || outboxCount != 1 || passwordHashAfter != originalPasswordHash {
+		t.Errorf("duplicate changed account: users=%d tokens=%d outbox=%d", userCount, tokenCount, outboxCount)
 	}
 
 	if err := service.VerifyEmail(ctx, created.VerificationToken); err != nil {
@@ -220,6 +233,9 @@ func TestRegisterDuplicateAndVerifySingleUse(t *testing.T) {
 	}
 	if status != StatusActive || verifiedAt != clock.now.UnixMilli() {
 		t.Errorf("verified account status=%q at=%d", status, verifiedAt)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM email_verification_outbox").Scan(&outboxCount); err != nil || outboxCount != 0 {
+		t.Errorf("verified outbox count=%d err=%v", outboxCount, err)
 	}
 	if err := service.VerifyEmail(ctx, created.VerificationToken); !errors.Is(err, ErrInvalidVerificationToken) {
 		t.Errorf("token reuse error = %v", err)
@@ -284,7 +300,7 @@ func TestRandomFailureLeavesNoPartialRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewService(db, hasher, &fakeClock{now: time.Now().UTC()}, failingReader{})
+	service, err := NewService(db, hasher, &fakeClock{now: time.Now().UTC()}, failingReader{}, testVerificationCodec(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +332,7 @@ func TestConcurrentDuplicateRegistrationCreatesOneAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewService(db, hasher, &fakeClock{now: time.Now().UTC()}, random)
+	service, err := NewService(db, hasher, &fakeClock{now: time.Now().UTC()}, random, testVerificationCodec(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,6 +460,15 @@ func (c *fakeClock) set(now time.Time) {
 	c.mu.Unlock()
 }
 
+func testVerificationCodec(t *testing.T) *verificationtoken.Codec {
+	t.Helper()
+	codec, err := verificationtoken.NewCodec(make([]byte, verificationtoken.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return codec
+}
+
 func testService(t *testing.T, clock Clock) (*Service, *sql.DB) {
 	t.Helper()
 	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "identity.db"), time.Second)
@@ -459,7 +484,7 @@ func testService(t *testing.T, clock Clock) (*Service, *sql.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewService(db, hasher, clock, random)
+	service, err := NewService(db, hasher, clock, random, testVerificationCodec(t))
 	if err != nil {
 		t.Fatal(err)
 	}

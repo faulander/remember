@@ -54,6 +54,11 @@ type SessionService interface {
 	RevokeDevice(context.Context, string, uuid.UUID) error
 }
 
+type IdentityService interface {
+	Register(context.Context, string, string) (identity.Registration, error)
+	VerifyEmail(context.Context, string) error
+}
+
 // Dependencies are explicit and injectable for bounded transport tests.
 type BlobUserService interface {
 	Put(context.Context, [sha256.Size]byte, io.Reader) (blob.PutResult, error)
@@ -71,10 +76,12 @@ type SyncActorService interface {
 type SyncForActor func(uuid.UUID, uuid.UUID) (SyncActorService, error)
 
 type Dependencies struct {
-	Sessions     SessionService
-	BlobForUser  BlobForUser
-	SyncForActor SyncForActor
-	Clock        Clock
+	Identity            IdentityService
+	RegistrationEnabled bool
+	Sessions            SessionService
+	BlobForUser         BlobForUser
+	SyncForActor        SyncForActor
+	Clock               Clock
 }
 
 // New returns the bounded public API.
@@ -89,24 +96,26 @@ func New(db *sql.DB, state *State, logger *slog.Logger, dependencies Dependencie
 		logger = slog.New(slog.DiscardHandler)
 	}
 	api := &handler{
-		db: db, state: state, sessions: dependencies.Sessions, blobForUser: dependencies.BlobForUser,
-		syncForActor: dependencies.SyncForActor,
-		limits:       newAbuseLimiters(dependencies.Clock), loginSlots: make(chan struct{}, maxConcurrentLogin),
+		db: db, state: state, identity: dependencies.Identity, registrationEnabled: dependencies.RegistrationEnabled,
+		sessions: dependencies.Sessions, blobForUser: dependencies.BlobForUser, syncForActor: dependencies.SyncForActor,
+		limits: newAbuseLimiters(dependencies.Clock), loginSlots: make(chan struct{}, maxConcurrentLogin),
 		blobSlots: make(chan struct{}, maxConcurrentBlobs), syncSlots: make(chan struct{}, maxConcurrentSync),
 	}
 	return requestLog(logger, securityHeaders(api)), nil
 }
 
 type handler struct {
-	db           *sql.DB
-	state        *State
-	sessions     SessionService
-	limits       *abuseLimiters
-	loginSlots   chan struct{}
-	blobForUser  BlobForUser
-	blobSlots    chan struct{}
-	syncForActor SyncForActor
-	syncSlots    chan struct{}
+	db                  *sql.DB
+	state               *State
+	identity            IdentityService
+	registrationEnabled bool
+	sessions            SessionService
+	limits              *abuseLimiters
+	loginSlots          chan struct{}
+	blobForUser         BlobForUser
+	blobSlots           chan struct{}
+	syncForActor        SyncForActor
+	syncSlots           chan struct{}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +130,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.probe(w, r, false)
 	case r.URL.Path == "/readyz":
 		h.probe(w, r, true)
+	case r.URL.Path == "/v1/auth/register":
+		h.register(w, r)
+	case r.URL.Path == "/v1/auth/verify-email":
+		h.verifyEmail(w, r)
 	case r.URL.Path == "/v1/auth/login":
 		h.login(w, r)
 	case r.URL.Path == "/v1/auth/refresh":
@@ -166,6 +179,78 @@ func (h *handler) probe(w http.ResponseWriter, r *http.Request, readiness bool) 
 		return
 	}
 	writeJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *handler) register(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, r, http.MethodPost)
+		return
+	}
+	if h.identity == nil || !h.registrationEnabled {
+		writeAPIError(w, r, http.StatusServiceUnavailable, "registration_unavailable")
+		return
+	}
+	var request struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := decodeStrictJSON(w, r, &request); err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	select {
+	case h.loginSlots <- struct{}{}:
+		defer func() { <-h.loginSlots }()
+	default:
+		writeRateLimited(w, r, time.Second)
+		return
+	}
+	if allowed, retry := h.limits.allowRegistration(request.Email); !allowed {
+		writeRateLimited(w, r, retry)
+		return
+	}
+	if _, err := h.identity.Register(r.Context(), request.Email, request.Password); err != nil {
+		if errors.Is(err, identity.ErrInvalidEmail) || errors.Is(err, identity.ErrInvalidPassword) {
+			writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		} else if errors.Is(err, identity.ErrRegistrationUnavailable) {
+			writeAPIError(w, r, http.StatusServiceUnavailable, "registration_unavailable")
+		} else {
+			writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+		}
+		return
+	}
+	writeJSON(w, r, http.StatusAccepted, map[string]string{"status": "verification_required"})
+}
+
+func (h *handler) verifyEmail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, r, http.MethodPost)
+		return
+	}
+	if h.identity == nil {
+		writeAPIError(w, r, http.StatusServiceUnavailable, "verification_unavailable")
+		return
+	}
+	var request struct {
+		Token string `json:"token"`
+	}
+	if err := decodeStrictJSON(w, r, &request); err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if allowed, retry := h.limits.allowVerification(request.Token); !allowed {
+		writeRateLimited(w, r, retry)
+		return
+	}
+	if err := h.identity.VerifyEmail(r.Context(), request.Token); err != nil {
+		if errors.Is(err, identity.ErrInvalidVerificationToken) {
+			writeAPIError(w, r, http.StatusBadRequest, "invalid_verification")
+		} else {
+			writeAPIError(w, r, http.StatusInternalServerError, "internal_error")
+		}
+		return
+	}
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "verified"})
 }
 
 func (h *handler) login(w http.ResponseWriter, r *http.Request) {

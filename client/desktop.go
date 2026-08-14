@@ -94,6 +94,17 @@ type LoginRequest struct {
 	DeviceName string `json:"deviceName"`
 }
 
+type RegisterRequest struct {
+	ServerURL string `json:"serverUrl"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+}
+
+type VerifyEmailRequest struct {
+	ServerURL string `json:"serverUrl"`
+	Token     string `json:"token"`
+}
+
 // SessionView contains public identifiers only; credentials never cross the bridge.
 type SessionView struct {
 	ServerURL string `json:"serverUrl"`
@@ -430,6 +441,32 @@ func (a *DesktopApp) DeleteNote(request DeleteNoteRequest) (ClientState, error) 
 		return ClientState{}, err
 	}
 	return a.snapshotCurrentState(ctx, core, report)
+}
+
+// RegisterAccount creates a pending account without returning its secret token.
+func (a *DesktopApp) RegisterAccount(request RegisterRequest) error {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+	serverURL := strings.TrimSuffix(strings.TrimSpace(request.ServerURL), "/")
+	return remotehttp.Register(ctx, serverURL, nil, request.Email, request.Password)
+}
+
+// VerifyEmail activates a pending account using the code delivered by email.
+func (a *DesktopApp) VerifyEmail(request VerifyEmailRequest) error {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+	serverURL := strings.TrimSuffix(strings.TrimSpace(request.ServerURL), "/")
+	return remotehttp.VerifyEmail(ctx, serverURL, nil, strings.TrimSpace(request.Token))
 }
 
 // Login authenticates and durably binds the rotating refresh token to the OS keyring.
