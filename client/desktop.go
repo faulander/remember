@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	coreapp "github.com/faulander/remember/client/internal/app"
 	"github.com/faulander/remember/client/internal/frontmatter"
@@ -17,6 +18,8 @@ import (
 	"github.com/faulander/remember/client/internal/naming"
 	"github.com/faulander/remember/client/internal/reconcile"
 	"github.com/faulander/remember/client/internal/remotehttp"
+	"github.com/faulander/remember/client/internal/sessionstore"
+	"github.com/google/uuid"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -83,7 +86,7 @@ type DeleteNoteRequest struct {
 	ExpectedRevision string `json:"expectedRevision"`
 }
 
-// LoginRequest starts one non-persistent authenticated desktop session.
+// LoginRequest starts one authenticated desktop session.
 type LoginRequest struct {
 	ServerURL  string `json:"serverUrl"`
 	Email      string `json:"email"`
@@ -130,10 +133,11 @@ type DesktopApp struct {
 	session     *remotehttp.Session
 	remote      *remotehttp.Client
 	serverURL   string
+	credentials sessionstore.Store
 }
 
 func NewDesktopApp() *DesktopApp {
-	return &DesktopApp{emit: runtime.EventsEmit}
+	return &DesktopApp{emit: runtime.EventsEmit, credentials: sessionstore.NewKeyringStore()}
 }
 
 func (a *DesktopApp) startup(ctx context.Context) {
@@ -416,7 +420,7 @@ func (a *DesktopApp) DeleteNote(request DeleteNoteRequest) (ClientState, error) 
 	return a.snapshotCurrentState(ctx, core, report)
 }
 
-// Login starts a session held only in memory for this app process.
+// Login authenticates and durably binds the rotating refresh token to the OS keyring.
 func (a *DesktopApp) Login(request LoginRequest) (SessionView, error) {
 	ctx, done, err := a.beginOperation()
 	if err != nil {
@@ -443,13 +447,103 @@ func (a *DesktopApp) Login(request LoginRequest) (SessionView, error) {
 		return SessionView{}, err
 	}
 	principal := session.Principal()
+	if err := session.BindRefreshTokenSink(ctx, a.refreshSink(serverURL, principal)); err != nil {
+		_ = session.Logout(ctx)
+		return SessionView{}, err
+	}
 	a.mu.Lock()
 	a.session, a.remote, a.serverURL = session, remote, serverURL
 	a.mu.Unlock()
+	return sessionView(serverURL, principal), nil
+}
+
+// RestoreSession rotates the refresh token loaded from the OS keyring before
+// exposing a restored session to the desktop.
+func (a *DesktopApp) RestoreSession() (*SessionView, error) {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+
+	a.mu.Lock()
+	active, serverURL, activePrincipal := a.session, a.serverURL, remotehttp.Principal{}
+	if active != nil {
+		activePrincipal = active.Principal()
+	}
+	a.mu.Unlock()
+	if active != nil {
+		view := sessionView(serverURL, activePrincipal)
+		return &view, nil
+	}
+	credential, err := a.credentials.Load()
+	if errors.Is(err, sessionstore.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	principal, err := storedPrincipal(credential)
+	if err != nil {
+		_ = a.credentials.Delete()
+		return nil, err
+	}
+	session, err := remotehttp.Resume(ctx, credential.ServerURL, nil, principal, credential.RefreshToken)
+	if errors.Is(err, remotehttp.ErrReauthRequired) {
+		if deleteErr := a.credentials.Delete(); deleteErr != nil {
+			return nil, deleteErr
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	remote, err := remotehttp.New(credential.ServerURL, nil, session)
+	if err != nil {
+		_ = session.Logout(ctx)
+		return nil, err
+	}
+	if err := session.BindRefreshTokenSink(ctx, a.refreshSink(credential.ServerURL, principal)); err != nil {
+		_ = session.Logout(ctx)
+		_ = a.credentials.Delete()
+		return nil, err
+	}
+	a.mu.Lock()
+	a.session, a.remote, a.serverURL = session, remote, credential.ServerURL
+	a.mu.Unlock()
+	view := sessionView(credential.ServerURL, principal)
+	return &view, nil
+}
+
+func (a *DesktopApp) refreshSink(serverURL string, principal remotehttp.Principal) remotehttp.RefreshTokenSink {
+	credential := sessionstore.Credential{
+		ServerURL: serverURL, UserID: principal.UserID.String(),
+		DeviceID: principal.DeviceID.String(), SessionID: principal.SessionID.String(),
+	}
+	return remotehttp.RefreshTokenSinkFunc(func(_ context.Context, token string, expiresAt time.Time) error {
+		credential.RefreshToken = token
+		credential.RefreshExpiresAt = expiresAt
+		return a.credentials.Save(credential)
+	})
+}
+
+func storedPrincipal(credential sessionstore.Credential) (remotehttp.Principal, error) {
+	user, userErr := uuid.Parse(credential.UserID)
+	device, deviceErr := uuid.Parse(credential.DeviceID)
+	session, sessionErr := uuid.Parse(credential.SessionID)
+	if userErr != nil || deviceErr != nil || sessionErr != nil {
+		return remotehttp.Principal{}, errors.New("stored session is invalid")
+	}
+	return remotehttp.Principal{UserID: user, DeviceID: device, SessionID: session}, nil
+}
+
+func sessionView(serverURL string, principal remotehttp.Principal) SessionView {
 	return SessionView{
 		ServerURL: serverURL,
 		UserID:    principal.UserID.String(), DeviceID: principal.DeviceID.String(), SessionID: principal.SessionID.String(),
-	}, nil
+	}
 }
 
 // SyncNow runs one bounded authenticated foreground synchronization cycle.
@@ -504,6 +598,7 @@ func (a *DesktopApp) Logout() error {
 		a.session, a.remote, a.serverURL = nil, nil, ""
 	}
 	a.mu.Unlock()
+	_ = a.credentials.Delete()
 	return nil
 }
 

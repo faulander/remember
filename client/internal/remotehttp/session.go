@@ -21,6 +21,16 @@ type Principal struct {
 	UserID, DeviceID, SessionID uuid.UUID
 }
 
+type RefreshTokenSink interface {
+	SaveRefreshToken(context.Context, string, time.Time) error
+}
+
+type RefreshTokenSinkFunc func(context.Context, string, time.Time) error
+
+func (f RefreshTokenSinkFunc) SaveRefreshToken(ctx context.Context, token string, expiresAt time.Time) error {
+	return f(ctx, token, expiresAt)
+}
+
 // Session owns one login's credentials in memory. Persistence belongs to a
 // platform keychain adapter; credentials are never written to the local index.
 type Session struct {
@@ -34,6 +44,8 @@ type Session struct {
 	refreshToken     string
 	accessExpiresAt  time.Time
 	refreshExpiresAt time.Time
+	refreshSink      RefreshTokenSink
+	refreshDirty     bool
 }
 
 // Login authenticates one device and returns an in-memory session suitable as
@@ -81,6 +93,46 @@ func Login(ctx context.Context, rawBase string, transport *http.Client, email, p
 	}, nil
 }
 
+// Resume rotates one persisted refresh token before making the restored
+// session available.
+func Resume(ctx context.Context, rawBase string, transport *http.Client, principal Principal, refreshToken string) (*Session, error) {
+	if !validUUIDv7(principal.UserID) || !validUUIDv7(principal.DeviceID) || !validUUIDv7(principal.SessionID) || !validSessionToken(refreshToken) {
+		return nil, ErrInvalidResponse
+	}
+	base, client, err := remoteEndpoint(rawBase, transport)
+	if err != nil {
+		return nil, err
+	}
+	session := &Session{base: base, http: client, principal: principal, refreshToken: refreshToken}
+	session.mu.Lock()
+	err = session.refreshLocked(ctx, true)
+	session.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// BindRefreshTokenSink persists the current rotating refresh credential and
+// makes every later rotation durable before an access token is returned.
+func (s *Session) BindRefreshTokenSink(ctx context.Context, sink RefreshTokenSink) error {
+	if s == nil || sink == nil {
+		return errors.New("nil refresh token sink")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refreshToken == "" {
+		return ErrReauthRequired
+	}
+	previousSink, previousDirty := s.refreshSink, s.refreshDirty
+	s.refreshSink, s.refreshDirty = sink, true
+	if err := s.persistRefreshLocked(ctx); err != nil {
+		s.refreshSink, s.refreshDirty = previousSink, previousDirty
+		return err
+	}
+	return nil
+}
+
 func (s *Session) Principal() Principal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -96,16 +148,29 @@ func (s *Session) AccessToken(ctx context.Context) (string, error) {
 	if s.refreshToken == "" || !time.Now().Before(s.refreshExpiresAt) {
 		return "", ErrReauthRequired
 	}
+	if err := s.persistRefreshLocked(ctx); err != nil {
+		return "", err
+	}
 	if s.accessToken != "" && time.Until(s.accessExpiresAt) > accessRefreshMargin {
 		return s.accessToken, nil
 	}
+	if err := s.refreshLocked(ctx, false); err != nil {
+		return "", err
+	}
+	return s.accessToken, nil
+}
+
+func (s *Session) refreshLocked(ctx context.Context, allowUnknownExpiry bool) error {
+	if s.refreshToken == "" || (!allowUnknownExpiry && !time.Now().Before(s.refreshExpiresAt)) {
+		return ErrReauthRequired
+	}
 	body, err := json.Marshal(map[string]string{"refresh_token": s.refreshToken})
 	if err != nil {
-		return "", errors.New("encode refresh request")
+		return errors.New("encode refresh request")
 	}
 	resp, err := sessionRequest(ctx, s.http, s.base, "/v1/auth/refresh", body, "")
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -113,19 +178,31 @@ func (s *Session) AccessToken(ctx context.Context) (string, error) {
 		if errors.Is(err, ErrReauthRequired) {
 			s.clearLocked()
 		}
-		return "", err
+		return err
 	}
 	var out sessionTokens
 	if err := decodeJSON(resp, &out, "access_token", "refresh_token", "access_expires_at", "refresh_expires_at"); err != nil {
-		return "", err
+		return err
 	}
 	access, refresh, accessExpiry, refreshExpiry, err := validateSessionTokens(out, time.Now())
 	if err != nil {
-		return "", err
+		return err
 	}
 	s.accessToken, s.refreshToken = access, refresh
 	s.accessExpiresAt, s.refreshExpiresAt = accessExpiry, refreshExpiry
-	return s.accessToken, nil
+	s.refreshDirty = s.refreshSink != nil
+	return s.persistRefreshLocked(ctx)
+}
+
+func (s *Session) persistRefreshLocked(ctx context.Context) error {
+	if !s.refreshDirty {
+		return nil
+	}
+	if s.refreshSink == nil || s.refreshSink.SaveRefreshToken(ctx, s.refreshToken, s.refreshExpiresAt) != nil {
+		return errors.New("secure session persistence unavailable")
+	}
+	s.refreshDirty = false
+	return nil
 }
 
 // Logout revokes the server session. Retryable failures leave the credentials
@@ -261,4 +338,5 @@ func (s *Session) clearLocked() {
 	s.refreshToken = ""
 	s.accessExpiresAt = time.Time{}
 	s.refreshExpiresAt = time.Time{}
+	s.refreshDirty = false
 }

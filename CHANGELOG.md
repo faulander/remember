@@ -8,7 +8,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 
 ### Added
 
-- Der Wails-Desktop-Client kann eine nicht persistierte Serversitzung per Login öffnen, Access-Tokens über rotierende Refresh-Tokens im Arbeitsspeicher erneuern, einen begrenzten Vordergrund-Sync auslösen und die Sitzung serverseitig widerrufen; Zugangsdaten und Tokens werden weder an das Frontend zurückgegeben noch in den lokalen Index geschrieben.
+- Der Wails-Desktop-Client kann eine Serversitzung per Login öffnen, Access-Tokens über rotierende Refresh-Tokens erneuern, einen begrenzten Vordergrund-Sync auslösen und die Sitzung serverseitig widerrufen. Refresh-Tokens werden ohne Klartext-Fallback ausschließlich in macOS Keychain, Linux Secret Service beziehungsweise Windows Credential Manager gespeichert, bei Wiederaufnahme vor Verwendung rotiert und nach jeder Rotation vor Tokenfreigabe erneut versiegelt; Passwort und Access-Token bleiben im Arbeitsspeicher und Tokens werden nie an das Frontend zurückgegeben.
 - ADR 0075 und Protokoll v3 bewahren aktive direkte Notes bei Folder Delete/Remote-Move unter derselben Note-UUID und mit exaktem Blob; Servermigration 008 und Client-Schema v35 versiegeln Recovery-Root-, Folder-Clone- und Note-Move-Deskriptoren, superseden nur exakt gebundene lokale Delete-Intents und promoten vorbereitete v2-Versuche ausschließlich nach authentifizierter expliziter Ablehnung dauerhaft mit neuer Operations-ID.
 - ADR 0074 erweitert Preserve-and-delete transaktional auf aktuelle direkte leere Child-Folder; versionierter Replay-Hash, bestätigte Cursor-Grenze, zusammenhängende Spanne und Clone-Mapping bleiben dauerhaft gebunden.
 - Client-Schema v34 bindet die leere Preserve-and-Delete-Historie exakt und schließt nur die konkrete aufgelöste Konfliktoperation aus ungelösten Intents aus.
@@ -81,8 +81,7 @@ Das Format orientiert sich an [Keep a Changelog](https://keepachangelog.com/de/1
 - Eigene akzeptierte Folder-Move/-Delete-Echos werden ausschließlich über atomar persistierte Quellpfad-/Device-/Inode-Intents als lokal ausgeführt bestätigt.
 - Mehrere Note-/Folder-Zustände derselben Pull-Seite verwenden pfadgenaue Zwischenzustände; Create→Delete-Publikationsmarker werden crash-resumierbar vom passenden Delete konsumiert.
 - Ein Netzwerkabbruch zwischen Pull-Seiten setzt nach Clientneustart nachweislich am dauerhaft bestätigten `NextCursor` statt bei Cursor null fort.
-- Hintergrund-Scheduler und OS-Schlüsselspeicher fehlen weiterhin.
-- Noch keine sichere Clientablage für Refresh-Tokens.
+- Automatischer Hintergrund-Sync fehlt weiterhin; Synchronisierung wird im Desktop bewusst manuell ausgelöst.
 - Reminder sowie breitere Zwei-Geräte-Konvergenz für die verbleibenden Folder-/Strukturkonflikte sind noch nicht implementiert.
 - Windows- und Linux-Desktop-Builds wurden noch nicht real auf Zielgeräten geprüft.
 - Builds sind unsigniert und besitzen noch keinen automatischen Updater.

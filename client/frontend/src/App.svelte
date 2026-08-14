@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import {
     CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, Login, Logout, MoveNote, OpenRoot,
-    ReadNote, Refresh, SaveNote, SelectRoot, NormalizeTags, SyncNow,
+    ReadNote, Refresh, RestoreSession, SaveNote, SelectRoot, NormalizeTags, SyncNow,
   } from '../wailsjs/go/main/DesktopApp';
   import { EventsOn } from '../wailsjs/runtime/runtime';
   import type { main } from '../wailsjs/go/models';
@@ -119,6 +119,7 @@
     window.addEventListener('keydown', shortcut);
     window.addEventListener('click', dismissContextMenu);
     window.addEventListener('blur', dismissContextMenu);
+    void restoreStoredSession();
     return () => {
       unsubscribe(); media.removeEventListener('change', apply);
       window.removeEventListener('beforeunload', beforeUnload);
@@ -173,6 +174,10 @@
     await run(async () => { applyState(await Refresh()); await syncSelectedFromDisk(); });
   }
 
+
+  async function restoreStoredSession() {
+    await run(async () => { session = await RestoreSession(); });
+  }
   function openLogin() {
     loginPassword = '';
     loginOpen = true;
@@ -584,4 +589,4 @@
 {#if folderOpen}<dialog use:openDialog class="modal" aria-labelledby="folder-title" on:close={() => folderOpen = false}><form on:submit|preventDefault={createFolderCurrent}><h2 id="folder-title">Neuer Ordner</h2><p>Wird angelegt in <code>{folderParent || 'Hauptordner'}</code>.</p><label>Name<input bind:value={folderName} placeholder="Neuer Ordner" /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => folderOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !folderName.trim()}>Ordner erstellen</button></div></form></dialog>{/if}
 {#if moveOpen}<dialog use:openDialog class="modal" aria-labelledby="move-title" on:close={() => moveOpen = false}><form on:submit|preventDefault={moveCurrent}><h2 id="move-title">Notiz umbenennen oder verschieben</h2><label>Name<input bind:value={moveName} /></label><label>Ordner<select bind:value={moveFolder}><option value="">Hauptordner</option>{#each folders as folder}<option value={folder}>{folder}</option>{/each}</select></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => moveOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !moveName.trim()}>Übernehmen</button></div></form></dialog>{/if}
 {#if deleteOpen && note}<dialog use:openDialog class="modal" aria-labelledby="delete-title" on:close={() => deleteOpen = false}><h2 id="delete-title">„{noteTitle}“ löschen?</h2><p>{dirty ? 'Ungespeicherte Änderungen werden verworfen. ' : ''}Die Datei wird wiederherstellbar nach <code>.remember/trash</code> verschoben.</p><div class="modal-actions"><button class="button ghost" on:click={() => deleteOpen = false}>Abbrechen</button><button class="button danger" on:click={deleteCurrent} disabled={busy}>In Papierkorb verschieben</button></div></dialog>{/if}
-{#if loginOpen}<dialog use:openDialog class="modal" aria-labelledby="login-title" on:close={closeLogin}><form on:submit|preventDefault={loginCurrent}><h2 id="login-title">Mit Remember verbinden</h2><p class="form-hint">Die Sitzung bleibt nur bis zum Schließen der App im Arbeitsspeicher. Es werden keine Zugangsdaten im lokalen Index gespeichert.</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label><label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete="current-password" required /></label><label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()}>Verbinden</button></div></form></dialog>{/if}
+{#if loginOpen}<dialog use:openDialog class="modal" aria-labelledby="login-title" on:close={closeLogin}><form on:submit|preventDefault={loginCurrent}><h2 id="login-title">Mit Remember verbinden</h2><p class="form-hint">Der rotierende Sitzungsschlüssel wird ausschließlich in der sicheren Schlüsselablage des Betriebssystems gespeichert. Passwort und Zugriffstoken bleiben im Arbeitsspeicher.</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label><label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete="current-password" required /></label><label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()}>Verbinden</button></div></form></dialog>{/if}

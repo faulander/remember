@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -60,6 +61,66 @@ func TestSessionLoginRefreshAndLogout(t *testing.T) {
 	}
 	if _, err := session.AccessToken(context.Background()); !errors.Is(err, ErrReauthRequired) {
 		t.Fatalf("post-logout AccessToken() error = %v", err)
+	}
+}
+
+func TestSessionResumeRotatesAndPersistsRefreshCredential(t *testing.T) {
+	t.Parallel()
+	principal := Principal{UserID: uuid.Must(uuid.NewV7()), DeviceID: uuid.Must(uuid.NewV7()), SessionID: uuid.Must(uuid.NewV7())}
+	var refreshes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body map[string]string
+		if r.URL.Path != "/v1/auth/refresh" || json.NewDecoder(r.Body).Decode(&body) != nil || body["refresh_token"] != "persisted-refresh" {
+			t.Errorf("resume request = %s %#v", r.URL.Path, body)
+		}
+		refreshes.Add(1)
+		writeSessionTokens(t, w, "access-new", "refresh-new", time.Now().Add(15*time.Minute), time.Now().Add(time.Hour))
+	}))
+	defer server.Close()
+
+	session, err := Resume(context.Background(), server.URL, nil, principal, "persisted-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var savedToken string
+	if err := session.BindRefreshTokenSink(context.Background(), RefreshTokenSinkFunc(func(_ context.Context, token string, _ time.Time) error {
+		savedToken = token
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	token, err := session.AccessToken(context.Background())
+	if err != nil || token != "access-new" || savedToken != "refresh-new" || refreshes.Load() != 1 {
+		t.Fatalf("restored token=%q saved=%q refreshes=%d err=%v", token, savedToken, refreshes.Load(), err)
+	}
+}
+
+func TestSessionDoesNotExposeRefreshPersistenceErrors(t *testing.T) {
+	t.Parallel()
+	var logouts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/auth/logout" {
+			logouts.Add(1)
+			_, _ = w.Write([]byte(`{"status":"revoked"}`))
+			return
+		}
+		writeSessionLoginResponse(t, w, uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), "access", "refresh", time.Now().Add(time.Minute), time.Now().Add(time.Hour))
+	}))
+	defer server.Close()
+	session, err := Login(context.Background(), server.URL, nil, "person@example.com", "secret", "Mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = session.BindRefreshTokenSink(context.Background(), RefreshTokenSinkFunc(func(context.Context, string, time.Time) error {
+		return errors.New("keychain backend detail")
+	}))
+	if err == nil || strings.Contains(err.Error(), "backend detail") {
+		t.Fatalf("persistence error = %v", err)
+	}
+	if err := session.Logout(context.Background()); err != nil || logouts.Load() != 1 {
+		t.Fatalf("Logout() after persistence failure = %v; calls=%d", err, logouts.Load())
 	}
 }
 

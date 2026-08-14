@@ -14,6 +14,7 @@ import (
 
 	coreapp "github.com/faulander/remember/client/internal/app"
 	"github.com/faulander/remember/client/internal/remotehttp"
+	"github.com/faulander/remember/client/internal/sessionstore"
 	"github.com/google/uuid"
 )
 
@@ -134,6 +135,8 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	defer server.Close()
 
 	app := NewDesktopApp()
+	credentials := &memoryCredentialStore{}
+	app.credentials = credentials
 	app.emit = func(context.Context, string, ...interface{}) {}
 	app.startup(context.Background())
 	defer app.shutdown(context.Background())
@@ -143,6 +146,9 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	view, err := app.Login(LoginRequest{ServerURL: server.URL, Email: "person@example.com", Password: "secret", DeviceName: "Desktop"})
 	if err != nil || view.UserID != user.String() || view.DeviceID != device.String() || view.SessionID != sessionID.String() {
 		t.Fatalf("Login() = %#v, %v", view, err)
+	}
+	if !credentials.exists || credentials.credential.RefreshToken != "refresh" || credentials.credential.ServerURL != server.URL {
+		t.Fatalf("persisted credential = %#v, exists=%v", credentials.credential, credentials.exists)
 	}
 	if _, err := app.SyncNow(); err != nil {
 		t.Fatal(err)
@@ -156,9 +162,97 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	if logouts != 1 {
 		t.Fatalf("logouts = %d", logouts)
 	}
+	if credentials.exists {
+		t.Fatal("credential retained after logout")
+	}
 	if _, err := app.SyncNow(); !errors.Is(err, remotehttp.ErrReauthRequired) {
 		t.Fatalf("post-logout SyncNow() error = %v", err)
 	}
+}
+
+func TestDesktopRestoresAndRotatesPersistedSession(t *testing.T) {
+	user, device, sessionID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	refreshes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/refresh":
+			refreshes++
+			var body map[string]string
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body["refresh_token"] != "persisted-refresh" {
+				t.Errorf("refresh body = %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token": "restored-access", "refresh_token": "rotated-refresh",
+				"access_expires_at":  time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339Nano),
+				"refresh_expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+			})
+		case "/v1/auth/logout":
+			if r.Header.Get("Authorization") != "Bearer restored-access" {
+				t.Errorf("logout authorization = %q", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"status":"revoked"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	credentials := &memoryCredentialStore{exists: true, credential: sessionstore.Credential{
+		ServerURL: server.URL, UserID: user.String(), DeviceID: device.String(), SessionID: sessionID.String(),
+		RefreshToken: "persisted-refresh", RefreshExpiresAt: time.Now().Add(time.Hour),
+	}}
+	app := NewDesktopApp()
+	app.credentials = credentials
+	app.emit = func(context.Context, string, ...interface{}) {}
+	app.startup(context.Background())
+	defer app.shutdown(context.Background())
+
+	view, err := app.RestoreSession()
+	if err != nil || view == nil || view.SessionID != sessionID.String() {
+		t.Fatalf("RestoreSession() = %#v, %v", view, err)
+	}
+	if refreshes != 1 || credentials.credential.RefreshToken != "rotated-refresh" {
+		t.Fatalf("refreshes=%d credential=%#v", refreshes, credentials.credential)
+	}
+	replayed, err := app.RestoreSession()
+	if err != nil || replayed == nil || refreshes != 1 {
+		t.Fatalf("second RestoreSession() = %#v, %v; refreshes=%d", replayed, err, refreshes)
+	}
+	if err := app.Logout(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type memoryCredentialStore struct {
+	credential sessionstore.Credential
+	exists     bool
+	err        error
+}
+
+func (s *memoryCredentialStore) Load() (sessionstore.Credential, error) {
+	if s.err != nil {
+		return sessionstore.Credential{}, s.err
+	}
+	if !s.exists {
+		return sessionstore.Credential{}, sessionstore.ErrNotFound
+	}
+	return s.credential, nil
+}
+
+func (s *memoryCredentialStore) Save(credential sessionstore.Credential) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.credential, s.exists = credential, true
+	return nil
+}
+
+func (s *memoryCredentialStore) Delete() error {
+	if s.err != nil {
+		return s.err
+	}
+	s.credential, s.exists = sessionstore.Credential{}, false
+	return nil
 }
 
 func TestEditableNotePathRejectsInvalidFolderAndNormalizesName(t *testing.T) {
