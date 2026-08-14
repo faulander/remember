@@ -636,6 +636,31 @@ func (a *DesktopApp) RevokeSession(rawID string) error {
 	return session.RevokeSession(ctx, id)
 }
 
+// RevokeDevice revokes another device and all of its account sessions.
+func (a *DesktopApp) RevokeDevice(rawID string) error {
+	ctx, done, err := a.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	a.authOps.Lock()
+	defer a.authOps.Unlock()
+	id, err := uuid.Parse(rawID)
+	if err != nil {
+		return errors.New("invalid device id")
+	}
+	a.mu.Lock()
+	session := a.session
+	a.mu.Unlock()
+	if session == nil {
+		return remotehttp.ErrReauthRequired
+	}
+	if id == session.Principal().DeviceID {
+		return errors.New("use logout for current device")
+	}
+	return session.RevokeDevice(ctx, id)
+}
+
 // SyncNow runs one bounded authenticated foreground synchronization cycle.
 func (a *DesktopApp) SyncNow() (ClientState, error) {
 	ctx, done, err := a.beginOperation()

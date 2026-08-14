@@ -89,6 +89,11 @@ func TestSessionListsRenamesAndRevokesSessions(t *testing.T) {
 				t.Errorf("rename request = %s %#v", r.Method, body)
 			}
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/devices/" + otherDevice.String():
+			if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer access" {
+				t.Errorf("device revoke request = %s auth=%q", r.Method, r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case "/v1/sessions/" + otherSession.String():
 			if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer access" {
 				t.Errorf("revoke request = %s auth=%q", r.Method, r.Header.Get("Authorization"))
@@ -109,6 +114,9 @@ func TestSessionListsRenamesAndRevokesSessions(t *testing.T) {
 		t.Fatalf("ListSessions() = %#v, %v", items, err)
 	}
 	if err := session.RenameDevice(context.Background(), device, "Arbeitsplatz"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.RevokeDevice(context.Background(), otherDevice); err != nil {
 		t.Fatal(err)
 	}
 	if err := session.RevokeSession(context.Background(), otherSession); err != nil {

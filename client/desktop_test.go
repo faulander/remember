@@ -100,7 +100,7 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	root := t.TempDir()
 	user, device, sessionID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
 	otherDevice, otherSession := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	pulls, logouts, renames, revokes := 0, 0, 0, 0
+	pulls, logouts, renames, revokes, deviceRevokes := 0, 0, 0, 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -127,6 +127,12 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 			var body map[string]string
 			if r.Method != http.MethodPatch || json.NewDecoder(r.Body).Decode(&body) != nil || body["display_name"] != "Arbeitsplatz" {
 				t.Errorf("rename request = %s %#v", r.Method, body)
+			}
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/devices/" + otherDevice.String():
+			deviceRevokes++
+			if r.Method != http.MethodDelete {
+				t.Errorf("device revoke method = %s", r.Method)
 			}
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case "/v1/sessions/" + otherSession.String():
@@ -179,8 +185,11 @@ func TestDesktopLoginSyncAndLogout(t *testing.T) {
 	if err := app.RevokeSession(otherSession.String()); err != nil {
 		t.Fatal(err)
 	}
-	if renames != 1 || revokes != 1 {
-		t.Fatalf("renames=%d revokes=%d", renames, revokes)
+	if err := app.RevokeDevice(otherDevice.String()); err != nil {
+		t.Fatal(err)
+	}
+	if renames != 1 || revokes != 1 || deviceRevokes != 1 {
+		t.Fatalf("renames=%d revokes=%d deviceRevokes=%d", renames, revokes, deviceRevokes)
 	}
 	if _, err := app.SyncNow(); err != nil {
 		t.Fatal(err)

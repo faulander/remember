@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import {
     CloseRoot, CreateFolder, CreateNote, DeleteNote, InitializeRoot, ListSessions, Login, Logout, MoveNote, OpenRoot,
-    ReadNote, Refresh, RenameCurrentDevice, RestoreSession, RevokeSession, SaveNote, SelectRoot, NormalizeTags, SyncNow,
+    ReadNote, Refresh, RenameCurrentDevice, RestoreSession, RevokeDevice, RevokeSession, SaveNote, SelectRoot, NormalizeTags, SyncNow,
   } from '../wailsjs/go/main/DesktopApp';
   import { EventsOn } from '../wailsjs/runtime/runtime';
   import type { main } from '../wailsjs/go/models';
@@ -18,6 +18,7 @@
 
   type StateEvent = { generation: number; revision: number; state?: main.ClientState; error?: string };
   type ViewMode = 'edit' | 'preview' | 'split';
+  type ManagedDevice = { deviceId: string; deviceName: string; current: boolean; sessions: main.ManagedSessionView[] };
 
   const modes: { value: AppearanceMode; label: string }[] = [
     { value: 'system', label: 'System' }, { value: 'light', label: 'Hell' }, { value: 'dark', label: 'Dunkel' },
@@ -86,6 +87,7 @@
   $: dirty = note !== null && (body !== baselineBody || JSON.stringify(tags) !== JSON.stringify(baselineTags));
   $: previewHTML = renderMarkdown(body);
   $: noteTitle = note ? fileTitle(note.relativePath) : '';
+  $: managedDevices = groupManagedDevices(managedSessions);
 
   onMount(() => {
     appearanceMode = storedMode(localStorage.getItem('remember.appearance.mode'));
@@ -240,6 +242,30 @@
       managedSessions = managedSessions.filter((candidate) => candidate.sessionId !== item.sessionId);
       notice = 'Sitzung widerrufen.';
     });
+  }
+
+  async function revokeManagedDevice(device: ManagedDevice) {
+    if (device.current || !window.confirm(`Gerät „${device.deviceName}“ und alle seine Sitzungen widerrufen?`)) return;
+    await run(async () => {
+      await RevokeDevice(device.deviceId);
+      managedSessions = managedSessions.filter((item) => item.deviceId !== device.deviceId);
+      notice = 'Gerät widerrufen.';
+    });
+  }
+
+  function groupManagedDevices(items: main.ManagedSessionView[]): ManagedDevice[] {
+    const devices = new Map<string, ManagedDevice>();
+    for (const item of items) {
+      const device = devices.get(item.deviceId);
+      if (device) {
+        device.current ||= item.current;
+        if (item.current) device.deviceName = item.deviceName;
+        device.sessions.push(item);
+      } else {
+        devices.set(item.deviceId, { deviceId: item.deviceId, deviceName: item.deviceName, current: item.current, sessions: [item] });
+      }
+    }
+    return [...devices.values()].sort((left, right) => Number(right.current) - Number(left.current));
   }
 
   function formatSessionDate(raw: string): string {
@@ -628,4 +654,4 @@
 {#if moveOpen}<dialog use:openDialog class="modal" aria-labelledby="move-title" on:close={() => moveOpen = false}><form on:submit|preventDefault={moveCurrent}><h2 id="move-title">Notiz umbenennen oder verschieben</h2><label>Name<input bind:value={moveName} /></label><label>Ordner<select bind:value={moveFolder}><option value="">Hauptordner</option>{#each folders as folder}<option value={folder}>{folder}</option>{/each}</select></label><div class="modal-actions"><button type="button" class="button ghost" on:click={() => moveOpen = false}>Abbrechen</button><button class="button primary" disabled={busy || !moveName.trim()}>Übernehmen</button></div></form></dialog>{/if}
 {#if deleteOpen && note}<dialog use:openDialog class="modal" aria-labelledby="delete-title" on:close={() => deleteOpen = false}><h2 id="delete-title">„{noteTitle}“ löschen?</h2><p>{dirty ? 'Ungespeicherte Änderungen werden verworfen. ' : ''}Die Datei wird wiederherstellbar nach <code>.remember/trash</code> verschoben.</p><div class="modal-actions"><button class="button ghost" on:click={() => deleteOpen = false}>Abbrechen</button><button class="button danger" on:click={deleteCurrent} disabled={busy}>In Papierkorb verschieben</button></div></dialog>{/if}
 {#if loginOpen}<dialog use:openDialog class="modal" aria-labelledby="login-title" on:close={closeLogin}><form on:submit|preventDefault={loginCurrent}><h2 id="login-title">Mit Remember verbinden</h2><p class="form-hint">Der rotierende Sitzungsschlüssel wird ausschließlich in der sicheren Schlüsselablage des Betriebssystems gespeichert. Passwort und Zugriffstoken bleiben im Arbeitsspeicher.</p><label>Server<input type="url" bind:value={loginServer} autocomplete="url" required /></label><label>E-Mail<input type="email" bind:value={loginEmail} autocomplete="username" required /></label><label>Passwort<input type="password" bind:value={loginPassword} autocomplete="current-password" required /></label><label>Gerätename<input bind:value={loginDevice} autocomplete="off" required /></label><div class="modal-actions"><button type="button" class="button ghost" on:click={closeLogin}>Abbrechen</button><button class="button primary" disabled={busy || !loginServer.trim() || !loginEmail.trim() || !loginPassword || !loginDevice.trim()}>Verbinden</button></div></form></dialog>{/if}
-{#if accountOpen}<dialog use:openDialog class="modal account-modal" aria-labelledby="account-title" on:close={() => accountOpen = false}><h2 id="account-title">Sitzungen</h2><p class="form-hint">Angemeldete Geräte und Sitzungen dieses Remember-Kontos.</p>{#if managedSessions.length}<form class="device-name-form" on:submit|preventDefault={renameCurrentDevice}><label>Dieses Gerät<input bind:value={currentDeviceName} autocomplete="off" required /></label><button class="button ghost" disabled={busy || !currentDeviceName.trim()}>Umbenennen</button></form><ul class="session-list">{#each managedSessions as item (item.sessionId)}<li><div><strong>{item.deviceName}</strong>{#if item.current}<span class="session-badge">Dieses Gerät</span>{/if}<small>{item.status === 'active' ? 'Aktiv' : 'Widerrufen'} · erstellt <time datetime={item.createdAt}>{formatSessionDate(item.createdAt)}</time></small><small>Läuft ab <time datetime={item.expiresAt}>{formatSessionDate(item.expiresAt)}</time></small></div>{#if !item.current && item.status === 'active'}<button class="button danger" on:click={() => revokeManagedSession(item)} disabled={busy}>Widerrufen</button>{/if}</li>{/each}</ul>{:else if busy}<p class="form-hint">Sitzungen werden geladen …</p>{/if}<div class="modal-actions"><button class="button ghost" on:click={() => accountOpen = false}>Schließen</button></div></dialog>{/if}
+{#if accountOpen}<dialog use:openDialog class="modal account-modal" aria-labelledby="account-title" on:close={() => accountOpen = false}><h2 id="account-title">Geräte und Sitzungen</h2><p class="form-hint">Angemeldete Geräte und Sitzungen dieses Remember-Kontos.</p>{#if managedDevices.length}<form class="device-name-form" on:submit|preventDefault={renameCurrentDevice}><label>Dieses Gerät<input bind:value={currentDeviceName} autocomplete="off" required /></label><button class="button ghost" disabled={busy || !currentDeviceName.trim()}>Umbenennen</button></form><ul class="device-list">{#each managedDevices as device (device.deviceId)}<li class="device-card"><div class="device-card-head"><div><strong>{device.deviceName}</strong>{#if device.current}<span class="session-badge">Dieses Gerät</span>{/if}<small>{device.sessions.length} {device.sessions.length === 1 ? 'Sitzung' : 'Sitzungen'}</small></div>{#if !device.current}<button class="button danger" on:click={() => revokeManagedDevice(device)} disabled={busy}>Gerät widerrufen</button>{/if}</div><ul class="session-list">{#each device.sessions as item (item.sessionId)}<li><div><small>{item.status === 'active' ? 'Aktiv' : 'Widerrufen'} · erstellt <time datetime={item.createdAt}>{formatSessionDate(item.createdAt)}</time></small><small>Läuft ab <time datetime={item.expiresAt}>{formatSessionDate(item.expiresAt)}</time></small></div>{#if !item.current && item.status === 'active'}<button class="button ghost session-revoke" aria-label={`Sitzung auf ${device.deviceName} widerrufen`} on:click={() => revokeManagedSession(item)} disabled={busy}>Sitzung widerrufen</button>{/if}</li>{/each}</ul></li>{/each}</ul>{:else if busy}<p class="form-hint">Sitzungen werden geladen …</p>{/if}<div class="modal-actions"><button class="button ghost" on:click={() => accountOpen = false}>Schließen</button></div></dialog>{/if}

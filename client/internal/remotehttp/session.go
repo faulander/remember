@@ -328,6 +328,13 @@ func (s *Session) RenameDevice(ctx context.Context, deviceID uuid.UUID, name str
 	return s.sessionMutation(ctx, http.MethodPatch, "/v1/devices/"+deviceID.String(), body)
 }
 
+func (s *Session) RevokeDevice(ctx context.Context, deviceID uuid.UUID) error {
+	if !validUUIDv7(deviceID) {
+		return errors.New("invalid device id")
+	}
+	return s.sessionMutation(ctx, http.MethodDelete, "/v1/devices/"+deviceID.String(), nil)
+}
+
 func (s *Session) RevokeSession(ctx context.Context, sessionID uuid.UUID) error {
 	if !validUUIDv7(sessionID) {
 		return errors.New("invalid session id")
