@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"path/filepath"
@@ -620,6 +621,7 @@ func TestPortableNamingConformanceVectors(t *testing.T) {
 
 type fixture struct {
 	db             *sql.DB
+	service        *Service
 	users, devices []uuid.UUID
 	actors         []*ActorService
 	blob, blob2    []byte
@@ -639,7 +641,7 @@ func newFixture(t *testing.T, count int) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fixture{db: db, blob: bytes.Repeat([]byte{1}, 32), blob2: bytes.Repeat([]byte{2}, 32)}
+	f := &fixture{db: db, service: service, blob: bytes.Repeat([]byte{1}, 32), blob2: bytes.Repeat([]byte{2}, 32)}
 	for _, blob := range [][]byte{f.blob, f.blob2} {
 		if _, err := db.Exec("INSERT INTO content_blobs(hash,size_bytes,available,created_at_ms) VALUES(?,1,1,1)", blob); err != nil {
 			t.Fatal(err)
@@ -962,6 +964,201 @@ func TestPreserveAndDeleteV3RejectsNestedPostFrontierHistory(t *testing.T) {
 	req := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 3, KnownCursor: moved.Cursor}
 	if _, err := a.PreserveAndDeleteEmptyFolder(ctx, req); !errors.Is(err, ErrPreserveDeleteUnavailable) {
 		t.Fatalf("nested post-frontier history accepted: %v", err)
+	}
+}
+
+func TestPreserveAndDeleteRecursiveV4ThreeLevelMixedTree(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1)
+	a := f.actors[0]
+	root, child, grandchild := newID(t), newID(t), newID(t)
+	rootNote, childNote, grandchildNote := newID(t), newID(t), newID(t)
+	created := mustAccepted(t, a, createFolder(root, "Root", nil))
+	mustAccepted(t, a, createFolder(child, "Child", &root))
+	mustAccepted(t, a, createFolder(grandchild, "Grandchild", &child))
+	mustAccepted(t, a, createNote(rootNote, "root.md", &root, f.blob))
+	mustAccepted(t, a, createNote(childNote, "child.md", &child, f.blob))
+	mustAccepted(t, a, createNote(grandchildNote, "grandchild.md", &grandchild, f.blob))
+	moved := mustAccepted(t, a, moveObject(root, ObjectFolder, created.Revision, "Moved", nil))
+	conflictID := mustNewID()
+	conflict, err := a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+	if err != nil || conflict.Conflict != ConflictBaseRevisionMismatch {
+		t.Fatalf("conflict=%#v err=%v", conflict, err)
+	}
+	request := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 4, KnownCursor: moved.Cursor}
+	got, err := a.PreserveAndDeleteEmptyFolder(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Clones) != 2 || len(got.NoteMoves) != 3 || got.LastCursor != got.FirstCursor+8 {
+		t.Fatalf("result=%#v", got)
+	}
+	childClone, grandchildClone := got.Clones[0], got.Clones[1]
+	if childClone.OriginalFolderID != child || childClone.SourceParentID != root || childClone.TargetParentID != got.RecoveredFolderID || childClone.Depth != 1 || childClone.CreateCursor != got.FirstCursor+1 {
+		t.Fatalf("child clone=%#v", childClone)
+	}
+	if grandchildClone.OriginalFolderID != grandchild || grandchildClone.SourceParentID != child || grandchildClone.TargetParentID != childClone.RecoveredFolderID || grandchildClone.Depth != 2 || grandchildClone.CreateCursor != got.FirstCursor+2 {
+		t.Fatalf("grandchild clone=%#v", grandchildClone)
+	}
+	if grandchildClone.DeleteCursor != got.FirstCursor+6 || childClone.DeleteCursor != got.FirstCursor+7 {
+		t.Fatalf("delete ordering child=%d grandchild=%d", childClone.DeleteCursor, grandchildClone.DeleteCursor)
+	}
+	expectedNotes := []struct {
+		id, source, target uuid.UUID
+		cursor             uint64
+		name               string
+	}{
+		{rootNote, root, got.RecoveredFolderID, got.FirstCursor + 3, "root.md"},
+		{childNote, child, childClone.RecoveredFolderID, got.FirstCursor + 4, "child.md"},
+		{grandchildNote, grandchild, grandchildClone.RecoveredFolderID, got.FirstCursor + 5, "grandchild.md"},
+	}
+	for i, expected := range expectedNotes {
+		note := got.NoteMoves[i]
+		if note.NoteID != expected.id || note.SourceParentID != expected.source || note.TargetParentID != expected.target || note.MoveCursor != expected.cursor || note.Name != expected.name || !bytes.Equal(note.BlobHash, f.blob) {
+			t.Fatalf("note %d=%#v", i, note)
+		}
+	}
+	page, err := a.Pull(ctx, got.FirstCursor-1, 20)
+	if err != nil || len(page.Changes) != 9 {
+		t.Fatalf("page=%#v err=%v", page, err)
+	}
+	for i, expected := range expectedNotes {
+		change := page.Changes[i+3]
+		if change.Mutation != MutationMove || change.ObjectID != expected.id || change.ParentID == nil || *change.ParentID != expected.target || change.Name != expected.name || !bytes.Equal(change.BlobHash, f.blob) {
+			t.Fatalf("note change %d=%#v", i, change)
+		}
+	}
+	if page.Changes[6].ObjectID != grandchild || page.Changes[7].ObjectID != child || page.Changes[8].ObjectID != root {
+		t.Fatalf("delete changes=%#v", page.Changes[6:])
+	}
+	replay, err := a.PreserveAndDeleteEmptyFolder(ctx, request)
+	if err != nil || replay.RecoveredFolderID != got.RecoveredFolderID || replay.RecoveredFolderName != got.RecoveredFolderName || replay.FirstCursor != got.FirstCursor || replay.LastCursor != got.LastCursor || len(replay.Clones) != len(got.Clones) || len(replay.NoteMoves) != len(got.NoteMoves) {
+		t.Fatalf("replay=%#v err=%v", replay, err)
+	}
+	for i := range got.Clones {
+		if replay.Clones[i] != got.Clones[i] {
+			t.Fatalf("replay clone %d=%#v want %#v", i, replay.Clones[i], got.Clones[i])
+		}
+	}
+	for i := range got.NoteMoves {
+		if replay.NoteMoves[i].NoteID != got.NoteMoves[i].NoteID || replay.NoteMoves[i].MoveCursor != got.NoteMoves[i].MoveCursor || !bytes.Equal(replay.NoteMoves[i].BlobHash, got.NoteMoves[i].BlobHash) {
+			t.Fatalf("replay note %d=%#v want %#v", i, replay.NoteMoves[i], got.NoteMoves[i])
+		}
+	}
+	otherDevice := mustNewID()
+	if _, err = f.db.Exec(`INSERT INTO devices(user_id,id,display_name,status,created_at_ms,updated_at_ms) VALUES(?,?,'Other','active',1,1)`, f.users[0][:], otherDevice[:]); err != nil {
+		t.Fatal(err)
+	}
+	otherActor, err := f.service.ForActor(f.users[0], otherDevice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = otherActor.PreserveAndDeleteEmptyFolder(ctx, request); !errors.Is(err, ErrOperationReplayMismatch) {
+		t.Fatalf("cross-device replay=%v", err)
+	}
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_clones SET depth=99 WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], request.OperationID[:]); err == nil {
+		t.Fatal("sealed recursive clone mutated")
+	}
+	fakeResolution := mustNewID()
+	if _, err = f.db.Exec(`INSERT INTO sync_folder_preserve_delete_resolutions(user_id,device_id,resolution_operation_id,request_hash,conflict_operation_id,folder_id,expected_revision,recovered_folder_id,recovered_folder_name,recovered_cursor,deleted_cursor,status,created_at_ms,request_version,known_cursor,first_cursor,last_cursor,clone_count,note_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,'preparing',1,4,?,?,?,?,?)`, f.users[0][:], f.devices[0][:], fakeResolution[:], bytes.Repeat([]byte{7}, sha256.Size), request.ConflictOperationID[:], request.FolderID[:], request.ExpectedRevision, got.RecoveredFolderID[:], got.RecoveredFolderName, got.FirstCursor, got.LastCursor, request.KnownCursor, got.FirstCursor, got.LastCursor, len(got.Clones), len(got.NoteMoves)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.db.Exec(`INSERT INTO sync_folder_preserve_delete_clones(user_id,resolution_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name,source_parent_id,target_parent_id,depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, f.users[0][:], fakeResolution[:], 0, childClone.OriginalFolderID[:], childClone.RecoveredFolderID[:], childClone.CreateCursor, childClone.DeleteCursor, childClone.SourceRevision, childClone.Name, childClone.SourceParentID[:], childClone.TargetParentID[:], 2); err == nil {
+		t.Fatal("invalid recursive parent depth accepted")
+	}
+	if _, err = f.db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET status='completed' WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], fakeResolution[:]); err == nil {
+		t.Fatal("incomplete recursive mapping sealed")
+	}
+}
+
+func TestPreserveAndDeleteRecursiveV4RejectsPostFrontierUnavailableBlobAndCanonicalDriftAtomically(t *testing.T) {
+	for _, tc := range []string{"post-frontier", "unavailable-blob", "canonical-drift"} {
+		t.Run(tc, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t, 1)
+			a := f.actors[0]
+			root, child, note := newID(t), newID(t), newID(t)
+			created := mustAccepted(t, a, createFolder(root, "Root", nil))
+			mustAccepted(t, a, createFolder(child, "Child", &root))
+			mustAccepted(t, a, createNote(note, "note.md", &child, f.blob))
+			moved := mustAccepted(t, a, moveObject(root, ObjectFolder, created.Revision, "Moved", nil))
+			known := moved.Cursor
+			if tc == "post-frontier" {
+				mustAccepted(t, a, moveObject(note, ObjectNote, 1, "later.md", &child))
+			} else if tc == "canonical-drift" {
+				later := mustAccepted(t, a, moveObject(root, ObjectFolder, moved.Revision, "Moved again", nil))
+				known = later.Cursor
+			} else if _, err := f.db.Exec(`UPDATE content_blobs SET available=0 WHERE hash=?`, f.blob); err != nil {
+				t.Fatal(err)
+			}
+			conflictID := mustNewID()
+			a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+			var beforeResolutionCursor uint64
+			if err := f.db.QueryRow(`SELECT COALESCE(MAX(cursor),0) FROM sync_change_log WHERE user_id=?`, f.users[0][:]).Scan(&beforeResolutionCursor); err != nil {
+				t.Fatal(err)
+			}
+			request := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 4, KnownCursor: known}
+			if _, err := a.PreserveAndDeleteEmptyFolder(ctx, request); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+				t.Fatalf("accepted %s: %v", tc, err)
+			}
+			var resolutions, changes int
+			if err := f.db.QueryRow(`SELECT COUNT(*) FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], request.OperationID[:]).Scan(&resolutions); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.db.QueryRow(`SELECT COUNT(*) FROM sync_change_log WHERE user_id=? AND cursor>?`, f.users[0][:], beforeResolutionCursor).Scan(&changes); err != nil {
+				t.Fatal(err)
+			}
+			if resolutions != 0 || changes != 0 {
+				t.Fatalf("partial resolution persisted: resolutions=%d changes=%d", resolutions, changes)
+			}
+		})
+	}
+}
+
+func TestPreserveAndDeleteRecursiveV4RejectsDepthAndCountOverflow(t *testing.T) {
+	for _, tc := range []string{"depth-257", "objects-10001"} {
+		t.Run(tc, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t, 1)
+			a := f.actors[0]
+			root := newID(t)
+			created := mustAccepted(t, a, createFolder(root, "Root", nil))
+			moved := mustAccepted(t, a, moveObject(root, ObjectFolder, created.Revision, "Moved", nil))
+			conflictID := mustNewID()
+			a.Submit(ctx, Mutation{OperationID: conflictID, Kind: MutationDelete, ObjectID: root, ObjectType: ObjectFolder, BaseRevision: created.Revision})
+			switch tc {
+			case "depth-257":
+				_, err := f.db.Exec(`WITH RECURSIVE ids(i,id,parent_id) AS (
+					SELECT 1,CAST(printf('%015x',1)||'d' AS BLOB),?
+					UNION ALL
+					SELECT i+1,CAST(printf('%015x',i+1)||'d' AS BLOB),id FROM ids WHERE i<257
+				)
+				INSERT INTO sync_objects(user_id,object_id,object_type,revision,parent_id,parent_key,name,name_key,blob_hash,deleted,created_at_ms,updated_at_ms)
+				SELECT ?,id,'folder',1,parent_id,parent_id,printf('Depth %d',i),printf('depth-%d',i),NULL,0,1,1 FROM ids`, root[:], f.users[0][:])
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "objects-10001":
+				_, err := f.db.Exec(`WITH RECURSIVE ids(i,id) AS (
+					SELECT 1,CAST('c'||printf('%015x',1) AS BLOB)
+					UNION ALL
+					SELECT i+1,CAST('c'||printf('%015x',i+1) AS BLOB) FROM ids WHERE i<10000
+				)
+				INSERT INTO sync_objects(user_id,object_id,object_type,revision,parent_id,parent_key,name,name_key,blob_hash,deleted,created_at_ms,updated_at_ms)
+				SELECT ?,id,'folder',1,?,?,printf('Child %d',i),printf('child-%d',i),NULL,0,1,1 FROM ids`, f.users[0][:], root[:], root[:])
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := PreserveDeleteFolderRequest{OperationID: mustNewID(), ConflictOperationID: conflictID, FolderID: root, ExpectedRevision: moved.Revision, Version: 4, KnownCursor: moved.Cursor}
+			if _, err := a.PreserveAndDeleteEmptyFolder(ctx, request); !errors.Is(err, ErrPreserveDeleteUnavailable) {
+				t.Fatalf("accepted %s: %v", tc, err)
+			}
+			var resolutions int
+			if err := f.db.QueryRow(`SELECT COUNT(*) FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, f.users[0][:], request.OperationID[:]).Scan(&resolutions); err != nil || resolutions != 0 {
+				t.Fatalf("resolution count=%d err=%v", resolutions, err)
+			}
+		})
 	}
 }
 

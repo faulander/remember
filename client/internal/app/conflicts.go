@@ -49,7 +49,7 @@ func preserveDeleteNotes(in []remotehttp.PreserveDeleteNoteMove) []clientsync.Fo
 func preserveDeleteClones(in []remotehttp.PreserveDeleteFolderClone) []clientsync.FolderPreserveDeleteClone {
 	out := make([]clientsync.FolderPreserveDeleteClone, len(in))
 	for i, c := range in {
-		out[i] = clientsync.FolderPreserveDeleteClone{OriginalFolderID: c.OriginalFolderID, RecoveredFolderID: c.RecoveredFolderID, CreateCursor: c.CreateCursor, DeleteCursor: c.DeleteCursor, SourceRevision: c.SourceRevision, Name: c.Name}
+		out[i] = clientsync.FolderPreserveDeleteClone{OriginalFolderID: c.OriginalFolderID, RecoveredFolderID: c.RecoveredFolderID, SourceParentID: c.SourceParentID, TargetParentID: c.TargetParentID, CreateCursor: c.CreateCursor, DeleteCursor: c.DeleteCursor, SourceRevision: c.SourceRevision, Depth: c.Depth, Name: c.Name}
 	}
 	return out
 }
@@ -119,12 +119,12 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 				if resolution.State == "prepared" {
 					result, err := remote.PreserveAndDeleteEmptyFolder(ctx, resolution.ResolutionOperationID, m.OperationID, m.ObjectID, conflict.Canonical.Revision, resolution.KnownCursor, resolution.RequestVersion)
 					var rejected *remotehttp.RejectedError
-					if err != nil && resolution.RequestVersion == 2 && errors.As(err, &rejected) && rejected.Code == "preserve_delete_unavailable" {
+					if err != nil && (resolution.RequestVersion == 2 || resolution.RequestVersion == 3) && errors.As(err, &rejected) && rejected.Status == 409 && rejected.Code == "preserve_delete_unavailable" {
 						nextID, idErr := uuid.NewV7()
 						if idErr != nil {
 							return idErr
 						}
-						resolution, err = store.PromotePreparedFolderPreserveDeleteV3(ctx, m.OperationID, nextID, resolution.KnownCursor)
+						resolution, err = store.PromotePreparedFolderPreserveDeleteV4(ctx, m.OperationID, nextID, resolution.KnownCursor)
 						if err != nil {
 							return err
 						}
@@ -132,7 +132,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 					}
 					if err != nil {
 						rejected = nil
-						if errors.As(err, &rejected) && rejected.Code == "preserve_delete_unavailable" {
+						if errors.As(err, &rejected) && rejected.Status == 409 && rejected.Code == "preserve_delete_unavailable" {
 							continue
 						}
 						return err
@@ -337,6 +337,7 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 		objects[object.ID] = object
 	}
 	var members []clientsync.ConflictFolderCreateNoteMember
+	var recursive *clientsync.ConflictRecursiveLocalFolderManifest
 	if recovery == nil {
 		object, ok := objects[m.ObjectID]
 		if !ok || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.FolderDevice == 0 || object.FolderInode == 0 {
@@ -349,58 +350,75 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 		if attempted != object.RelativePath {
 			return errors.New("moved deleted folder path mismatch")
 		}
-		candidates, err := store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+		recursive, err = store.DiscoverRecursiveLocalFolderManifest(ctx, m.OperationID, m.ObjectID)
 		if err != nil {
 			return err
 		}
-		byID := make(map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember, len(candidates))
-		for _, candidate := range candidates {
-			byID[candidate.NoteID] = candidate
-		}
-		prefix := attempted + "/"
-		for _, child := range snapshot.Objects {
-			if child.ID == object.ID || !strings.HasPrefix(child.RelativePath, prefix) {
-				continue
-			}
-			if child.Type != localindex.ObjectNote || path.Dir(child.RelativePath) != attempted {
-				return errors.New("folder move/delete recovery supports direct notes only")
-			}
-			candidate, ok := byID[child.ID]
-			if !ok || candidate.Name != path.Base(child.RelativePath) || !bytes.Equal(child.ContentHash, candidate.BlobHash[:]) {
-				return errors.New("folder move/delete direct note intent mismatch")
-			}
-			content, readErr := repository.ReadRooted(c.root, child.RelativePath, clientsync.MaxBlobBytes)
-			if readErr != nil || sha256.Sum256(content) != candidate.BlobHash {
-				return errors.New("folder move/delete direct note bytes mismatch")
-			}
-			inspection, inspectErr := frontmatter.Inspect(content)
-			if inspectErr != nil || inspection.NoteID != child.ID {
-				return errors.New("folder move/delete direct note identity mismatch")
-			}
-			members = append(members, candidate)
-			delete(byID, child.ID)
-		}
-		if len(byID) != 0 {
-			return errors.New("folder move/delete note manifest incomplete")
-		}
-		if len(members) == 0 {
-			if err := repository.VerifyRootedEmptyFolderIdentity(c.root, attempted, object.FolderDevice, object.FolderInode); err != nil {
+		if recursive != nil {
+			if err := prepareRecursiveLocalFolderManifest(c.root, attempted, object.ID, objects, recursive); err != nil {
 				return err
 			}
-		} else if err := verifyDirectNoteFolder(c.root, attempted, object.FolderDevice, object.FolderInode, members); err != nil {
-			return err
+		} else {
+			candidates, err := store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+			if err != nil {
+				return err
+			}
+			byID := make(map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember, len(candidates))
+			for _, candidate := range candidates {
+				byID[candidate.NoteID] = candidate
+			}
+			prefix := attempted + "/"
+			for _, child := range snapshot.Objects {
+				if child.ID == object.ID || !strings.HasPrefix(child.RelativePath, prefix) {
+					continue
+				}
+				if child.Type != localindex.ObjectNote || path.Dir(child.RelativePath) != attempted {
+					return errors.New("folder move/delete recovery supports direct notes only")
+				}
+				candidate, ok := byID[child.ID]
+				if !ok || candidate.Name != path.Base(child.RelativePath) || !bytes.Equal(child.ContentHash, candidate.BlobHash[:]) {
+					return errors.New("folder move/delete direct note intent mismatch")
+				}
+				content, readErr := repository.ReadRooted(c.root, child.RelativePath, clientsync.MaxBlobBytes)
+				if readErr != nil || sha256.Sum256(content) != candidate.BlobHash {
+					return errors.New("folder move/delete direct note bytes mismatch")
+				}
+				inspection, inspectErr := frontmatter.Inspect(content)
+				if inspectErr != nil || inspection.NoteID != child.ID {
+					return errors.New("folder move/delete direct note identity mismatch")
+				}
+				members = append(members, candidate)
+				delete(byID, child.ID)
+			}
+			if len(byID) != 0 {
+				return errors.New("folder move/delete note manifest incomplete")
+			}
+			if len(members) == 0 {
+				if err := repository.VerifyRootedEmptyFolderIdentity(c.root, attempted, object.FolderDevice, object.FolderInode); err != nil {
+					return err
+				}
+			} else if err := verifyDirectNoteFolder(c.root, attempted, object.FolderDevice, object.FolderInode, members); err != nil {
+				return err
+			}
 		}
 		recoveredID, err := uuid.NewV7()
 		if err != nil {
 			return err
 		}
-		newOperationID, err := uuid.NewV7()
-		if err != nil {
-			return err
+		var newOperationID uuid.UUID
+		if recursive != nil {
+			newOperationID = recursive.NewRootOperationID
+		} else {
+			newOperationID, err = uuid.NewV7()
+			if err != nil {
+				return err
+			}
 		}
 		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName(path.Base(attempted), m.OperationID)
 		recovery = &clientsync.ConflictFolderMoveDeleteRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperationID, AttemptedRelative: attempted, TargetRelative: target, Device: object.FolderDevice, Inode: object.FolderInode, CanonicalRevision: canonical.Revision, State: "prepared"}
-		if len(members) == 0 {
+		if recursive != nil {
+			err = store.PutConflictFolderMoveDeleteRecoveryWithRecursiveManifest(ctx, *recovery, *recursive)
+		} else if len(members) == 0 {
 			err = store.PutConflictFolderMoveDeleteRecovery(ctx, *recovery)
 		} else {
 			err = store.PutConflictFolderMoveDeleteRecoveryWithNotes(ctx, *recovery, members)
@@ -413,6 +431,10 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 		if err != nil {
 			return err
 		}
+		recursive, err = store.ConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderMoveDeleteRecovery, m.OperationID)
+		if err != nil {
+			return err
+		}
 	}
 	parent, ok := objects[clientsync.ConflictRecoveredID]
 	if !ok || parent.Type != localindex.ObjectFolder || parent.IdentityState != localindex.IdentityKnown || parent.FolderDevice == 0 || parent.FolderInode == 0 {
@@ -422,12 +444,20 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 		if err := repository.VerifyRootedFolderIdentity(c.root, parent.RelativePath, parent.FolderDevice, parent.FolderInode); err != nil {
 			return err
 		}
+		if recursive != nil {
+			return verifyRecursiveLocalFolder(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode, recursive)
+		}
 		if len(members) == 0 {
 			return repository.VerifyRootedEmptyFolderIdentity(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode)
 		}
 		return verifyDirectNoteFolder(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode, members)
 	}
 	if recovery.State == "prepared" {
+		if recursive != nil {
+			if err := store.ValidateConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderMoveDeleteRecovery, m.OperationID); err != nil {
+				return err
+			}
+		}
 		if targetErr := verify(); targetErr != nil {
 			if identityErr := repository.VerifyRootedFolderIdentity(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode); identityErr == nil {
 				if restoreErr := repository.MoveRootedFolderExpected(c.root, recovery.TargetRelative, recovery.AttemptedRelative, recovery.Device, recovery.Inode); restoreErr != nil {
@@ -436,7 +466,9 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 				return targetErr
 			}
 			var sourceErr error
-			if len(members) == 0 {
+			if recursive != nil {
+				sourceErr = verifyRecursiveLocalFolder(c.root, recovery.AttemptedRelative, recovery.Device, recovery.Inode, recursive)
+			} else if len(members) == 0 {
 				sourceErr = repository.VerifyRootedEmptyFolderIdentity(c.root, recovery.AttemptedRelative, recovery.Device, recovery.Inode)
 			} else {
 				sourceErr = verifyDirectNoteFolder(c.root, recovery.AttemptedRelative, recovery.Device, recovery.Inode, members)
@@ -445,10 +477,10 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 				return sourceErr
 			}
 			var moveErr error
-			if len(members) == 0 {
-				moveErr = repository.MoveRootedEmptyFolderExpected(c.root, recovery.AttemptedRelative, recovery.TargetRelative, recovery.Device, recovery.Inode)
-			} else {
+			if recursive != nil || len(members) != 0 {
 				moveErr = repository.MoveRootedFolderExpected(c.root, recovery.AttemptedRelative, recovery.TargetRelative, recovery.Device, recovery.Inode)
+			} else {
+				moveErr = repository.MoveRootedEmptyFolderExpected(c.root, recovery.AttemptedRelative, recovery.TargetRelative, recovery.Device, recovery.Inode)
 			}
 			if moveErr != nil {
 				return moveErr
@@ -457,26 +489,37 @@ func (c *LocalCore) recoverEmptyFolderMoveAgainstDelete(ctx context.Context, sto
 		if testHookAfterConflictFolderMoveDeleteMove != nil {
 			testHookAfterConflictFolderMoveDeleteMove()
 		}
-		indexed, alreadyIndexed := objects[recovery.RecoveredFolderID]
-		_, oldExists := objects[recovery.FolderID]
-		alreadyIndexed = alreadyIndexed && indexed.Type == localindex.ObjectFolder && indexed.RelativePath == recovery.TargetRelative && !oldExists
-		if alreadyIndexed {
-			for _, member := range members {
-				note, exists := objects[member.NoteID]
-				if !exists || note.Type != localindex.ObjectNote || note.ParentID != recovery.RecoveredFolderID || note.RelativePath != path.Join(recovery.TargetRelative, member.Name) || !bytes.Equal(note.ContentHash, member.BlobHash[:]) {
-					alreadyIndexed = false
-					break
+		alreadyIndexed := false
+		appliedNotes := map[uuid.UUID][32]byte{}
+		appliedPaths := map[uuid.UUID]string{}
+		appliedFolders := map[uuid.UUID]bool{}
+		appliedFolderPaths := map[uuid.UUID]string{}
+		trustedFolders := map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}
+		if recursive != nil {
+			data := recursiveLocalRecoveryData(recursive, recovery.TargetRelative, recovery.RecoveredFolderID)
+			alreadyIndexed = recursiveLocalAlreadyIndexed(objects, recursive, recovery.TargetRelative, recovery.FolderID, recovery.RecoveredFolderID)
+			appliedNotes, appliedPaths = data.notes, data.notePaths
+			appliedFolders, appliedFolderPaths, trustedFolders = data.folders, data.folderPaths, data.trusted
+		} else {
+			indexed, indexedExists := objects[recovery.RecoveredFolderID]
+			_, oldExists := objects[recovery.FolderID]
+			alreadyIndexed = indexedExists && indexed.Type == localindex.ObjectFolder && indexed.RelativePath == recovery.TargetRelative && !oldExists
+			if alreadyIndexed {
+				for _, member := range members {
+					note, exists := objects[member.NoteID]
+					if !exists || note.Type != localindex.ObjectNote || note.ParentID != recovery.RecoveredFolderID || note.RelativePath != path.Join(recovery.TargetRelative, member.Name) || !bytes.Equal(note.ContentHash, member.BlobHash[:]) {
+						alreadyIndexed = false
+						break
+					}
 				}
 			}
 		}
-		appliedNotes := map[uuid.UUID][32]byte{}
-		appliedPaths := map[uuid.UUID]string{}
 		for _, member := range members {
 			appliedNotes[member.NoteID] = member.BlobHash
 			appliedPaths[member.NoteID] = path.Join(recovery.TargetRelative, member.Name)
 		}
 		if !alreadyIndexed {
-			if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteNotes: appliedNotes, AppliedRemoteNotePaths: appliedPaths, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+			if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteNotes: appliedNotes, AppliedRemoteNotePaths: appliedPaths, AppliedRemoteFolders: appliedFolders, AppliedRemoteFolderPaths: appliedFolderPaths, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: trustedFolders, VerifyTrustedRemoteFolders: verify}); err != nil {
 				return err
 			}
 		}
@@ -542,6 +585,7 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		paths[portablePathKey(object.RelativePath)] = true
 	}
 	var members []clientsync.ConflictFolderCreateNoteMember
+	var recursive *clientsync.ConflictRecursiveLocalFolderManifest
 	if recovery == nil {
 		eligible, err := store.DivergentFolderMoveRecoveryEligible(ctx, m.OperationID)
 		if err != nil {
@@ -560,38 +604,53 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(canonical.Name))); err == nil || !os.IsNotExist(err) {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
-		members, err = store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+		recursive, err = store.DiscoverRecursiveLocalFolderManifest(ctx, m.OperationID, m.ObjectID)
 		if err != nil {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
-		byID := map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember{}
-		for _, member := range members {
-			byID[member.NoteID] = member
-		}
-		prefix := object.RelativePath + "/"
-		for _, desc := range snapshot.Objects {
-			if desc.ID == object.ID || !strings.HasPrefix(desc.RelativePath, prefix) {
-				continue
-			}
-			member, ok := byID[desc.ID]
-			if !ok || desc.Type != localindex.ObjectNote || path.Dir(desc.RelativePath) != object.RelativePath || member.Name != path.Base(desc.RelativePath) || !bytes.Equal(desc.ContentHash, member.BlobHash[:]) {
+		if recursive != nil {
+			if err := prepareRecursiveLocalFolderManifest(c.root, object.RelativePath, object.ID, objects, recursive); err != nil {
 				return clientsync.ErrDivergentFolderMoveIneligible
 			}
-			delete(byID, desc.ID)
-		}
-		if len(byID) != 0 {
-			return clientsync.ErrDivergentFolderMoveIneligible
-		}
-		if err := verifyDivergentDirectNoteSubtree(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, members); err != nil {
-			return clientsync.ErrDivergentFolderMoveIneligible
+		} else {
+			members, err = store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+			if err != nil {
+				return clientsync.ErrDivergentFolderMoveIneligible
+			}
+			byID := map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember{}
+			for _, member := range members {
+				byID[member.NoteID] = member
+			}
+			prefix := object.RelativePath + "/"
+			for _, desc := range snapshot.Objects {
+				if desc.ID == object.ID || !strings.HasPrefix(desc.RelativePath, prefix) {
+					continue
+				}
+				member, ok := byID[desc.ID]
+				if !ok || desc.Type != localindex.ObjectNote || path.Dir(desc.RelativePath) != object.RelativePath || member.Name != path.Base(desc.RelativePath) || !bytes.Equal(desc.ContentHash, member.BlobHash[:]) {
+					return clientsync.ErrDivergentFolderMoveIneligible
+				}
+				delete(byID, desc.ID)
+			}
+			if len(byID) != 0 {
+				return clientsync.ErrDivergentFolderMoveIneligible
+			}
+			if err := verifyDivergentDirectNoteSubtree(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, members); err != nil {
+				return clientsync.ErrDivergentFolderMoveIneligible
+			}
 		}
 		recoveredID, err := uuid.NewV7()
 		if err != nil {
 			return err
 		}
-		newOperation, err := uuid.NewV7()
-		if err != nil {
-			return err
+		var newOperation uuid.UUID
+		if recursive != nil {
+			newOperation = recursive.NewRootOperationID
+		} else {
+			newOperation, err = uuid.NewV7()
+			if err != nil {
+				return err
+			}
 		}
 		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName(path.Base(object.RelativePath), m.OperationID)
 		if paths[portablePathKey(target)] {
@@ -605,7 +664,9 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			return err
 		}
 		recovery = &clientsync.ConflictFolderDivergentMoveRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperation, AttemptedRelative: object.RelativePath, CanonicalRelative: canonical.Name, RecoveryRelative: target, SourceDevice: object.FolderDevice, SourceInode: object.FolderInode, CanonicalRevision: canonical.Revision, CanonicalNonce: nonce, State: "prepared"}
-		if len(members) == 0 {
+		if recursive != nil {
+			err = store.PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx, *recovery, *recursive)
+		} else if len(members) == 0 {
 			err = store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery)
 		} else {
 			err = store.PutConflictFolderDivergentMoveRecoveryWithNotes(ctx, *recovery, members)
@@ -618,8 +679,15 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		if err != nil {
 			return err
 		}
+		recursive, err = store.ConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderDivergentMoveRecovery, m.OperationID)
+		if err != nil {
+			return err
+		}
 	}
 	verifyRecovery := func() error {
+		if recursive != nil {
+			return verifyRecursiveLocalFolder(c.root, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, recursive)
+		}
 		return verifyDivergentDirectNoteSubtree(c.root, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, members)
 	}
 	noteOptions := func(base string) (map[uuid.UUID][32]byte, map[uuid.UUID]string) {
@@ -633,19 +701,47 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 	}
 	recoveryNotes, recoveryPaths := noteOptions(recovery.RecoveryRelative)
 	attemptedNotes, attemptedPaths := noteOptions(recovery.AttemptedRelative)
+	recoveryFolders := map[uuid.UUID]bool{recovery.RecoveredFolderID: true}
+	recoveryFolderPaths := map[uuid.UUID]string{recovery.RecoveredFolderID: recovery.RecoveryRelative}
+	recoveryTrusted := map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID}
+	attemptedFolders := map[uuid.UUID]bool{recovery.FolderID: true}
+	attemptedFolderPaths := map[uuid.UUID]string{recovery.FolderID: recovery.AttemptedRelative}
+	attemptedTrusted := map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}
+	if recursive != nil {
+		recoveryData := recursiveLocalRecoveryData(recursive, recovery.RecoveryRelative, recovery.RecoveredFolderID)
+		recoveryNotes, recoveryPaths = recoveryData.notes, recoveryData.notePaths
+		recoveryFolders, recoveryFolderPaths, recoveryTrusted = recoveryData.folders, recoveryData.folderPaths, recoveryData.trusted
+		attemptedData := recursiveLocalRecoveryData(recursive, recovery.AttemptedRelative, recovery.FolderID)
+		attemptedNotes, attemptedPaths = attemptedData.notes, attemptedData.notePaths
+		attemptedFolders, attemptedFolderPaths, attemptedTrusted = attemptedData.folders, attemptedData.folderPaths, attemptedData.trusted
+	}
 	restorePrepared := func(cause error) error {
 		restoreErr := repository.MoveRootedFolderExpected(c.root, recovery.RecoveryRelative, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode)
 		if restoreErr == nil {
-			_, restoreErr = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: attemptedNotes, AppliedRemoteNotePaths: attemptedPaths, AppliedRemoteFolders: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteFolderPaths: map[uuid.UUID]string{recovery.FolderID: recovery.AttemptedRelative}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: func() error {
+			_, restoreErr = reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: attemptedNotes, AppliedRemoteNotePaths: attemptedPaths, AppliedRemoteFolders: attemptedFolders, AppliedRemoteFolderPaths: attemptedFolderPaths, TrustedRemoteFolders: attemptedTrusted, VerifyTrustedRemoteFolders: func() error {
+				if recursive != nil {
+					return verifyRecursiveLocalFolder(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, recursive)
+				}
 				return verifyDivergentDirectNoteSubtree(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, members)
 			}})
 		}
 		return errors.Join(cause, restoreErr)
 	}
 	if recovery.State == "prepared" {
-		if err := verifyRecovery(); err != nil {
-			if err := verifyDivergentDirectNoteSubtree(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, members); err != nil {
+		if recursive != nil {
+			if err := store.ValidateConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderDivergentMoveRecovery, m.OperationID); err != nil {
 				return err
+			}
+		}
+		if err := verifyRecovery(); err != nil {
+			var sourceErr error
+			if recursive != nil {
+				sourceErr = verifyRecursiveLocalFolder(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, recursive)
+			} else {
+				sourceErr = verifyDivergentDirectNoteSubtree(c.root, recovery.AttemptedRelative, recovery.SourceDevice, recovery.SourceInode, members)
+			}
+			if sourceErr != nil {
+				return sourceErr
 			}
 			if err := repository.MoveRootedFolderExpected(c.root, recovery.AttemptedRelative, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode); err != nil {
 				return err
@@ -657,7 +753,7 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			}
 		}
 		verify := func() error { return verifyRecovery() }
-		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteNotes: recoveryNotes, AppliedRemoteNotePaths: recoveryPaths, AppliedRemoteFolders: map[uuid.UUID]bool{recovery.RecoveredFolderID: true}, AppliedRemoteFolderPaths: map[uuid.UUID]string{recovery.RecoveredFolderID: recovery.RecoveryRelative}, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.FolderID: true}, AppliedRemoteNotes: recoveryNotes, AppliedRemoteNotePaths: recoveryPaths, AppliedRemoteFolders: recoveryFolders, AppliedRemoteFolderPaths: recoveryFolderPaths, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.AttemptedRelative: recovery.FolderID}, TrustedRemoteFolders: recoveryTrusted, VerifyTrustedRemoteFolders: verify}); err != nil {
 			return restorePrepared(err)
 		}
 		if testHookAfterDivergentFolderEvacuationReconcile != nil {
@@ -735,7 +831,22 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			}
 			return repository.VerifyRootedSubtreeExpected(c.root, recovery.CanonicalRelative, recovery.CanonicalDevice, recovery.CanonicalInode, nil, clientsync.MaxBlobBytes)
 		}
-		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: recoveryNotes, AppliedRemoteNotePaths: recoveryPaths, AppliedRemoteFolders: map[uuid.UUID]bool{recovery.FolderID: true, recovery.RecoveredFolderID: true}, AppliedRemoteFolderPaths: map[uuid.UUID]string{recovery.FolderID: recovery.CanonicalRelative, recovery.RecoveredFolderID: recovery.RecoveryRelative}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.RecoveryRelative: recovery.RecoveredFolderID, recovery.CanonicalRelative: recovery.FolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+		finalFolders := make(map[uuid.UUID]bool, len(recoveryFolders)+1)
+		finalFolderPaths := make(map[uuid.UUID]string, len(recoveryFolderPaths)+1)
+		finalTrusted := make(map[string]uuid.UUID, len(recoveryTrusted)+1)
+		for id, present := range recoveryFolders {
+			finalFolders[id] = present
+		}
+		for id, relative := range recoveryFolderPaths {
+			finalFolderPaths[id] = relative
+		}
+		for relative, id := range recoveryTrusted {
+			finalTrusted[relative] = id
+		}
+		finalFolders[recovery.FolderID] = true
+		finalFolderPaths[recovery.FolderID] = recovery.CanonicalRelative
+		finalTrusted[recovery.CanonicalRelative] = recovery.FolderID
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteNotes: recoveryNotes, AppliedRemoteNotePaths: recoveryPaths, AppliedRemoteFolders: finalFolders, AppliedRemoteFolderPaths: finalFolderPaths, TrustedRemoteFolders: finalTrusted, VerifyTrustedRemoteFolders: verify}); err != nil {
 			return err
 		}
 		if err := verifyRecovery(); err != nil {
@@ -779,44 +890,55 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 		objects[object.ID] = object
 	}
 	var members []clientsync.ConflictFolderCreateNoteMember
+	var recursive *clientsync.ConflictRecursiveLocalFolderManifest
 	if recovery == nil {
 		source, exists := objects[m.ObjectID]
 		if !exists || source.Type != localindex.ObjectFolder || source.IdentityState != localindex.IdentityKnown || source.FolderDevice == 0 || source.FolderInode == 0 {
 			return errors.New("folder create collision source identity unavailable")
 		}
-		candidates, err := store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+		recursive, err = store.DiscoverRecursiveLocalFolderManifest(ctx, m.OperationID, m.ObjectID)
 		if err != nil {
 			return err
 		}
-		byID := make(map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember, len(candidates))
-		for _, candidate := range candidates {
-			byID[candidate.NoteID] = candidate
-		}
-		prefix := source.RelativePath + "/"
-		for _, object := range snapshot.Objects {
-			if object.ID == source.ID || !strings.HasPrefix(object.RelativePath, prefix) {
-				continue
+		if recursive != nil {
+			if err := prepareRecursiveLocalFolderManifest(c.root, source.RelativePath, source.ID, objects, recursive); err != nil {
+				return err
 			}
-			if object.Type != localindex.ObjectNote || path.Dir(object.RelativePath) != source.RelativePath {
-				return errors.New("folder create recovery supports direct notes only")
+		} else {
+			candidates, err := store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+			if err != nil {
+				return err
 			}
-			candidate, ok := byID[object.ID]
-			if !ok || candidate.Name != path.Base(object.RelativePath) || !bytes.Equal(object.ContentHash, candidate.BlobHash[:]) {
-				return errors.New("folder create direct note intent mismatch")
+			byID := make(map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember, len(candidates))
+			for _, candidate := range candidates {
+				byID[candidate.NoteID] = candidate
 			}
-			content, err := repository.ReadRooted(c.root, object.RelativePath, clientsync.MaxBlobBytes)
-			if err != nil || sha256.Sum256(content) != candidate.BlobHash {
-				return errors.New("folder create direct note bytes mismatch")
+			prefix := source.RelativePath + "/"
+			for _, object := range snapshot.Objects {
+				if object.ID == source.ID || !strings.HasPrefix(object.RelativePath, prefix) {
+					continue
+				}
+				if object.Type != localindex.ObjectNote || path.Dir(object.RelativePath) != source.RelativePath {
+					return errors.New("folder create recovery supports direct notes only")
+				}
+				candidate, ok := byID[object.ID]
+				if !ok || candidate.Name != path.Base(object.RelativePath) || !bytes.Equal(object.ContentHash, candidate.BlobHash[:]) {
+					return errors.New("folder create direct note intent mismatch")
+				}
+				content, err := repository.ReadRooted(c.root, object.RelativePath, clientsync.MaxBlobBytes)
+				if err != nil || sha256.Sum256(content) != candidate.BlobHash {
+					return errors.New("folder create direct note bytes mismatch")
+				}
+				inspection, err := frontmatter.Inspect(content)
+				if err != nil || inspection.NoteID != object.ID {
+					return errors.New("folder create direct note identity mismatch")
+				}
+				members = append(members, candidate)
+				delete(byID, object.ID)
 			}
-			inspection, err := frontmatter.Inspect(content)
-			if err != nil || inspection.NoteID != object.ID {
-				return errors.New("folder create direct note identity mismatch")
+			if len(byID) != 0 {
+				return errors.New("folder create direct note manifest incomplete")
 			}
-			members = append(members, candidate)
-			delete(byID, object.ID)
-		}
-		if len(byID) != 0 {
-			return errors.New("folder create direct note manifest incomplete")
 		}
 		recoveredID, err := uuid.NewV7()
 		if err != nil {
@@ -824,7 +946,11 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 		}
 		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName(path.Base(source.RelativePath), m.OperationID)
 		recovery = &clientsync.ConflictFolderCreateRecovery{OperationID: m.OperationID, SourceFolderID: m.ObjectID, RecoveredFolderID: recoveredID, SourceRelative: source.RelativePath, TargetRelative: target, Device: source.FolderDevice, Inode: source.FolderInode, State: "prepared"}
-		if len(members) == 0 {
+		if recursive != nil {
+			if err := store.PutConflictFolderCreateRecoveryWithRecursiveManifest(ctx, *recovery, *recursive); err != nil {
+				return err
+			}
+		} else if len(members) == 0 {
 			if err := repository.VerifyRootedEmptyFolderIdentity(c.root, source.RelativePath, source.FolderDevice, source.FolderInode); err != nil {
 				return err
 			}
@@ -844,6 +970,10 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 		if err != nil {
 			return err
 		}
+		recursive, err = store.ConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderCreateRecovery, m.OperationID)
+		if err != nil {
+			return err
+		}
 	}
 	recoveredParent, ok := objects[clientsync.ConflictRecoveredID]
 	if !ok || recoveredParent.Type != localindex.ObjectFolder || recoveredParent.IdentityState != localindex.IdentityKnown || recoveredParent.FolderDevice == 0 || recoveredParent.FolderInode == 0 {
@@ -853,12 +983,20 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 		if err := repository.VerifyRootedFolderIdentity(c.root, recoveredParent.RelativePath, recoveredParent.FolderDevice, recoveredParent.FolderInode); err != nil {
 			return err
 		}
+		if recursive != nil {
+			return verifyRecursiveLocalFolder(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode, recursive)
+		}
 		if len(members) == 0 {
 			return repository.VerifyRootedEmptyFolderIdentity(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode)
 		}
 		return verifyDirectNoteFolder(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode, members)
 	}
 	if recovery.State == "prepared" {
+		if recursive != nil {
+			if err := store.ValidateConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderCreateRecovery, m.OperationID); err != nil {
+				return err
+			}
+		}
 		if targetErr := verify(); targetErr != nil {
 			if identityErr := repository.VerifyRootedFolderIdentity(c.root, recovery.TargetRelative, recovery.Device, recovery.Inode); identityErr == nil {
 				if restoreErr := repository.MoveRootedFolderExpected(c.root, recovery.TargetRelative, recovery.SourceRelative, recovery.Device, recovery.Inode); restoreErr != nil {
@@ -867,7 +1005,9 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 				return targetErr
 			}
 			var sourceErr error
-			if len(members) == 0 {
+			if recursive != nil {
+				sourceErr = verifyRecursiveLocalFolder(c.root, recovery.SourceRelative, recovery.Device, recovery.Inode, recursive)
+			} else if len(members) == 0 {
 				sourceErr = repository.VerifyRootedEmptyFolderIdentity(c.root, recovery.SourceRelative, recovery.Device, recovery.Inode)
 			} else {
 				sourceErr = verifyDirectNoteFolder(c.root, recovery.SourceRelative, recovery.Device, recovery.Inode, members)
@@ -876,10 +1016,10 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 				return sourceErr
 			}
 			var moveErr error
-			if len(members) == 0 {
-				moveErr = repository.MoveRootedEmptyFolderExpected(c.root, recovery.SourceRelative, recovery.TargetRelative, recovery.Device, recovery.Inode)
-			} else {
+			if recursive != nil || len(members) != 0 {
 				moveErr = repository.MoveRootedFolderExpected(c.root, recovery.SourceRelative, recovery.TargetRelative, recovery.Device, recovery.Inode)
+			} else {
+				moveErr = repository.MoveRootedEmptyFolderExpected(c.root, recovery.SourceRelative, recovery.TargetRelative, recovery.Device, recovery.Inode)
 			}
 			if moveErr != nil {
 				return moveErr
@@ -889,7 +1029,17 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 			testHookAfterConflictFolderCreateMove()
 		}
 		alreadyIndexed := false
-		if indexed, ok := objects[recovery.RecoveredFolderID]; ok && indexed.Type == localindex.ObjectFolder && indexed.RelativePath == recovery.TargetRelative {
+		appliedNotes := map[uuid.UUID][32]byte{}
+		appliedPaths := map[uuid.UUID]string{}
+		appliedFolders := map[uuid.UUID]bool{}
+		appliedFolderPaths := map[uuid.UUID]string{}
+		trustedFolders := map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}
+		if recursive != nil {
+			data := recursiveLocalRecoveryData(recursive, recovery.TargetRelative, recovery.RecoveredFolderID)
+			alreadyIndexed = recursiveLocalAlreadyIndexed(objects, recursive, recovery.TargetRelative, recovery.SourceFolderID, recovery.RecoveredFolderID)
+			appliedNotes, appliedPaths = data.notes, data.notePaths
+			appliedFolders, appliedFolderPaths, trustedFolders = data.folders, data.folderPaths, data.trusted
+		} else if indexed, ok := objects[recovery.RecoveredFolderID]; ok && indexed.Type == localindex.ObjectFolder && indexed.RelativePath == recovery.TargetRelative {
 			_, oldExists := objects[recovery.SourceFolderID]
 			alreadyIndexed = !oldExists
 			for _, member := range members {
@@ -900,14 +1050,12 @@ func (c *LocalCore) recoverEmptyFolderCreateCollision(ctx context.Context, store
 				}
 			}
 		}
-		appliedNotes := map[uuid.UUID][32]byte{}
-		appliedPaths := map[uuid.UUID]string{}
 		for _, member := range members {
 			appliedNotes[member.NoteID] = member.BlobHash
 			appliedPaths[member.NoteID] = path.Join(recovery.TargetRelative, member.Name)
 		}
 		if !alreadyIndexed {
-			if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.SourceFolderID: true}, AppliedRemoteNotes: appliedNotes, AppliedRemoteNotePaths: appliedPaths, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.SourceRelative: recovery.SourceFolderID}, TrustedRemoteFolders: map[string]uuid.UUID{recovery.TargetRelative: recovery.RecoveredFolderID}, VerifyTrustedRemoteFolders: verify}); err != nil {
+			if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode, AppliedRemoteDeletes: map[uuid.UUID]bool{recovery.SourceFolderID: true}, AppliedRemoteNotes: appliedNotes, AppliedRemoteNotePaths: appliedPaths, AppliedRemoteFolders: appliedFolders, AppliedRemoteFolderPaths: appliedFolderPaths, TrustedRemoteFolderDeletes: map[string]uuid.UUID{recovery.SourceRelative: recovery.SourceFolderID}, TrustedRemoteFolders: trustedFolders, VerifyTrustedRemoteFolders: verify}); err != nil {
 				return err
 			}
 		}

@@ -232,7 +232,7 @@ func TestV1UpgradePreservesSnapshotAndMarksBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap=%q err=%v", bootstrap, err)
 	}
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 36 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
@@ -245,13 +245,16 @@ func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DROP VIEW sync_inbox_valid_parent_bindings; DROP TRIGGER sync_inbox_parent_binding_insert_guard; DROP TRIGGER sync_inbox_parent_binding_no_update; DROP TRIGGER sync_inbox_parent_binding_no_delete; DROP TABLE sync_inbox_parent_bindings; DROP VIEW sync_independent_inbox_candidates`); err != nil {
+		if _, err := tx.Exec(`DROP VIEW sync_inbox_valid_nested_bindings; DROP VIEW sync_inbox_valid_parent_bindings; DROP VIEW sync_independent_inbox_candidates; DROP VIEW sync_inbox_note_ancestry; DROP TRIGGER sync_inbox_parent_binding_insert_guard; DROP TRIGGER sync_inbox_parent_binding_no_update; DROP TRIGGER sync_inbox_parent_binding_no_delete; DROP TABLE sync_inbox_parent_bindings`); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT INTO sync_state(key,value) VALUES('confirmed_cursor','42') ON CONFLICT(key) DO UPDATE SET value='42'`); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DROP TRIGGER sync_folder_preserve_delete_note_insert_guard; DROP TRIGGER sync_folder_preserve_delete_note_no_update; DROP TRIGGER sync_folder_preserve_delete_note_no_delete; DROP TABLE sync_folder_preserve_delete_note_moves; DROP TRIGGER sync_folder_preserve_delete_clone_insert_guard; DROP TRIGGER sync_folder_preserve_delete_clone_no_update; DROP TRIGGER sync_folder_preserve_delete_clone_no_delete; DROP TABLE sync_folder_preserve_delete_clones; DROP TRIGGER sync_folder_preserve_delete_resolution_insert_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_immutable; DROP TRIGGER sync_folder_preserve_delete_resolution_seal_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_no_delete; DROP TABLE sync_folder_preserve_delete_resolutions; DROP TRIGGER conflict_folder_divergent_move_note_members_no_update; DROP TRIGGER conflict_folder_divergent_move_note_members_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_update; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_members_guard; DROP TRIGGER conflict_folder_divergent_move_note_chains_guard; DROP TABLE conflict_folder_divergent_move_note_chains; DROP TABLE conflict_folder_divergent_move_note_members; DROP TRIGGER conflict_folder_divergent_move_insert_guard; DROP TRIGGER conflict_folder_divergent_move_identity_immutable; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_move_no_delete; DROP TABLE conflict_folder_divergent_move_recoveries; DROP TRIGGER sync_integrity_incident_insert_guard; DROP TRIGGER sync_integrity_incident_binding_immutable; DROP TRIGGER sync_integrity_incident_progress_guard; DROP TRIGGER sync_integrity_incident_no_delete; DROP TRIGGER sync_integrity_incident_step_binding_immutable; DROP TRIGGER sync_integrity_incident_step_no_delete; DROP TABLE sync_integrity_incidents; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TRIGGER IF EXISTS conflict_folder_move_delete_recoveries_manifest_guard; DROP TRIGGER IF EXISTS conflict_folder_divergent_move_state_guard; DROP TRIGGER IF EXISTS sync_conflict_resolutions_recursive_local_folder_guard; DROP TABLE conflict_recursive_local_folder_note_chains; DROP TABLE conflict_recursive_local_folder_members; DROP TABLE conflict_recursive_local_folder_recoveries`); err != nil {
 			return err
 		}
 		return nil
@@ -282,10 +285,13 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DROP VIEW sync_inbox_valid_parent_bindings; DROP TRIGGER sync_inbox_parent_binding_insert_guard; DROP TRIGGER sync_inbox_parent_binding_no_update; DROP TRIGGER sync_inbox_parent_binding_no_delete; DROP TABLE sync_inbox_parent_bindings; DROP VIEW sync_independent_inbox_candidates`); err != nil {
+		if _, err := tx.Exec(`DROP VIEW sync_inbox_valid_nested_bindings; DROP VIEW sync_inbox_valid_parent_bindings; DROP VIEW sync_independent_inbox_candidates; DROP VIEW sync_inbox_note_ancestry; DROP TRIGGER sync_inbox_parent_binding_insert_guard; DROP TRIGGER sync_inbox_parent_binding_no_update; DROP TRIGGER sync_inbox_parent_binding_no_delete; DROP TABLE sync_inbox_parent_bindings`); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DROP TRIGGER sync_folder_preserve_delete_note_insert_guard; DROP TRIGGER sync_folder_preserve_delete_note_no_update; DROP TRIGGER sync_folder_preserve_delete_note_no_delete; DROP TABLE sync_folder_preserve_delete_note_moves; DROP TRIGGER sync_folder_preserve_delete_clone_insert_guard; DROP TRIGGER sync_folder_preserve_delete_clone_no_update; DROP TRIGGER sync_folder_preserve_delete_clone_no_delete; DROP TABLE sync_folder_preserve_delete_clones; DROP TRIGGER sync_folder_preserve_delete_resolution_insert_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_immutable; DROP TRIGGER sync_folder_preserve_delete_resolution_seal_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_no_delete; DROP TABLE sync_folder_preserve_delete_resolutions; DROP TRIGGER conflict_folder_divergent_move_note_members_no_update; DROP TRIGGER conflict_folder_divergent_move_note_members_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_update; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_members_guard; DROP TRIGGER conflict_folder_divergent_move_note_chains_guard; DROP TABLE conflict_folder_divergent_move_note_chains; DROP TABLE conflict_folder_divergent_move_note_members; DROP TRIGGER conflict_folder_divergent_move_insert_guard; DROP TRIGGER conflict_folder_divergent_move_identity_immutable; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_move_no_delete; DROP TABLE conflict_folder_divergent_move_recoveries; DROP TRIGGER sync_integrity_incident_insert_guard; DROP TRIGGER sync_integrity_incident_binding_immutable; DROP TRIGGER sync_integrity_incident_progress_guard; DROP TRIGGER sync_integrity_incident_no_delete; DROP TRIGGER sync_integrity_incident_step_binding_immutable; DROP TRIGGER sync_integrity_incident_step_no_delete; DROP TABLE sync_integrity_incidents; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; PRAGMA user_version=25`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TRIGGER IF EXISTS conflict_folder_move_delete_recoveries_manifest_guard; DROP TRIGGER IF EXISTS conflict_folder_divergent_move_state_guard; DROP TRIGGER IF EXISTS sync_conflict_resolutions_recursive_local_folder_guard; DROP TABLE conflict_recursive_local_folder_note_chains; DROP TABLE conflict_recursive_local_folder_members; DROP TABLE conflict_recursive_local_folder_recoveries`); err != nil {
 			return err
 		}
 		return nil
@@ -301,7 +307,7 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 	}
 	defer index.Close()
 	var version int
-	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != 36 {
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error { return tx.QueryRow(`PRAGMA user_version`).Scan(&version) }); err != nil || version != schemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
@@ -441,7 +447,7 @@ func TestV36MigrationBuildsNestedInboxEligibilityView(t *testing.T) {
 		if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 			return err
 		}
-		if version != 36 {
+		if version != schemaVersion {
 			t.Fatalf("version=%d", version)
 		}
 		rows, err := tx.Query(`SELECT cursor,parent_id FROM sync_independent_inbox_candidates ORDER BY cursor`)
@@ -468,6 +474,95 @@ func TestV36MigrationBuildsNestedInboxEligibilityView(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestV39MigrationPreservesDirectBindingAndRootEligibility(t *testing.T) {
+	db := openLocalSchemaVersion(t, filepath.Join(t.TempDir(), "v36.db"), 36)
+	defer db.Close()
+
+	parent, nested, root := uuid.New(), uuid.New(), uuid.New()
+	parentOperation, nestedOperation, rootOperation := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	plan := uuid.Must(uuid.NewV7())
+	hash := bytes.Repeat([]byte{9}, sha256.Size)
+	if _, err := db.Exec(`INSERT INTO objects(object_id,object_type,relative_path,collision_path,parent_id,folder_device,folder_inode,identity_state) VALUES(?,'folder','Folder','folder',NULL,11,22,'known')`, parent.String()); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		id        uuid.UUID
+		revision  int
+		operation any
+	}{
+		{parent, 3, parentOperation.String()},
+		{nested, 1, nil},
+		{root, 1, nil},
+	} {
+		if _, err := db.Exec(`INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,?,?)`, row.id.String(), row.revision, row.operation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO sync_inbox_changes(cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,deleted,state,ingested_at_ms) VALUES(1,?,?,'update','note',2,?,'Nested.md',?,0,'pending',1),(2,?,?,'update','note',2,NULL,'Root.md',?,0,'pending',1)`, nestedOperation.String(), nested.String(), parent.String(), hash, rootOperation.String(), root.String(), hash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,0,1,'prepared',1)`, plan.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_inbox_parent_bindings(plan_id,inbox_cursor,parent_id,parent_relative,device,inode,baseline_revision,baseline_operation_id) VALUES(?,1,?,'Folder',11,22,3,?)`, plan.String(), parent.String(), parentOperation.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,0,1,?,?,'update','note',2,?,'Nested.md',?,'pending')`, plan.String(), nestedOperation.String(), nested.String(), parent.String(), hash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_inbox_apply_plans(plan_id,cursor) VALUES(?,1)`, plan.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	script, err := migrations.ReadFile("migrations/039_recursive_note_inbox_ancestry.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(string(script)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA user_version=39`); err != nil {
+		t.Fatal(err)
+	}
+
+	var depth, cursor, revision int
+	var ancestorID, relative, operation string
+	var ancestorParent sql.NullString
+	var device, inode int64
+	if err = db.QueryRow(`SELECT inbox_cursor,depth,ancestor_id,ancestor_parent_id,ancestor_relative,device,inode,baseline_revision,baseline_operation_id FROM sync_inbox_parent_bindings WHERE plan_id=?`, plan.String()).Scan(&cursor, &depth, &ancestorID, &ancestorParent, &relative, &device, &inode, &revision, &operation); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 1 || depth != 1 || ancestorID != parent.String() || ancestorParent.Valid || relative != "Folder" || device != 11 || inode != 22 || revision != 3 || operation != parentOperation.String() {
+		t.Fatalf("migrated binding=%d/%d/%s/%v/%s/%d/%d/%d/%s", cursor, depth, ancestorID, ancestorParent, relative, device, inode, revision, operation)
+	}
+	var eligible []int
+	rows, err := db.Query(`SELECT cursor FROM sync_independent_inbox_candidates ORDER BY cursor`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var cursor int
+		if err := rows.Scan(&cursor); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		eligible = append(eligible, cursor)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(eligible, []int{1, 2}) {
+		t.Fatalf("eligible=%v", eligible)
+	}
+	if _, err := db.Exec(`UPDATE sync_inbox_parent_bindings SET ancestor_relative='Changed' WHERE plan_id=?`, plan.String()); err == nil {
+		t.Fatal("migrated direct binding became mutable")
 	}
 }
 
@@ -513,7 +608,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=37`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=40`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -546,5 +641,69 @@ func TestReplaceSnapshotRejectsInvalidHashBeforeMutation(t *testing.T) {
 	}
 	if len(got.Objects) != 0 || len(got.Issues) != 0 {
 		t.Errorf("invalid replacement mutated index: %#v", got)
+	}
+}
+
+func TestV37MigrationPreservesLegacyRowsAndGuardsRecursiveFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v36.db")
+	db := openLocalSchemaVersion(t, path, 36)
+	preparedV1, preparedV3, resolvedV2 := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	resolutionV1, resolutionV3, resolutionV2 := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	folderV1, folderV3, folderV2 := uuid.New(), uuid.New(), uuid.New()
+	for _, row := range []struct {
+		conflict uuid.UUID
+		folder   uuid.UUID
+	}{
+		{preparedV1, folderV1},
+		{preparedV3, folderV3},
+		{resolvedV2, folderV2},
+	} {
+		if _, err := db.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,conflict_code,created_at_ms) VALUES(?,'delete',?,'folder',1,NULL,'',NULL,'conflict','base_revision_mismatch',1)`, row.conflict.String(), row.folder.String()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO sync_conflict_states(operation_id,object_type,revision,parent_id,name,blob_hash,deleted) VALUES(?,'folder',2,NULL,'Moved',NULL,0)`, row.conflict.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO sync_folder_preserve_delete_resolutions(conflict_operation_id,resolution_operation_id,folder_id,expected_revision,state,request_version,known_cursor) VALUES(?,?,?,2,'prepared',1,NULL),(?,?,?,2,'prepared',3,9),(?,?,?,2,'prepared',2,9)`, preparedV1.String(), resolutionV1.String(), folderV1.String(), preparedV3.String(), resolutionV3.String(), folderV3.String(), resolvedV2.String(), resolutionV2.String(), folderV2.String()); err != nil {
+		t.Fatal(err)
+	}
+	recoveredRoot, originalChild, recoveredChild := uuid.New(), uuid.New(), uuid.New()
+	if _, err := db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET state='sealing',recovered_folder_id=?,recovered_cursor=10,deleted_cursor=13,first_cursor=10,last_cursor=13,clone_count=1 WHERE conflict_operation_id=?`, recoveredRoot.String(), resolvedV2.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_folder_preserve_delete_clones(conflict_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor) VALUES(?,0,?,?,11,12)`, resolvedV2.String(), originalChild.String(), recoveredChild.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET state='resolved' WHERE conflict_operation_id=?`, resolvedV2.String()); err != nil {
+		t.Fatal(err)
+	}
+	script, err := migrations.ReadFile("migrations/037_recursive_preserve_delete.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(string(script)); err != nil {
+		t.Fatal(err)
+	}
+	var rowCount int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM sync_folder_preserve_delete_resolutions WHERE conflict_operation_id IN(?,?,?)`, preparedV1.String(), preparedV3.String(), resolvedV2.String()).Scan(&rowCount); err != nil || rowCount != 3 {
+		t.Fatalf("rows=%d err=%v", rowCount, err)
+	}
+	var sourceParent, targetParent sql.NullString
+	var depth sql.NullInt64
+	if err = db.QueryRow(`SELECT source_parent_id,target_parent_id,depth FROM sync_folder_preserve_delete_clones WHERE conflict_operation_id=?`, resolvedV2.String()).Scan(&sourceParent, &targetParent, &depth); err != nil {
+		t.Fatal(err)
+	}
+	if sourceParent.Valid || targetParent.Valid || depth.Valid {
+		t.Fatalf("legacy recursive fields=%v/%v/%v", sourceParent, targetParent, depth)
+	}
+	if _, err = db.Exec(`UPDATE sync_folder_preserve_delete_clones SET source_parent_id=?,target_parent_id=?,depth=1 WHERE conflict_operation_id=?`, folderV2.String(), recoveredRoot.String(), resolvedV2.String()); err == nil {
+		t.Fatal("recursive clone fields were mutable")
+	}
+	if _, err = db.Exec(`UPDATE sync_folder_preserve_delete_resolutions SET request_version=4 WHERE conflict_operation_id=?`, preparedV3.String()); err == nil {
+		t.Fatal("request version changed without resolution identity transition")
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

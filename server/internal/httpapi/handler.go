@@ -558,7 +558,7 @@ func (h *handler) preserveDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	folder, err := parseSyncObjectID(request.FolderID)
-	if err != nil || request.ExpectedRevision == 0 || request.ExpectedRevision > math.MaxInt64 || request.RequestVersion > 3 || (request.RequestVersion >= 2 && (request.KnownCursor == 0 || request.KnownCursor > math.MaxInt64)) || (request.RequestVersion < 2 && request.KnownCursor != 0) {
+	if err != nil || request.ExpectedRevision == 0 || request.ExpectedRevision > math.MaxInt64 || request.RequestVersion > 4 || (request.RequestVersion >= 2 && (request.KnownCursor == 0 || request.KnownCursor > math.MaxInt64)) || (request.RequestVersion < 2 && request.KnownCursor != 0) {
 		writeAPIError(w, r, http.StatusBadRequest, "invalid_request")
 		return
 	}
@@ -588,9 +588,21 @@ func (h *handler) preserveDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, http.StatusOK, map[string]any{"recovered_folder_id": result.RecoveredFolderID.String(), "recovered_cursor": result.RecoveredCursor, "deleted_cursor": result.DeletedCursor, "first_cursor": result.FirstCursor, "last_cursor": result.LastCursor, "clones": clones})
 		return
 	}
+	if request.RequestVersion == 3 {
+		clones := make([]map[string]any, 0, len(result.Clones))
+		for _, clone := range result.Clones {
+			clones = append(clones, map[string]any{"original_folder_id": clone.OriginalFolderID.String(), "recovered_folder_id": clone.RecoveredFolderID.String(), "create_cursor": clone.CreateCursor, "delete_cursor": clone.DeleteCursor, "source_revision": clone.SourceRevision, "name": clone.Name})
+		}
+		notes := make([]map[string]any, 0, len(result.NoteMoves))
+		for _, note := range result.NoteMoves {
+			notes = append(notes, map[string]any{"note_id": note.NoteID.String(), "move_cursor": note.MoveCursor, "source_revision": note.SourceRevision, "target_revision": note.TargetRevision, "source_parent_id": note.SourceParentID.String(), "target_parent_id": note.TargetParentID.String(), "name": note.Name, "blob_hash": hex.EncodeToString(note.BlobHash)})
+		}
+		writeJSON(w, r, http.StatusOK, map[string]any{"recovered_folder_id": result.RecoveredFolderID.String(), "recovered_folder_name": result.RecoveredFolderName, "recovered_cursor": result.RecoveredCursor, "deleted_cursor": result.DeletedCursor, "first_cursor": result.FirstCursor, "last_cursor": result.LastCursor, "clones": clones, "note_moves": notes})
+		return
+	}
 	clones := make([]map[string]any, 0, len(result.Clones))
 	for _, clone := range result.Clones {
-		clones = append(clones, map[string]any{"original_folder_id": clone.OriginalFolderID.String(), "recovered_folder_id": clone.RecoveredFolderID.String(), "create_cursor": clone.CreateCursor, "delete_cursor": clone.DeleteCursor, "source_revision": clone.SourceRevision, "name": clone.Name})
+		clones = append(clones, map[string]any{"original_folder_id": clone.OriginalFolderID.String(), "recovered_folder_id": clone.RecoveredFolderID.String(), "create_cursor": clone.CreateCursor, "delete_cursor": clone.DeleteCursor, "source_revision": clone.SourceRevision, "name": clone.Name, "source_parent_id": clone.SourceParentID.String(), "target_parent_id": clone.TargetParentID.String(), "depth": clone.Depth})
 	}
 	notes := make([]map[string]any, 0, len(result.NoteMoves))
 	for _, note := range result.NoteMoves {

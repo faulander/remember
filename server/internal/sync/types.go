@@ -86,8 +86,9 @@ type PreserveDeleteFolderRequest struct {
 }
 type PreserveDeleteFolderClone struct {
 	OriginalFolderID, RecoveredFolderID uuid.UUID
+	SourceParentID, TargetParentID      uuid.UUID
 	CreateCursor, DeleteCursor          uint64
-	SourceRevision                      uint64
+	SourceRevision, Depth               uint64
 	Name                                string
 }
 type PreserveDeleteNoteMove struct {

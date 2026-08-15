@@ -210,3 +210,25 @@ func TestVerifyRootedSubtreeExpectedRetainsRootDescriptorAcrossReplacement(t *te
 		t.Fatal(err)
 	}
 }
+
+func TestVerifyRootedSubtreeExpectedNestedRecoveryShapeWithSibling(t *testing.T) {
+	f := newSubtreeFixture(t)
+	if err := os.Mkdir(filepath.Join(f.root, "Tree", "Sibling"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("sibling\n")
+	if err := os.WriteFile(filepath.Join(f.root, "Tree", "Sibling", "other.md"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(f.root, "Tree/Sibling")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.entries = append(f.entries,
+		RootedSubtreeEntry{Relative: "Sibling", Kind: RootedSubtreeFolder, Device: device, Inode: inode},
+		RootedSubtreeEntry{Relative: "Sibling/other.md", Kind: RootedSubtreeFile, Hash: sha256.Sum256(content)},
+	)
+	if err := VerifyRootedSubtreeExpected(f.root, "Tree", f.device, f.inode, f.entries, 1024); err != nil {
+		t.Fatal(err)
+	}
+}

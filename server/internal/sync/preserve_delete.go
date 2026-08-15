@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -8,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -34,9 +36,12 @@ func preserveRequestHash(r PreserveDeleteFolderRequest) [32]byte {
 	binary.BigEndian.PutUint64(b[48:56], r.ExpectedRevision)
 	binary.BigEndian.PutUint64(b[56:64], version)
 	binary.BigEndian.PutUint64(b[64:72], r.KnownCursor)
-	if version == 3 {
+	switch version {
+	case 3:
 		copy(b[72:], []byte("presdel3"))
-	} else {
+	case 4:
+		copy(b[72:], []byte("presdel4"))
+	default:
 		copy(b[72:], []byte("presdel2"))
 	}
 	return sha256.Sum256(b[:])
@@ -82,6 +87,9 @@ func (a *ActorService) PreserveAndDeleteEmptyFolder(ctx context.Context, r Prese
 	r.Version = version
 	if version == 2 || version == 3 {
 		return a.preserveAndDeleteDirectChildren(ctx, r)
+	}
+	if version == 4 {
+		return a.preserveAndDeleteRecursive(ctx, r)
 	}
 	if version != 1 || r.KnownCursor != 0 {
 		return PreserveDeleteFolderResult{}, ErrInvalidInput
@@ -488,6 +496,427 @@ func (a *ActorService) preserveAndDeleteDirectChildren(ctx context.Context, r Pr
 		if n, _ := result.RowsAffected(); n != 1 {
 			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 		}
+	}
+	if err = tx.Commit(); err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	return PreserveDeleteFolderResult{RecoveredFolderID: rootClone, RecoveredFolderName: name, RecoveredCursor: first, DeletedCursor: last, FirstCursor: first, LastCursor: last, Clones: clones, NoteMoves: noteMoves}, nil
+}
+
+type recursivePreserveNode struct {
+	state objectState
+	depth uint64
+}
+
+func (a *ActorService) preserveAndDeleteRecursive(ctx context.Context, r PreserveDeleteFolderRequest) (PreserveDeleteFolderResult, error) {
+	if !validV7(r.OperationID) || !validV7(r.ConflictOperationID) || !validObjectID(r.FolderID) || r.ExpectedRevision == 0 || r.KnownCursor == 0 {
+		return PreserveDeleteFolderResult{}, ErrInvalidInput
+	}
+	hash := preserveRequestHash(r)
+	tx, err := a.service.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	defer tx.Rollback()
+	if err = a.requireActiveActor(ctx, tx); err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+
+	var stored, recovered, device []byte
+	var version, known, first, last uint64
+	var status string
+	var recoveredName sql.NullString
+	var cloneCount, noteCount int
+	err = tx.QueryRowContext(ctx, `SELECT request_hash,recovered_folder_id,recovered_folder_name,device_id,request_version,known_cursor,first_cursor,last_cursor,status,clone_count,note_count FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, a.userID[:], r.OperationID[:]).Scan(&stored, &recovered, &recoveredName, &device, &version, &known, &first, &last, &status, &cloneCount, &noteCount)
+	if err == nil {
+		if len(stored) != sha256.Size || len(device) != 16 || subtle.ConstantTimeCompare(device, a.deviceID[:]) != 1 || subtle.ConstantTimeCompare(stored, hash[:]) != 1 || version != 4 || known != r.KnownCursor || status != "completed" || !recoveredName.Valid || recoveredName.String == "" || cloneCount < 0 || noteCount < 0 || last != first+2*uint64(cloneCount)+uint64(noteCount)+1 {
+			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+		}
+		rootClone, parseErr := uuid.FromBytes(recovered)
+		if parseErr != nil {
+			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+		}
+		out := PreserveDeleteFolderResult{RecoveredFolderID: rootClone, RecoveredFolderName: recoveredName.String, RecoveredCursor: first, DeletedCursor: last, FirstCursor: first, LastCursor: last}
+		cloneRows, queryErr := tx.QueryContext(ctx, `SELECT original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name,source_parent_id,target_parent_id,depth FROM sync_folder_preserve_delete_clones WHERE user_id=? AND resolution_operation_id=? ORDER BY ordinal`, a.userID[:], r.OperationID[:])
+		if queryErr != nil {
+			return PreserveDeleteFolderResult{}, queryErr
+		}
+		for cloneRows.Next() {
+			var original, cloneID, sourceParent, targetParent []byte
+			var item PreserveDeleteFolderClone
+			if queryErr = cloneRows.Scan(&original, &cloneID, &item.CreateCursor, &item.DeleteCursor, &item.SourceRevision, &item.Name, &sourceParent, &targetParent, &item.Depth); queryErr != nil {
+				cloneRows.Close()
+				return PreserveDeleteFolderResult{}, queryErr
+			}
+			if item.OriginalFolderID, queryErr = uuid.FromBytes(original); queryErr != nil {
+				cloneRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			if item.RecoveredFolderID, queryErr = uuid.FromBytes(cloneID); queryErr != nil {
+				cloneRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			if item.SourceParentID, queryErr = uuid.FromBytes(sourceParent); queryErr != nil {
+				cloneRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			if item.TargetParentID, queryErr = uuid.FromBytes(targetParent); queryErr != nil {
+				cloneRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			if item.SourceRevision == 0 || item.Name == "" || item.Depth == 0 || item.Depth > 256 || item.CreateCursor != first+1+uint64(len(out.Clones)) || item.DeleteCursor <= first+uint64(cloneCount)+uint64(noteCount) || item.DeleteCursor >= last {
+				cloneRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			out.Clones = append(out.Clones, item)
+		}
+		if queryErr = cloneRows.Err(); queryErr != nil {
+			cloneRows.Close()
+			return PreserveDeleteFolderResult{}, queryErr
+		}
+		if queryErr = cloneRows.Close(); queryErr != nil {
+			return PreserveDeleteFolderResult{}, queryErr
+		}
+		if len(out.Clones) != cloneCount {
+			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+		}
+		mapped := map[uuid.UUID]uuid.UUID{r.FolderID: rootClone}
+		depths := map[uuid.UUID]uint64{r.FolderID: 0}
+		deleteCursors := map[uuid.UUID]uint64{r.FolderID: last}
+		for _, item := range out.Clones {
+			parentClone, ok := mapped[item.SourceParentID]
+			if !ok || parentClone != item.TargetParentID || depths[item.SourceParentID]+1 != item.Depth {
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			mapped[item.OriginalFolderID] = item.RecoveredFolderID
+			depths[item.OriginalFolderID] = item.Depth
+			deleteCursors[item.OriginalFolderID] = item.DeleteCursor
+		}
+		for _, item := range out.Clones {
+			if item.DeleteCursor >= deleteCursors[item.SourceParentID] {
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+		}
+		noteRows, queryErr := tx.QueryContext(ctx, `SELECT note_id,move_cursor,source_revision,target_revision,source_parent_id,target_parent_id,name,blob_hash FROM sync_folder_preserve_delete_note_moves WHERE user_id=? AND resolution_operation_id=? ORDER BY ordinal`, a.userID[:], r.OperationID[:])
+		if queryErr != nil {
+			return PreserveDeleteFolderResult{}, queryErr
+		}
+		for noteRows.Next() {
+			var noteID, sourceParent, targetParent, blob []byte
+			var item PreserveDeleteNoteMove
+			if queryErr = noteRows.Scan(&noteID, &item.MoveCursor, &item.SourceRevision, &item.TargetRevision, &sourceParent, &targetParent, &item.Name, &blob); queryErr != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, queryErr
+			}
+			if item.NoteID, queryErr = uuid.FromBytes(noteID); queryErr != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			if item.SourceParentID, queryErr = uuid.FromBytes(sourceParent); queryErr != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			if item.TargetParentID, queryErr = uuid.FromBytes(targetParent); queryErr != nil {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			item.BlobHash = append([]byte(nil), blob...)
+			if item.MoveCursor != first+1+uint64(cloneCount)+uint64(len(out.NoteMoves)) || item.TargetRevision != item.SourceRevision+1 || item.SourceRevision == 0 || item.Name == "" || len(item.BlobHash) != sha256.Size || mapped[item.SourceParentID] != item.TargetParentID {
+				noteRows.Close()
+				return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+			}
+			out.NoteMoves = append(out.NoteMoves, item)
+		}
+		if queryErr = noteRows.Err(); queryErr != nil {
+			noteRows.Close()
+			return PreserveDeleteFolderResult{}, queryErr
+		}
+		if queryErr = noteRows.Close(); queryErr != nil {
+			return PreserveDeleteFolderResult{}, queryErr
+		}
+		if len(out.NoteMoves) != noteCount {
+			return PreserveDeleteFolderResult{}, ErrOperationReplayMismatch
+		}
+		if err = tx.Commit(); err != nil {
+			return PreserveDeleteFolderResult{}, err
+		}
+		return out, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return PreserveDeleteFolderResult{}, err
+	}
+
+	var typ, mutation, resultCode, conflict string
+	var object []byte
+	var conflictRevision sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT proposed_type,mutation,object_id,result,conflict_code,conflict_revision FROM sync_operations WHERE user_id=? AND device_id=? AND operation_id=?`, a.userID[:], a.deviceID[:], r.ConflictOperationID[:]).Scan(&typ, &mutation, &object, &resultCode, &conflict, &conflictRevision); err != nil {
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+	}
+	if typ != "folder" || mutation != "delete" || resultCode != "conflict" || conflict != "base_revision_mismatch" || len(object) != 16 || subtle.ConstantTimeCompare(object, r.FolderID[:]) != 1 || !conflictRevision.Valid || uint64(conflictRevision.Int64) != r.ExpectedRevision {
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+	}
+	var serverFrontier uint64
+	if err = tx.QueryRowContext(ctx, `SELECT last_cursor FROM user_cursor_counters WHERE user_id=?`, a.userID[:]).Scan(&serverFrontier); err != nil || r.KnownCursor > serverFrontier {
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+	}
+
+	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE tree(object_id,depth,path,cycle) AS (
+		SELECT object_id,0,','||hex(object_id)||',',0 FROM sync_objects WHERE user_id=? AND object_id=? AND deleted=0
+		UNION ALL
+		SELECT o.object_id,t.depth+1,t.path||hex(o.object_id)||',',instr(t.path,','||hex(o.object_id)||',')>0
+		FROM sync_objects o JOIN tree t ON o.parent_id=t.object_id
+		WHERE o.user_id=? AND o.deleted=0 AND t.cycle=0 AND t.depth<257
+	)
+	SELECT o.object_id,o.object_type,o.revision,o.parent_id,o.name,o.name_key,o.blob_hash,t.depth,t.cycle,
+	       CASE WHEN ub.hash IS NULL THEN 0 ELSE 1 END,COALESCE(b.available,0)
+	FROM tree t JOIN sync_objects o ON o.user_id=? AND o.object_id=t.object_id
+	LEFT JOIN user_content_blobs ub ON ub.user_id=o.user_id AND ub.hash=o.blob_hash
+	LEFT JOIN content_blobs b ON b.hash=o.blob_hash
+	ORDER BY t.depth,o.object_id LIMIT 10001`, a.userID[:], r.FolderID[:], a.userID[:], a.userID[:])
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	var folders, notes []recursivePreserveNode
+	for rows.Next() {
+		var idBytes, parentBytes, blob []byte
+		var node recursivePreserveNode
+		var cycle, entitled, available int
+		if err = rows.Scan(&idBytes, &node.state.Type, &node.state.Revision, &parentBytes, &node.state.Name, &node.state.NameKey, &blob, &node.depth, &cycle, &entitled, &available); err != nil {
+			rows.Close()
+			return PreserveDeleteFolderResult{}, err
+		}
+		if node.state.ID, err = uuid.FromBytes(idBytes); err != nil {
+			rows.Close()
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		if len(parentBytes) == 16 {
+			parent, parseErr := uuid.FromBytes(parentBytes)
+			if parseErr != nil {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+			}
+			node.state.ParentID = &parent
+		} else if len(parentBytes) != 0 {
+			rows.Close()
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		node.state.BlobHash = append([]byte(nil), blob...)
+		if cycle != 0 || node.depth > 256 || node.state.Revision == 0 || node.state.Name == "" || node.state.NameKey == "" {
+			rows.Close()
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		switch node.state.Type {
+		case ObjectFolder:
+			if len(node.state.BlobHash) != 0 {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+			}
+			folders = append(folders, node)
+		case ObjectNote:
+			if len(node.state.BlobHash) != sha256.Size || entitled != 1 || available != 1 {
+				rows.Close()
+				return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+			}
+			notes = append(notes, node)
+		default:
+			rows.Close()
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		if len(folders)+len(notes) > 10000 {
+			rows.Close()
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return PreserveDeleteFolderResult{}, err
+	}
+	if err = rows.Close(); err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	if len(folders) == 0 || folders[0].state.ID != r.FolderID || folders[0].depth != 0 || folders[0].state.Revision != r.ExpectedRevision {
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+	}
+	folderByID := make(map[uuid.UUID]recursivePreserveNode, len(folders))
+	for _, folder := range folders {
+		folderByID[folder.state.ID] = folder
+	}
+	for _, folder := range folders[1:] {
+		if folder.state.ParentID == nil {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		parent, ok := folderByID[*folder.state.ParentID]
+		if !ok || parent.depth+1 != folder.depth {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+	}
+	for _, note := range notes {
+		if note.state.ParentID == nil {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		parent, ok := folderByID[*note.state.ParentID]
+		if !ok || parent.depth+1 != note.depth {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+	}
+	var late int
+	err = tx.QueryRowContext(ctx, `WITH RECURSIVE
+		ranked(object_id,parent_id,deleted,rank) AS (
+			SELECT v.object_id,v.parent_id,v.deleted,ROW_NUMBER() OVER(PARTITION BY v.object_id ORDER BY l.cursor DESC)
+			FROM sync_object_versions v JOIN sync_change_log l ON l.user_id=v.user_id AND l.operation_id=v.operation_id
+			WHERE v.user_id=? AND l.cursor<=?
+		),
+		frontier(object_id,parent_id,deleted) AS (
+			SELECT object_id,parent_id,deleted FROM ranked WHERE rank=1
+		),
+		frontier_subtree(object_id) AS (
+			SELECT object_id FROM frontier WHERE object_id=? AND deleted=0
+			UNION
+			SELECT f.object_id FROM frontier f JOIN frontier_subtree p ON f.parent_id=p.object_id WHERE f.deleted=0
+		),
+		current_subtree(object_id) AS (
+			SELECT object_id FROM sync_objects WHERE user_id=? AND object_id=? AND deleted=0
+			UNION
+			SELECT o.object_id FROM sync_objects o JOIN current_subtree p ON o.parent_id=p.object_id WHERE o.user_id=? AND o.deleted=0
+		),
+		post_attached(object_id) AS (
+			SELECT v.object_id
+			FROM sync_object_versions v JOIN sync_change_log l ON l.user_id=v.user_id AND l.operation_id=v.operation_id
+			JOIN frontier_subtree p ON p.object_id=v.parent_id
+			WHERE v.user_id=? AND l.cursor>?
+			UNION
+			SELECT v.object_id
+			FROM sync_object_versions v JOIN sync_change_log l ON l.user_id=v.user_id AND l.operation_id=v.operation_id
+			JOIN post_attached p ON p.object_id=v.parent_id
+			WHERE v.user_id=? AND l.cursor>?
+		),
+		candidates(object_id) AS (
+			SELECT object_id FROM frontier_subtree
+			UNION SELECT object_id FROM current_subtree
+			UNION SELECT object_id FROM post_attached
+		)
+	SELECT 1 FROM candidates s JOIN sync_change_log l ON l.user_id=? AND l.object_id=s.object_id WHERE l.cursor>? LIMIT 1`, a.userID[:], r.KnownCursor, r.FolderID[:], a.userID[:], r.FolderID[:], a.userID[:], a.userID[:], r.KnownCursor, a.userID[:], r.KnownCursor, a.userID[:], r.KnownCursor).Scan(&late)
+	if err == nil {
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return PreserveDeleteFolderResult{}, err
+	}
+
+	sort.Slice(folders[1:], func(i, j int) bool {
+		left, right := folders[i+1], folders[j+1]
+		if left.depth != right.depth {
+			return left.depth < right.depth
+		}
+		return bytes.Compare(left.state.ID[:], right.state.ID[:]) < 0
+	})
+	folderOrder := make(map[uuid.UUID]int, len(folders))
+	for i, folder := range folders {
+		folderOrder[folder.state.ID] = i
+	}
+	sort.Slice(notes, func(i, j int) bool {
+		leftParent, rightParent := folderOrder[*notes[i].state.ParentID], folderOrder[*notes[j].state.ParentID]
+		if leftParent != rightParent {
+			return leftParent < rightParent
+		}
+		return bytes.Compare(notes[i].state.ID[:], notes[j].state.ID[:]) < 0
+	})
+
+	if err = a.ensureConflictNamespace(ctx, tx); err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	now := a.service.clock.Now().UTC().UnixMilli()
+	rootClone, err := uuid.NewV7()
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	name, recoveredKey, err := recoveryName(ctx, tx, a.userID, folders[0].state.Name, r.OperationID)
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	first, err = a.createPreservedFolder(ctx, tx, rootClone, ConflictRecoveredID, name, recoveredKey, now)
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	mapped := map[uuid.UUID]uuid.UUID{r.FolderID: rootClone}
+	clones := make([]PreserveDeleteFolderClone, 0, len(folders)-1)
+	for _, folder := range folders[1:] {
+		cloneID, createErr := uuid.NewV7()
+		if createErr != nil {
+			return PreserveDeleteFolderResult{}, createErr
+		}
+		sourceParent := *folder.state.ParentID
+		targetParent, ok := mapped[sourceParent]
+		if !ok {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		createCursor, createErr := a.createPreservedFolder(ctx, tx, cloneID, targetParent, folder.state.Name, folder.state.NameKey, now)
+		if createErr != nil {
+			return PreserveDeleteFolderResult{}, createErr
+		}
+		mapped[folder.state.ID] = cloneID
+		clones = append(clones, PreserveDeleteFolderClone{OriginalFolderID: folder.state.ID, RecoveredFolderID: cloneID, SourceParentID: sourceParent, TargetParentID: targetParent, CreateCursor: createCursor, SourceRevision: folder.state.Revision, Depth: folder.depth, Name: folder.state.Name})
+	}
+	noteMoves := make([]PreserveDeleteNoteMove, 0, len(notes))
+	for _, note := range notes {
+		sourceParent := *note.state.ParentID
+		targetParent, ok := mapped[sourceParent]
+		if !ok {
+			return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+		}
+		moveCursor, moveErr := a.movePreservedNote(ctx, tx, note.state, targetParent, now)
+		if moveErr != nil {
+			return PreserveDeleteFolderResult{}, moveErr
+		}
+		noteMoves = append(noteMoves, PreserveDeleteNoteMove{NoteID: note.state.ID, SourceParentID: sourceParent, TargetParentID: targetParent, MoveCursor: moveCursor, SourceRevision: note.state.Revision, TargetRevision: note.state.Revision + 1, Name: note.state.Name, BlobHash: append([]byte(nil), note.state.BlobHash...)})
+	}
+	deleteOrder := append([]recursivePreserveNode(nil), folders[1:]...)
+	sort.Slice(deleteOrder, func(i, j int) bool {
+		if deleteOrder[i].depth != deleteOrder[j].depth {
+			return deleteOrder[i].depth > deleteOrder[j].depth
+		}
+		return bytes.Compare(deleteOrder[i].state.ID[:], deleteOrder[j].state.ID[:]) < 0
+	})
+	cloneByOriginal := make(map[uuid.UUID]int, len(clones))
+	for i := range clones {
+		cloneByOriginal[clones[i].OriginalFolderID] = i
+	}
+	for _, folder := range deleteOrder {
+		deleteCursor, deleteErr := a.deletePreservedFolder(ctx, tx, folder.state, now)
+		if deleteErr != nil {
+			return PreserveDeleteFolderResult{}, deleteErr
+		}
+		clones[cloneByOriginal[folder.state.ID]].DeleteCursor = deleteCursor
+	}
+	last, err = a.deletePreservedFolder(ctx, tx, folders[0].state, now)
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	if last != first+2*uint64(len(clones))+uint64(len(noteMoves))+1 {
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_resolutions(user_id,device_id,resolution_operation_id,request_hash,conflict_operation_id,folder_id,expected_revision,recovered_folder_id,recovered_folder_name,recovered_cursor,deleted_cursor,status,created_at_ms,request_version,known_cursor,first_cursor,last_cursor,clone_count,note_count) VALUES(?,?,?,?,?,?,?,?,?, ?,?,'preparing',?,4,?,?,?,?,?)`, a.userID[:], a.deviceID[:], r.OperationID[:], hash[:], r.ConflictOperationID[:], r.FolderID[:], r.ExpectedRevision, rootClone[:], name, first, last, now, r.KnownCursor, first, last, len(clones), len(noteMoves)); err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	for i, clone := range clones {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_clones(user_id,resolution_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name,source_parent_id,target_parent_id,depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, a.userID[:], r.OperationID[:], i, clone.OriginalFolderID[:], clone.RecoveredFolderID[:], clone.CreateCursor, clone.DeleteCursor, clone.SourceRevision, clone.Name, clone.SourceParentID[:], clone.TargetParentID[:], clone.Depth); err != nil {
+			return PreserveDeleteFolderResult{}, err
+		}
+	}
+	for i, note := range noteMoves {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_note_moves(user_id,resolution_operation_id,ordinal,note_id,move_cursor,source_revision,target_revision,source_parent_id,target_parent_id,name,blob_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, a.userID[:], r.OperationID[:], i, note.NoteID[:], note.MoveCursor, note.SourceRevision, note.TargetRevision, note.SourceParentID[:], note.TargetParentID[:], note.Name, note.BlobHash); err != nil {
+			return PreserveDeleteFolderResult{}, err
+		}
+	}
+	completed, err := tx.ExecContext(ctx, `UPDATE sync_folder_preserve_delete_resolutions SET status='completed' WHERE user_id=? AND resolution_operation_id=? AND status='preparing'`, a.userID[:], r.OperationID[:])
+	if err != nil {
+		return PreserveDeleteFolderResult{}, err
+	}
+	if affected, affectedErr := completed.RowsAffected(); affectedErr != nil || affected != 1 {
+		if affectedErr != nil {
+			return PreserveDeleteFolderResult{}, affectedErr
+		}
+		return PreserveDeleteFolderResult{}, ErrPreserveDeleteUnavailable
 	}
 	if err = tx.Commit(); err != nil {
 		return PreserveDeleteFolderResult{}, err

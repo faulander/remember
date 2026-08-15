@@ -23,8 +23,8 @@ type InboxItem struct {
 	AppliedAt  *int64
 }
 
-// InboxParentBinding is the immutable root Folder identity authorizing one
-// direct-child Note plan.
+// InboxParentBinding is the immutable immediate-parent Folder identity used for
+// rooted filesystem access by one recursively ancestry-bound Note plan.
 type InboxParentBinding struct {
 	ParentID     uuid.UUID
 	RelativePath string
@@ -233,8 +233,8 @@ func (s *Store) PendingInboxChange(ctx context.Context, cursor uint64) (InboxIte
 	return item, found, err
 }
 
-// ListIndependentInboxCandidates returns the currently eligible root-note and
-// direct-child note update/delete rows in cursor order. Eligibility is a
+// ListIndependentInboxCandidates returns the currently eligible root and
+// arbitrarily nested Note update/delete rows in cursor order. Eligibility is a
 // point-in-time filter; CreateInboxApplyPlan repeats it atomically.
 func (s *Store) ListIndependentInboxCandidates(ctx context.Context, limit int) ([]InboxItem, error) {
 	if limit <= 0 || limit > 1000 {
@@ -315,7 +315,7 @@ func (s *Store) MarkInboxApplied(ctx context.Context, cursor uint64) error {
 }
 
 // CreateInboxApplyPlan creates one persisted apply plan for an independent
-// out-of-order root-note or direct-child note update or delete. It does not
+// out-of-order root or arbitrarily nested Note update or delete. It does not
 // advance either cursor.
 func (s *Store) CreateInboxApplyPlan(ctx context.Context, cursor uint64, planID uuid.UUID) error {
 	if cursor == 0 || cursor > math.MaxInt64 || !validOperationID(planID) {
@@ -341,15 +341,23 @@ func (s *Store) CreateInboxApplyPlan(ctx context.Context, cursor uint64, planID 
 			return err
 		}
 		if item.Change.ParentID != nil {
-			result, err := tx.ExecContext(ctx, `INSERT INTO sync_inbox_parent_bindings(plan_id,inbox_cursor,parent_id,parent_relative,device,inode,baseline_revision,baseline_operation_id)
-				SELECT ?,?,parent.object_id,parent.relative_path,parent.folder_device,parent.folder_inode,baseline.revision,baseline.operation_id
-				FROM objects parent JOIN sync_baselines baseline ON baseline.object_id=parent.object_id
-				WHERE parent.object_id=?`, planID.String(), cursor, item.Change.ParentID.String())
+			result, err := tx.ExecContext(ctx, `INSERT INTO sync_inbox_parent_bindings(
+					plan_id,inbox_cursor,depth,ancestor_id,ancestor_parent_id,
+					ancestor_relative,device,inode,baseline_revision,baseline_operation_id)
+				SELECT ?,inbox_cursor,depth,ancestor_id,ancestor_parent_id,
+					ancestor_relative,device,inode,baseline_revision,baseline_operation_id
+				FROM sync_inbox_note_ancestry
+				WHERE inbox_cursor=?
+				ORDER BY depth`, planID.String(), cursor)
 			if err != nil {
 				return err
 			}
-			if count, err := result.RowsAffected(); err != nil || count != 1 {
-				return errors.New("nested inbox parent binding unavailable")
+			var expected int64
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sync_inbox_note_ancestry WHERE inbox_cursor=?`, cursor).Scan(&expected); err != nil {
+				return err
+			}
+			if count, err := result.RowsAffected(); err != nil || count == 0 || count != expected {
+				return errors.New("nested inbox ancestry binding unavailable")
 			}
 		}
 		var parent, blob any
@@ -374,21 +382,30 @@ func linkedInboxParentBindingValidTx(ctx context.Context, tx *sql.Tx, planID uui
 		FROM sync_inbox_apply_plans link
 		JOIN sync_inbox_changes i ON i.cursor=link.cursor
 		WHERE link.plan_id=?
-		  AND ((i.parent_id IS NULL AND NOT EXISTS(SELECT 1 FROM sync_inbox_parent_bindings binding WHERE binding.plan_id=link.plan_id))
-		       OR EXISTS(SELECT 1 FROM sync_inbox_valid_parent_bindings binding WHERE binding.plan_id=link.plan_id AND binding.inbox_cursor=i.cursor))
+		  AND (
+		    (i.parent_id IS NULL AND NOT EXISTS(
+		      SELECT 1 FROM sync_inbox_parent_bindings binding
+		      WHERE binding.plan_id=link.plan_id
+		    ))
+		    OR
+		    (i.parent_id IS NOT NULL AND EXISTS(
+		      SELECT 1 FROM sync_inbox_valid_nested_bindings valid
+		      WHERE valid.plan_id=link.plan_id AND valid.inbox_cursor=i.cursor
+		    ))
+		  )
 	)`, planID.String()).Scan(&valid)
 	if err != nil {
 		return err
 	}
 	if valid == 0 {
-		return errors.New("nested inbox parent binding is no longer valid")
+		return errors.New("nested inbox ancestry binding is no longer valid")
 	}
 	return nil
 }
 
-// ActiveInboxParentBinding returns and revalidates the immutable parent
-// identity for a linked direct-child Note plan. Root-Note and legacy plans
-// return nil.
+// ActiveInboxParentBinding returns the revalidated immediate-parent identity for
+// a linked nested Note plan. Root-Note and unlinked legacy plans return nil. The
+// validity check covers every immutable Folder ancestry binding.
 func (s *Store) ActiveInboxParentBinding(ctx context.Context, planID uuid.UUID) (*InboxParentBinding, error) {
 	if !validOperationID(planID) {
 		return nil, errors.New("invalid apply plan id")
@@ -406,29 +423,26 @@ func (s *Store) ActiveInboxParentBinding(ctx context.Context, planID uuid.UUID) 
 		if err != nil {
 			return err
 		}
+		if err := linkedInboxParentBindingValidTx(ctx, tx, planID); err != nil {
+			return err
+		}
 		if !parent.Valid {
-			var count int
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sync_inbox_parent_bindings WHERE plan_id=?`, planID.String()).Scan(&count); err != nil {
-				return err
-			}
-			if count != 0 {
-				return errors.New("root inbox plan has a parent binding")
-			}
 			return nil
 		}
 		var rawID, relative string
 		var device, inode uint64
-		err = tx.QueryRowContext(ctx, `SELECT parent_id,parent_relative,device,inode
-			FROM sync_inbox_valid_parent_bindings WHERE plan_id=?`, planID.String()).Scan(&rawID, &relative, &device, &inode)
+		err = tx.QueryRowContext(ctx, `SELECT ancestor_id,ancestor_relative,device,inode
+			FROM sync_inbox_valid_parent_bindings
+			WHERE plan_id=? AND depth=1`, planID.String()).Scan(&rawID, &relative, &device, &inode)
 		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("nested inbox parent binding is no longer valid")
+			return errors.New("nested inbox immediate-parent binding is no longer valid")
 		}
 		if err != nil {
 			return err
 		}
 		id, err := uuid.Parse(rawID)
 		if err != nil || id == uuid.Nil || id.String() != parent.String || naming.ValidateRelativePath(relative) != nil || device == 0 || inode == 0 {
-			return errors.New("invalid nested inbox parent binding")
+			return errors.New("invalid nested inbox immediate-parent binding")
 		}
 		binding = &InboxParentBinding{ParentID: id, RelativePath: relative, Device: device, Inode: inode}
 		return nil

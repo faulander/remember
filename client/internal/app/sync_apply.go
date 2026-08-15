@@ -26,6 +26,7 @@ var ErrUnsupportedApplyPlan = errors.New("apply plan contains unsupported remote
 // Test-only race hook after durable publication and before reconciliation.
 var testHookAfterApplyPublication func()
 var testHookAfterNoteApplyReconcile func()
+var testHookBeforeNoteApplyPublication func() error
 var testHookBeforeFolderPublication func()
 var testHookAfterFolderReconcile func()
 var testHookAfterFolderMutationPublication func() error
@@ -98,6 +99,19 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 			return fmt.Errorf("nested inbox parent identity changed: %w", err)
 		}
 	}
+	revalidateParentBinding := func(phase string) error {
+		if parentBinding == nil {
+			return nil
+		}
+		current, err := store.ActiveInboxParentBinding(ctx, plan.ID)
+		if err != nil {
+			return fmt.Errorf("nested inbox ancestry changed %s: %w", phase, err)
+		}
+		if current == nil || *current != *parentBinding {
+			return fmt.Errorf("nested inbox immediate-parent binding changed %s", phase)
+		}
+		return nil
+	}
 	steps, err := c.preflightNotePlan(ctx, plan, resolver)
 	if err != nil {
 		var incident *applyIntegrityError
@@ -158,6 +172,14 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 			}
 			continue
 		}
+		if testHookBeforeNoteApplyPublication != nil {
+			if err := testHookBeforeNoteApplyPublication(); err != nil {
+				return err
+			}
+		}
+		if err := revalidateParentBinding("before filesystem mutation"); err != nil {
+			return err
+		}
 		if err := c.publishNoteApplyStep(step); err != nil {
 			return err
 		}
@@ -185,6 +207,9 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 		if testHookAfterNoteApplyReconcile != nil {
 			testHookAfterNoteApplyReconcile()
 		}
+		if err := revalidateParentBinding("before step completion"); err != nil {
+			return err
+		}
 		if parentBinding != nil {
 			if err := repository.VerifyRootedFolderIdentity(c.root, parentBinding.RelativePath, parentBinding.Device, parentBinding.Inode); err != nil {
 				return errors.New("nested inbox parent identity changed before step completion")
@@ -193,6 +218,9 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 		if err := store.MarkApplyStepApplied(ctx, plan.ID, step.index); err != nil {
 			return err
 		}
+	}
+	if err := revalidateParentBinding("before plan completion"); err != nil {
+		return err
 	}
 	if parentBinding != nil {
 		if err := repository.VerifyRootedFolderIdentity(c.root, parentBinding.RelativePath, parentBinding.Device, parentBinding.Inode); err != nil {
@@ -439,8 +467,16 @@ func (c *LocalCore) preflightNotePlan(ctx context.Context, plan *clientsync.Appl
 					if !matched {
 						return nil, errors.New("remote move object is absent")
 					}
+					if change.ParentID == nil {
+						return nil, errors.New("preserve delete note parent missing")
+					}
+					parent, parentExists := objects[*change.ParentID]
+					if !parentExists || parent.Type != localindex.ObjectFolder || parent.RelativePath != path.Dir(target) || parent.FolderDevice == 0 || parent.FolderInode == 0 {
+						return nil, errors.New("preserve delete note parent is not identity bound")
+					}
+					step.folderDevice, step.folderInode = parent.FolderDevice, parent.FolderInode
 					if !vacatedPaths[portablePathKey(target)] {
-						current, readErr := repository.ReadRooted(c.root, target, clientsync.MaxBlobBytes)
+						current, readErr := repository.ReadRootedInFolderExpected(c.root, target, step.folderDevice, step.folderInode, clientsync.MaxBlobBytes)
 						if readErr == nil {
 							if !bytes.Equal(current, blob) {
 								return nil, errors.New("preserve delete note target occupied")
@@ -1116,11 +1152,27 @@ func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {
 		}
 		return repository.WriteRootedExpected(c.root, step.relative, step.expected, step.content, validateAppliedNote(step.change.ObjectID))
 	case clientsync.Move:
+		if step.resolutionMaterialized {
+			if step.folderDevice == 0 || step.folderInode == 0 {
+				return errors.New("preserve delete note parent binding missing")
+			}
+			if step.exists {
+				current, err := repository.ReadRootedInFolderExpected(c.root, step.relative, step.folderDevice, step.folderInode, clientsync.MaxBlobBytes)
+				if err != nil {
+					return err
+				}
+				if !bytes.Equal(current, step.content) {
+					return errors.New("preserve delete note target changed")
+				}
+				if err = validateAppliedNote(step.change.ObjectID)(current); err != nil {
+					return err
+				}
+				return nil
+			}
+			return repository.CreateRootedInFolderExpected(c.root, path.Dir(step.relative), path.Base(step.relative), step.folderDevice, step.folderInode, step.content, validateAppliedNote(step.change.ObjectID))
+		}
 		if step.exists {
 			return nil
-		}
-		if step.resolutionMaterialized {
-			return repository.CreateRooted(c.root, step.relative, step.content, validateAppliedNote(step.change.ObjectID))
 		}
 		return repository.MoveRootedExpected(c.root, step.source, step.relative, step.expected)
 	case clientsync.Delete:
@@ -1144,6 +1196,19 @@ func (c *LocalCore) verifyNoteApplyStep(step preparedNoteStep) error {
 		if err := repository.VerifyRootedFolderIdentity(c.root, step.parentBinding.RelativePath, step.parentBinding.Device, step.parentBinding.Inode); err != nil {
 			return errors.New("nested inbox parent identity changed")
 		}
+	}
+	if step.resolutionMaterialized {
+		if step.folderDevice == 0 || step.folderInode == 0 {
+			return errors.New("preserve delete note parent binding missing")
+		}
+		current, err := repository.ReadRootedInFolderExpected(c.root, step.relative, step.folderDevice, step.folderInode, clientsync.MaxBlobBytes)
+		if err != nil || !bytes.Equal(current, step.content) {
+			return errors.New("applied preserve delete note bytes differ")
+		}
+		if err = validateAppliedNote(step.change.ObjectID)(current); err != nil {
+			return err
+		}
+		return nil
 	}
 	if step.deleted {
 		if _, err := repository.ReadRooted(c.root, step.relative, 1); !os.IsNotExist(err) {

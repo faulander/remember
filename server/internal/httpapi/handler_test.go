@@ -600,9 +600,9 @@ func TestPreserveDeleteFolderHTTPBinding(t *testing.T) {
 	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
 	defer cleanup()
 	actor := newFakeSyncActor()
-	recovered, note, source := uuid.New(), uuid.New(), uuid.New()
+	recovered, cloneID, note, source := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	hash := sha256.Sum256([]byte("note"))
-	actor.preserveResult = synccore.PreserveDeleteFolderResult{RecoveredFolderID: recovered, RecoveredFolderName: "Recovered", RecoveredCursor: 10, DeletedCursor: 12, FirstCursor: 10, LastCursor: 12, NoteMoves: []synccore.PreserveDeleteNoteMove{{NoteID: note, SourceParentID: source, TargetParentID: recovered, MoveCursor: 11, SourceRevision: 2, TargetRevision: 3, Name: "N.md", BlobHash: hash[:]}}}
+	actor.preserveResult = synccore.PreserveDeleteFolderResult{RecoveredFolderID: recovered, RecoveredFolderName: "Recovered", RecoveredCursor: 10, DeletedCursor: 14, FirstCursor: 10, LastCursor: 14, Clones: []synccore.PreserveDeleteFolderClone{{OriginalFolderID: source, RecoveredFolderID: cloneID, SourceParentID: source, TargetParentID: recovered, CreateCursor: 11, DeleteCursor: 13, SourceRevision: 2, Depth: 1, Name: "Child"}}, NoteMoves: []synccore.PreserveDeleteNoteMove{{NoteID: note, SourceParentID: source, TargetParentID: cloneID, MoveCursor: 12, SourceRevision: 2, TargetRevision: 3, Name: "N.md", BlobHash: hash[:]}}}
 	api.syncForActor = func(user, device uuid.UUID) (SyncActorService, error) {
 		if user != testUserID || device != testDeviceID {
 			t.Fatalf("actor=%s/%s", user, device)
@@ -611,13 +611,67 @@ func TestPreserveDeleteFolderHTTPBinding(t *testing.T) {
 	}
 	operation, conflict := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
 	folder := actor.preserveResult.NoteMoves[0].SourceParentID
-	body := map[string]any{"operation_id": operation.String(), "conflict_operation_id": conflict.String(), "folder_id": folder.String(), "expected_revision": 2, "request_version": 3, "known_cursor": 9}
+	body := map[string]any{"operation_id": operation.String(), "conflict_operation_id": conflict.String(), "folder_id": folder.String(), "expected_revision": 2, "request_version": 4, "known_cursor": 9}
 	response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/folder-preserve-delete", body, testAccess, http.StatusOK)
-	if actor.lastPreserve.OperationID != operation || actor.lastPreserve.ConflictOperationID != conflict || actor.lastPreserve.FolderID != folder || actor.lastPreserve.ExpectedRevision != 2 || actor.lastPreserve.Version != 3 || actor.lastPreserve.KnownCursor != 9 {
+	if actor.lastPreserve.OperationID != operation || actor.lastPreserve.ConflictOperationID != conflict || actor.lastPreserve.FolderID != folder || actor.lastPreserve.ExpectedRevision != 2 || actor.lastPreserve.Version != 4 || actor.lastPreserve.KnownCursor != 9 {
 		t.Fatalf("request=%#v", actor.lastPreserve)
 	}
-	if !strings.Contains(response.Body.String(), recovered.String()) || !strings.Contains(response.Body.String(), `"recovered_folder_name":"Recovered"`) || !strings.Contains(response.Body.String(), note.String()) || !strings.Contains(response.Body.String(), hex.EncodeToString(hash[:])) {
+	if !strings.Contains(response.Body.String(), recovered.String()) || !strings.Contains(response.Body.String(), `"recovered_folder_name":"Recovered"`) || !strings.Contains(response.Body.String(), note.String()) || !strings.Contains(response.Body.String(), hex.EncodeToString(hash[:])) || !strings.Contains(response.Body.String(), `"source_parent_id"`) || !strings.Contains(response.Body.String(), `"target_parent_id"`) || !strings.Contains(response.Body.String(), `"depth":1`) {
 		t.Fatalf("body=%s", response.Body.String())
+	}
+}
+
+func TestPreserveDeleteFolderLegacyHTTPShapesRemainExact(t *testing.T) {
+	handler, _, api, cleanup := newHandlerTest(t, newFakeSessions())
+	defer cleanup()
+	actor := newFakeSyncActor()
+	root, original, recovered := uuid.New(), uuid.New(), uuid.New()
+	hash := sha256.Sum256([]byte("note"))
+	actor.preserveResult = synccore.PreserveDeleteFolderResult{
+		RecoveredFolderID: recovered, RecoveredFolderName: "Recovered", RecoveredCursor: 10, DeletedCursor: 13, FirstCursor: 10, LastCursor: 13,
+		Clones:    []synccore.PreserveDeleteFolderClone{{OriginalFolderID: original, RecoveredFolderID: uuid.New(), SourceParentID: root, TargetParentID: recovered, CreateCursor: 11, DeleteCursor: 12, SourceRevision: 2, Depth: 1, Name: "Child"}},
+		NoteMoves: []synccore.PreserveDeleteNoteMove{{NoteID: uuid.New(), SourceParentID: root, TargetParentID: recovered, MoveCursor: 12, SourceRevision: 1, TargetRevision: 2, Name: "N.md", BlobHash: hash[:]}},
+	}
+	api.syncForActor = func(uuid.UUID, uuid.UUID) (SyncActorService, error) { return actor, nil }
+	assertKeys := func(raw json.RawMessage, expected ...string) {
+		t.Helper()
+		var value map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &value); err != nil {
+			t.Fatal(err)
+		}
+		if len(value) != len(expected) {
+			t.Fatalf("keys=%v want=%v", value, expected)
+		}
+		for _, key := range expected {
+			if _, ok := value[key]; !ok {
+				t.Fatalf("missing key %q in %v", key, value)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		version      uint64
+		responseKeys []string
+		cloneKeys    []string
+	}{
+		{1, []string{"recovered_folder_id", "recovered_cursor", "deleted_cursor"}, nil},
+		{2, []string{"recovered_folder_id", "recovered_cursor", "deleted_cursor", "first_cursor", "last_cursor", "clones"}, []string{"original_folder_id", "recovered_folder_id", "create_cursor", "delete_cursor"}},
+		{3, []string{"recovered_folder_id", "recovered_folder_name", "recovered_cursor", "deleted_cursor", "first_cursor", "last_cursor", "clones", "note_moves"}, []string{"original_folder_id", "recovered_folder_id", "create_cursor", "delete_cursor", "source_revision", "name"}},
+	} {
+		body := map[string]any{"operation_id": uuid.Must(uuid.NewV7()).String(), "conflict_operation_id": uuid.Must(uuid.NewV7()).String(), "folder_id": root.String(), "expected_revision": 2, "request_version": tc.version}
+		if tc.version >= 2 {
+			body["known_cursor"] = 9
+		}
+		response := jsonRequest(t, handler, http.MethodPost, "/v1/sync/folder-preserve-delete", body, testAccess, http.StatusOK)
+		assertKeys(response.Body.Bytes(), tc.responseKeys...)
+		if tc.cloneKeys != nil {
+			var decoded struct {
+				Clones []json.RawMessage `json:"clones"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil || len(decoded.Clones) != 1 {
+				t.Fatalf("clones=%s err=%v", response.Body.String(), err)
+			}
+			assertKeys(decoded.Clones[0], tc.cloneKeys...)
+		}
 	}
 }
 

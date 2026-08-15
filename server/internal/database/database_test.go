@@ -50,8 +50,8 @@ func TestOpenConfiguresSQLiteAndMigrateIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 9 {
-		t.Errorf("migration count = %d, want 9", count)
+	if count != 10 {
+		t.Errorf("migration count = %d, want 10", count)
 	}
 
 	info, err := os.Stat(path)
@@ -63,7 +63,7 @@ func TestOpenConfiguresSQLiteAndMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestV8MigrationPreservesV1V2RowsAndCloneMappings(t *testing.T) {
+func TestV10MigrationPreservesV1V2V3RowsAndCloneMappings(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDatabase(t)
 	if err := migrateFS(ctx, db, migrationFiles, "migrations/00[1-7]_*.sql"); err != nil {
@@ -148,33 +148,71 @@ func TestV8MigrationPreservesV1V2RowsAndCloneMappings(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err = migrateFS(ctx, db, migrationFiles, "migrations/00[1-9]_*.sql"); err != nil {
+		t.Fatal(err)
+	}
+	blob := bytes.Repeat([]byte{3}, 32)
+	if _, err = db.Exec(`INSERT INTO content_blobs(hash,size_bytes,available,created_at_ms) VALUES(?,1,1,1)`, blob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO user_content_blobs(user_id,hash,entitled_at_ms) VALUES(?,?,1)`, user[:], blob); err != nil {
+		t.Fatal(err)
+	}
+	v3Root, v3Child, v3Note := uuid.New(), uuid.New(), uuid.New()
+	v3Created := submit(synccore.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: synccore.MutationCreate, ObjectID: v3Root, ObjectType: synccore.ObjectFolder, Name: "V3"})
+	v3ChildCreate := synccore.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: synccore.MutationCreate, ObjectID: v3Child, ObjectType: synccore.ObjectFolder, ParentID: &v3Root, Name: "Child"}
+	submit(v3ChildCreate)
+	v3NoteCreate := synccore.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: synccore.MutationCreate, ObjectID: v3Note, ObjectType: synccore.ObjectNote, ParentID: &v3Root, Name: "N.md", BlobHash: blob}
+	submit(v3NoteCreate)
+	v3Move := synccore.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: synccore.MutationMove, ObjectID: v3Root, ObjectType: synccore.ObjectFolder, BaseRevision: v3Created.Revision, Name: "V3 moved"}
+	v3Moved := submit(v3Move)
+	v3Conflict := synccore.Mutation{OperationID: uuid.Must(uuid.NewV7()), Kind: synccore.MutationDelete, ObjectID: v3Root, ObjectType: synccore.ObjectFolder, BaseRevision: v3Created.Revision}
+	v3ConflictResult, err := actor.Submit(ctx, v3Conflict)
+	if err != nil || v3ConflictResult.Conflict != synccore.ConflictBaseRevisionMismatch {
+		t.Fatalf("v3 conflict=%#v err=%v", v3ConflictResult, err)
+	}
+	v3Operation := uuid.Must(uuid.NewV7())
+	if _, err = actor.PreserveAndDeleteEmptyFolder(ctx, synccore.PreserveDeleteFolderRequest{OperationID: v3Operation, ConflictOperationID: v3Conflict.OperationID, FolderID: v3Root, ExpectedRevision: v3Moved.Revision, Version: 3, KnownCursor: v3Moved.Cursor}); err != nil {
+		t.Fatal(err)
+	}
 	if err = Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	for _, expected := range []struct {
-		operation uuid.UUID
-		version   int
-		clones    int
+		operation        uuid.UUID
+		version, clones  int
+		notes            int
+		hasRecoveredName bool
 	}{
-		{v1Operation, 1, 0},
-		{v2Operation, 2, 1},
+		{v1Operation, 1, 0, 0, false},
+		{v2Operation, 2, 1, 0, false},
+		{v3Operation, 3, 1, 1, true},
 	} {
 		var version, cloneCount, noteCount int
 		var recoveredName sql.NullString
 		if err = db.QueryRow(`SELECT request_version,clone_count,note_count,recovered_folder_name FROM sync_folder_preserve_delete_resolutions WHERE user_id=? AND resolution_operation_id=?`, user[:], expected.operation[:]).Scan(&version, &cloneCount, &noteCount, &recoveredName); err != nil {
 			t.Fatal(err)
 		}
-		if version != expected.version || cloneCount != expected.clones || noteCount != 0 || recoveredName.Valid {
+		if version != expected.version || cloneCount != expected.clones || noteCount != expected.notes || recoveredName.Valid != expected.hasRecoveredName {
 			t.Fatalf("migrated resolution=%d/%d/%d/%v", version, cloneCount, noteCount, recoveredName)
 		}
 	}
-	var sourceRevision sql.NullInt64
+	var sourceRevision, cloneDepth sql.NullInt64
 	var cloneName sql.NullString
-	if err = db.QueryRow(`SELECT source_revision,name FROM sync_folder_preserve_delete_clones WHERE user_id=? AND resolution_operation_id=?`, user[:], v2Operation[:]).Scan(&sourceRevision, &cloneName); err != nil {
+	var sourceParent, targetParent []byte
+	if err = db.QueryRow(`SELECT source_revision,name,source_parent_id,target_parent_id,depth FROM sync_folder_preserve_delete_clones WHERE user_id=? AND resolution_operation_id=?`, user[:], v2Operation[:]).Scan(&sourceRevision, &cloneName, &sourceParent, &targetParent, &cloneDepth); err != nil {
 		t.Fatal(err)
 	}
-	if sourceRevision.Valid || cloneName.Valid {
-		t.Fatalf("legacy clone gained V3 descriptors: %v/%v", sourceRevision, cloneName)
+	if sourceRevision.Valid || cloneName.Valid || sourceParent != nil || targetParent != nil || cloneDepth.Valid {
+		t.Fatalf("legacy clone gained later descriptors: %v/%v/%x/%x/%v", sourceRevision, cloneName, sourceParent, targetParent, cloneDepth)
+	}
+	sourceRevision, cloneDepth = sql.NullInt64{}, sql.NullInt64{}
+	cloneName, sourceParent, targetParent = sql.NullString{}, nil, nil
+	if err = db.QueryRow(`SELECT source_revision,name,source_parent_id,target_parent_id,depth FROM sync_folder_preserve_delete_clones WHERE user_id=? AND resolution_operation_id=?`, user[:], v3Operation[:]).Scan(&sourceRevision, &cloneName, &sourceParent, &targetParent, &cloneDepth); err != nil {
+		t.Fatal(err)
+	}
+	if !sourceRevision.Valid || !cloneName.Valid || sourceParent != nil || targetParent != nil || cloneDepth.Valid {
+		t.Fatalf("V3 clone descriptors drifted: %v/%v/%x/%x/%v", sourceRevision, cloneName, sourceParent, targetParent, cloneDepth)
 	}
 }
 

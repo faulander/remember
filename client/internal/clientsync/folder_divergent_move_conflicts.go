@@ -170,6 +170,22 @@ func (s *Store) PutConflictFolderDivergentMoveRecoveryWithNotes(ctx context.Cont
 		return nil
 	})
 }
+func (s *Store) PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx context.Context, r ConflictFolderDivergentMoveRecovery, manifest ConflictRecursiveLocalFolderManifest) error {
+	if !validConflictFolderDivergentMoveRecovery(r) || r.State != "prepared" || manifest.OperationID != r.OperationID || manifest.NewRootOperationID != r.NewOperationID {
+		return errors.New("invalid recursive divergent folder move recovery")
+	}
+	manifest.Kind = RecursiveFolderDivergentMoveRecovery
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:])
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("recursive divergent folder move recovery unavailable")
+		}
+		return putRecursiveLocalFolderManifestTx(ctx, tx, manifest)
+	})
+}
 func (s *Store) ConflictFolderDivergentMoveNoteMembers(ctx context.Context, operationID uuid.UUID) ([]ConflictFolderCreateNoteMember, error) {
 	var out []ConflictFolderCreateNoteMember
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
@@ -355,11 +371,28 @@ func (s *Store) CompleteConflictFolderDivergentMoveRecovery(ctx context.Context,
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var ok int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries recovery JOIN sync_outbox o ON o.operation_id=recovery.operation_id JOIN sync_conflict_states c ON c.operation_id=o.operation_id JOIN sync_baselines b ON b.object_id=recovery.folder_id JOIN sync_inbox_changes applied ON applied.operation_id=b.operation_id AND applied.object_id=b.object_id WHERE recovery.operation_id=? AND recovery.state='canonical_published' AND recovery.folder_id=? AND recovery.recovered_folder_id=? AND recovery.new_operation_id=? AND recovery.attempted_relative=? AND recovery.canonical_relative=? AND recovery.recovery_relative=? AND recovery.source_device=? AND recovery.source_inode=? AND recovery.canonical_revision=? AND recovery.canonical_nonce=? AND recovery.canonical_device=? AND recovery.canonical_inode=? AND o.status='conflict' AND o.conflict_code='base_revision_mismatch' AND c.object_type='folder' AND c.deleted=0 AND c.parent_id IS NULL AND c.name=recovery.canonical_relative AND c.revision=recovery.canonical_revision AND b.revision=recovery.canonical_revision AND applied.state='applied' AND applied.object_type='folder' AND applied.mutation='move' AND applied.revision=recovery.canonical_revision AND applied.parent_id IS NULL AND applied.name=recovery.canonical_relative AND applied.deleted=0 AND NOT EXISTS(SELECT 1 FROM sync_outbox later WHERE later.object_id=o.object_id AND later.sequence>o.sequence AND later.status IN ('pending','attempted','replay_mismatch','conflict')) AND (SELECT COUNT(*) FROM sync_outbox_dependencies d JOIN sync_outbox dependent ON dependent.operation_id=d.operation_id WHERE d.dependency_operation_id=o.operation_id AND dependent.status IN ('pending','attempted','replay_mismatch','conflict'))=(SELECT COUNT(*) FROM conflict_folder_divergent_move_note_members n WHERE n.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM sync_outbox_dependencies d JOIN sync_outbox dependent ON dependent.operation_id=d.operation_id WHERE d.dependency_operation_id=o.operation_id AND dependent.status IN ('pending','attempted','replay_mismatch','conflict') AND NOT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_note_members n WHERE n.operation_id=o.operation_id AND n.old_operation_id=dependent.operation_id)))`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:], r.CanonicalDevice, r.CanonicalInode).Scan(&ok); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries recovery JOIN sync_outbox o ON o.operation_id=recovery.operation_id JOIN sync_conflict_states c ON c.operation_id=o.operation_id JOIN sync_baselines b ON b.object_id=recovery.folder_id JOIN sync_inbox_changes applied ON applied.operation_id=b.operation_id AND applied.object_id=b.object_id WHERE recovery.operation_id=? AND recovery.state='canonical_published' AND recovery.folder_id=? AND recovery.recovered_folder_id=? AND recovery.new_operation_id=? AND recovery.attempted_relative=? AND recovery.canonical_relative=? AND recovery.recovery_relative=? AND recovery.source_device=? AND recovery.source_inode=? AND recovery.canonical_revision=? AND recovery.canonical_nonce=? AND recovery.canonical_device=? AND recovery.canonical_inode=? AND o.status='conflict' AND o.conflict_code='base_revision_mismatch' AND c.object_type='folder' AND c.deleted=0 AND c.parent_id IS NULL AND c.name=recovery.canonical_relative AND c.revision=recovery.canonical_revision AND b.revision=recovery.canonical_revision AND applied.state='applied' AND applied.object_type='folder' AND applied.mutation='move' AND applied.revision=recovery.canonical_revision AND applied.parent_id IS NULL AND applied.name=recovery.canonical_relative AND applied.deleted=0 AND NOT EXISTS(SELECT 1 FROM sync_outbox later WHERE later.object_id=o.object_id AND later.sequence>o.sequence AND later.status IN ('pending','attempted','replay_mismatch','conflict')))`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:], r.CanonicalDevice, r.CanonicalInode).Scan(&ok); err != nil {
 			return err
 		}
 		if ok == 0 {
 			return errors.New("divergent folder move completion identity mismatch")
+		}
+		foundRecursive, recursiveMutations, err := recursiveLocalFolderReplacementMutationsTx(ctx, tx, RecursiveFolderDivergentMoveRecovery, r.OperationID, r.RecoveredFolderID, path.Base(r.RecoveryRelative))
+		if err != nil {
+			return err
+		}
+		if foundRecursive {
+			if err := s.enqueueTx(ctx, tx, recursiveMutations); err != nil {
+				return err
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE conflict_folder_divergent_move_recoveries SET state='completed' WHERE operation_id=? AND state='canonical_published'`, r.OperationID.String())
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errors.New("recursive divergent folder move completion unavailable")
+			}
+			return nil
 		}
 		if err := validateDivergentNoteTopologyTx(ctx, tx, r); err != nil {
 			return err

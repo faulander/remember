@@ -255,6 +255,22 @@ func (s *Store) PutConflictFolderCreateRecoveryWithNotes(ctx context.Context, r 
 		return nil
 	})
 }
+func (s *Store) PutConflictFolderCreateRecoveryWithRecursiveManifest(ctx context.Context, r ConflictFolderCreateRecovery, manifest ConflictRecursiveLocalFolderManifest) error {
+	if !validFolderCreateRecovery(r) || r.State != "prepared" || manifest.OperationID != r.OperationID {
+		return errors.New("invalid recursive folder create recovery")
+	}
+	manifest.Kind = RecursiveFolderCreateRecovery
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_create_recoveries(operation_id,source_folder_id,recovered_folder_id,source_relative,target_relative,device,inode,state) SELECT o.operation_id,o.object_id,?,?,?,?,?,? FROM sync_outbox o WHERE o.operation_id=? AND o.object_id=? AND o.object_type='folder' AND o.mutation='create' AND o.status='conflict' AND o.conflict_code IN ('path_collision','parent_unavailable') AND NOT EXISTS(SELECT 1 FROM sync_conflict_states c WHERE c.operation_id=o.operation_id) AND NOT EXISTS(SELECT 1 FROM sync_outbox later WHERE later.sequence>o.sequence AND later.object_id=o.object_id AND later.status IN ('pending','attempted','replay_mismatch','conflict'))`, r.RecoveredFolderID.String(), r.SourceRelative, r.TargetRelative, r.Device, r.Inode, r.State, r.OperationID.String(), r.SourceFolderID.String())
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("recursive folder create recovery unavailable")
+		}
+		return putRecursiveLocalFolderManifestTx(ctx, tx, manifest)
+	})
+}
 
 func (s *Store) ConflictFolderCreateNoteMembers(ctx context.Context, operationID uuid.UUID) ([]ConflictFolderCreateNoteMember, error) {
 	var out []ConflictFolderCreateNoteMember
@@ -324,6 +340,23 @@ func (s *Store) CompleteConflictFolderCreateRecovery(ctx context.Context, r Conf
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
 			return errors.New("folder create recovery completion unavailable")
+		}
+		foundRecursive, recursiveMutations, err := recursiveLocalFolderReplacementMutationsTx(ctx, tx, RecursiveFolderCreateRecovery, r.OperationID, r.RecoveredFolderID, path.Base(r.TargetRelative))
+		if err != nil {
+			return err
+		}
+		if foundRecursive {
+			if err := s.enqueueTx(ctx, tx, recursiveMutations); err != nil {
+				return err
+			}
+			res, err = tx.ExecContext(ctx, `INSERT INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms) SELECT operation_id,'folder_create_collision_recovered',? FROM conflict_folder_create_recoveries WHERE operation_id=? AND state='completed' ON CONFLICT(operation_id) DO NOTHING`, s.clock().UTC().UnixMilli(), r.OperationID.String())
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errors.New("recursive folder create recovery resolution unavailable")
+			}
+			return nil
 		}
 		var rawRootOperation string
 		rootErr := tx.QueryRowContext(ctx, `SELECT new_root_operation_id FROM conflict_folder_create_note_roots WHERE operation_id=?`, r.OperationID.String()).Scan(&rawRootOperation)

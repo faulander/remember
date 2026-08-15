@@ -146,6 +146,22 @@ func (s *Store) PutConflictFolderMoveDeleteRecoveryWithNotes(ctx context.Context
 		return nil
 	})
 }
+func (s *Store) PutConflictFolderMoveDeleteRecoveryWithRecursiveManifest(ctx context.Context, r ConflictFolderMoveDeleteRecovery, manifest ConflictRecursiveLocalFolderManifest) error {
+	if !validFolderMoveDeleteRecovery(r) || r.State != "prepared" || manifest.OperationID != r.OperationID || manifest.NewRootOperationID != r.NewOperationID {
+		return errors.New("invalid recursive folder move/delete recovery")
+	}
+	manifest.Kind = RecursiveFolderMoveDeleteRecovery
+	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_move_delete_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,target_relative,device,inode,canonical_revision,state) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.TargetRelative, r.Device, r.Inode, r.CanonicalRevision, r.State)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("recursive folder move/delete recovery unavailable")
+		}
+		return putRecursiveLocalFolderManifestTx(ctx, tx, manifest)
+	})
+}
 func (s *Store) ConflictFolderMoveDeleteNoteMembers(ctx context.Context, operationID uuid.UUID) ([]ConflictFolderCreateNoteMember, error) {
 	var out []ConflictFolderCreateNoteMember
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
@@ -211,6 +227,23 @@ func (s *Store) CompleteConflictFolderMoveDeleteRecovery(ctx context.Context, r 
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
 			return errors.New("folder move/delete completion unavailable")
+		}
+		foundRecursive, recursiveMutations, err := recursiveLocalFolderReplacementMutationsTx(ctx, tx, RecursiveFolderMoveDeleteRecovery, r.OperationID, r.RecoveredFolderID, path.Base(r.TargetRelative))
+		if err != nil {
+			return err
+		}
+		if foundRecursive {
+			if err := s.enqueueTx(ctx, tx, recursiveMutations); err != nil {
+				return err
+			}
+			res, err = tx.ExecContext(ctx, `INSERT INTO sync_conflict_resolutions(operation_id,resolution,created_at_ms) VALUES(?,'folder_move_deleted_recovered',?)`, r.OperationID.String(), s.clock().UTC().UnixMilli())
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errors.New("recursive folder move/delete resolution unavailable")
+			}
+			return nil
 		}
 		parent := ConflictRecoveredID
 		mutations := []Mutation{{OperationID: r.NewOperationID, Kind: Create, ObjectID: r.RecoveredFolderID, ObjectType: Folder, ParentID: &parent, Name: path.Base(r.TargetRelative)}}

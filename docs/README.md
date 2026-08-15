@@ -87,5 +87,8 @@
 | [0073](adr/0073-m2-authenticated-empty-folder-preserve-delete.md) | Authentifizierte A/B-/Cold-C-Konvergenz für leere Folder Delete/Remote-Move |
 | [0074](adr/0074-m2-direct-empty-folder-preserve-delete.md) | Versioniertes Preserve-and-delete für direkte leere Child-Folder |
 | [0075](adr/0075-m2-direct-note-preserve-delete.md) | Identitätserhaltendes Preserve-and-delete für direkte Notes |
+| [0076](adr/0076-m2-recursive-local-folder-recovery.md) | Rekursive lokale Folder-Recovery für exakt manifestierte Create/Update-DAGs |
+| [0077](adr/0077-m2-recursive-folder-preserve-delete.md) | Atomare rekursive Folder-Delete/Remote-Move-Recovery mit identitätserhaltenden Notes |
+| [0078](adr/0078-m2-recursive-note-inbox-isolation.md) | Ancestry-gebundene Isolation tief verschachtelter Note-Updates/-Deletes |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

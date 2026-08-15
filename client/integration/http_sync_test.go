@@ -284,7 +284,7 @@ func (r *lostPreserveDeleteResponseRemote) PreserveAndDeleteEmptyFolder(ctx cont
 	return result, err
 }
 
-func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testing.T) {
+func TestAuthenticatedRecursiveFolderDeleteAgainstRemoteMoveConverges(t *testing.T) {
 	ctx := context.Background()
 	server, err := integrationtest.New(ctx, t.TempDir())
 	if err != nil {
@@ -314,6 +314,19 @@ func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testin
 	if _, err = a.CreateFolder(ctx, "F/Empty"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = a.CreateFolder(ctx, "F/A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.CreateFolder(ctx, "F/A/B"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.CreateFolder(ctx, "F/A/B/C"); err != nil {
+		t.Fatal(err)
+	}
+	deepNote, _, err := a.CreateNote(ctx, "F/A/B/C/Deep.md", "deep exact body\n", []string{"deep"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	note, _, err := a.CreateNote(ctx, "F/Note.md", "exact preserved body\n", []string{"one", "two"})
 	if err != nil {
 		t.Fatal(err)
@@ -335,11 +348,24 @@ func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testin
 		t.Fatal(err)
 	}
 	expectedNote := append([]byte(nil), raw...)
+	deepNotePath := filepath.Join(rootA, "F", "A", "B", "C", "Deep.md")
+	expectedDeepNote, err := os.ReadFile(deepNotePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	syncTimes(t, ctx, a, remoteA, 1)
 	syncTimes(t, ctx, b, remoteB, 1)
 	folderID := localFolderIDAtPath(t, ctx, rootA, "F")
 	if err = os.Remove(filepath.Join(rootA, "F", "Note.md")); err != nil {
 		t.Fatal(err)
+	}
+	if err = os.Remove(filepath.Join(rootA, "F", "A", "B", "C", "Deep.md")); err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"F/A/B/C", "F/A/B", "F/A"} {
+		if err = os.Remove(filepath.Join(rootA, filepath.FromSlash(relative))); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err = os.Remove(filepath.Join(rootA, "F", "Empty")); err != nil {
 		t.Fatal(err)
@@ -398,6 +424,10 @@ func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testin
 		t.Fatalf("A recovered empty child: %v", err)
 	}
 	assertRememberNoteBytesAndID(t, ctx, a, recoveredPath+"/Note.md", expectedNote, note.ID)
+	if info, err := os.Stat(filepath.Join(rootA, filepath.FromSlash(recoveredPath), "A", "B", "C")); err != nil || !info.IsDir() {
+		t.Fatalf("A recovered depth-3 child: %v", err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, a, recoveredPath+"/A/B/C/Deep.md", expectedDeepNote, deepNote.ID)
 	if _, err := os.Stat(filepath.Join(rootA, "F")); !os.IsNotExist(err) {
 		t.Fatalf("A retained F: %v", err)
 	}
@@ -409,6 +439,10 @@ func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testin
 		t.Fatalf("B recovered empty child: %v", err)
 	}
 	assertRememberNoteBytesAndID(t, ctx, b, recoveredPath+"/Note.md", expectedNote, note.ID)
+	if info, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredPath), "A", "B", "C")); err != nil || !info.IsDir() {
+		t.Fatalf("B recovered depth-3 child: %v", err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, b, recoveredPath+"/A/B/C/Deep.md", expectedDeepNote, deepNote.ID)
 	for _, old := range []string{"F", "RemoteMoved"} {
 		if _, err := os.Stat(filepath.Join(rootB, old)); !os.IsNotExist(err) {
 			t.Fatalf("B retained %s: %v", old, err)
@@ -426,9 +460,130 @@ func TestAuthenticatedDirectNoteFolderDeleteAgainstRemoteMoveConverges(t *testin
 		t.Fatalf("C recovered empty child: %v", err)
 	}
 	assertRememberNoteBytesAndID(t, ctx, c, recoveredPath+"/Note.md", expectedNote, note.ID)
+	if info, err := os.Stat(filepath.Join(rootC, filepath.FromSlash(recoveredPath), "A", "B", "C")); err != nil || !info.IsDir() {
+		t.Fatalf("C recovered depth-3 child: %v", err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, c, recoveredPath+"/A/B/C/Deep.md", expectedDeepNote, deepNote.ID)
 	if _, err := os.Stat(filepath.Join(rootC, "RemoteMoved")); !os.IsNotExist(err) {
 		t.Fatalf("C retained original: %v", err)
 	}
+}
+
+func TestAuthenticatedRecursiveFolderCreateCollisionConvergesAcrossRestartsAndColdClient(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "recursive-create@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Recursive Create A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Recursive Create B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "Tree"); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	for _, relative := range []string{"Tree", "Tree/A", "Tree/A/B", "Tree/Sibling"} {
+		if _, err := b.CreateFolder(ctx, relative); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deep, _, err := b.CreateNote(ctx, "Tree/A/B/Note.md", "recursive deep exact\n", []string{"deep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibling, _, err := b.CreateNote(ctx, "Tree/Sibling/Other.md", "recursive sibling exact\n", []string{"sibling"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deepBytes, err := os.ReadFile(filepath.Join(rootB, "Tree", "A", "B", "Note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingBytes, err := os.ReadFile(filepath.Join(rootB, "Tree", "Sibling", "Other.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRootID := localFolderIDAtPath(t, ctx, rootB, "Tree")
+	folderAID := localFolderIDAtPath(t, ctx, rootB, "Tree/A")
+	folderBID := localFolderIDAtPath(t, ctx, rootB, "Tree/A/B")
+	siblingFolderID := localFolderIDAtPath(t, ctx, rootB, "Tree/Sibling")
+	for restart := range 2 {
+		for attempt := range 3 {
+			if err := b.SyncOnce(ctx, remoteB); err != nil && !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+				t.Fatalf("recursive recovery restart=%d attempt=%d: %v", restart, attempt, err)
+			}
+		}
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+		b, _, err = clientapp.Open(ctx, rootB)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer b.Close()
+	for attempt := range 6 {
+		if err := b.SyncOnce(ctx, remoteB); err != nil && !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+			t.Fatalf("recursive recovery completion %d: %v", attempt, err)
+		}
+		if err := a.SyncOnce(ctx, remoteA); err != nil && !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+			t.Fatalf("recursive recovery pull %d: %v", attempt, err)
+		}
+	}
+	states := httpSyncStates(t, ctx, remoteA)
+	recoveredName := ""
+	recoveredRootID := uuid.Nil
+	for id, state := range states {
+		if state.ObjectType == clientsync.Folder && !state.Deleted && state.ParentID != nil && *state.ParentID == clientsync.ConflictRecoveredID && strings.HasPrefix(state.Name, "Tree (Konflikt - ") {
+			if recoveredRootID != uuid.Nil {
+				t.Fatal("multiple recursive recovered roots")
+			}
+			recoveredRootID, recoveredName = id, state.Name
+		}
+	}
+	if recoveredRootID == uuid.Nil || recoveredRootID == oldRootID {
+		t.Fatalf("recovered root id=%s old=%s", recoveredRootID, oldRootID)
+	}
+	recovered := filepath.ToSlash(filepath.Join(clientsync.ConflictRootName, clientsync.ConflictRecoveredName, recoveredName))
+	for label, core := range map[string]*clientapp.LocalCore{"A": a, "B": b} {
+		if got := localFolderIDAtPath(t, ctx, core.Root(), recovered+"/A"); got != folderAID {
+			t.Fatalf("%s A id=%s want=%s", label, got, folderAID)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), recovered+"/A/B"); got != folderBID {
+			t.Fatalf("%s B id=%s want=%s", label, got, folderBID)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), recovered+"/Sibling"); got != siblingFolderID {
+			t.Fatalf("%s sibling id=%s want=%s", label, got, siblingFolderID)
+		}
+		assertRememberNoteBytesAndID(t, ctx, core, recovered+"/A/B/Note.md", deepBytes, deep.ID)
+		assertRememberNoteBytesAndID(t, ctx, core, recovered+"/Sibling/Other.md", siblingBytes, sibling.ID)
+	}
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Recursive Create C"))
+	c, _, err := clientapp.Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	if got := localFolderIDAtPath(t, ctx, c.Root(), recovered+"/A/B"); got != folderBID {
+		t.Fatalf("cold B id=%s want=%s", got, folderBID)
+	}
+	assertRememberNoteBytesAndID(t, ctx, c, recovered+"/A/B/Note.md", deepBytes, deep.ID)
+	assertRememberNoteBytesAndID(t, ctx, c, recovered+"/Sibling/Other.md", siblingBytes, sibling.ID)
 }
 
 func TestAuthenticatedEmptyDivergentFolderMovesConverge(t *testing.T) {

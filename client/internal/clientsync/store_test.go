@@ -1073,6 +1073,25 @@ func putInboxRootFolder(t *testing.T, index *localindex.Index, folder uuid.UUID)
 	}
 }
 
+func putInboxFolder(t *testing.T, index *localindex.Index, folder uuid.UUID, parent *uuid.UUID, relative string, device, inode uint64) uuid.UUID {
+	t.Helper()
+	operation := uuid.Must(uuid.NewV7())
+	var parentID any
+	if parent != nil {
+		parentID = parent.String()
+	}
+	if err := index.WithTransaction(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO objects(object_id,object_type,relative_path,collision_path,parent_id,folder_device,folder_inode,identity_state) VALUES(?,'folder',?,?,?,?,?,'known')`, folder.String(), relative, relative, parentID, device, inode); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,1,?)`, folder.String(), operation.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return operation
+}
+
 func putStoredInboxChange(t *testing.T, index *localindex.Index, change Change) {
 	t.Helper()
 	var parent, blob any
@@ -1121,6 +1140,18 @@ func TestInboxApplyPlanCompletesOutOfOrderWithoutSkippingFrontier(t *testing.T) 
 	putInboxBaseline(t, index, y, 1)
 	yPlan := uuid.Must(uuid.NewV7())
 	if err := store.CreateInboxApplyPlan(ctx, 2, yPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRow(`SELECT count(*) FROM sync_inbox_parent_bindings WHERE plan_id=?`, yPlan.String()).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			t.Fatalf("root plan persisted %d ancestry rows", count)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	active, err := store.ActiveApplyPlan(ctx)
@@ -1797,8 +1828,262 @@ func TestDirectChildInboxChainReselectsAfterReopen(t *testing.T) {
 	}
 }
 
+func TestRecursiveInboxDepthThreeBindsChainAndReselectsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "recursive-inbox.db")
+	index, err := localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewStore(index)
+	root, middle, parent := uuid.New(), uuid.New(), uuid.New()
+	blocked, note := uuid.New(), uuid.New()
+	rootOperation := putInboxFolder(t, index, root, nil, "Root", 101, 201)
+	middleOperation := putInboxFolder(t, index, middle, &root, "Root/Middle", 102, 202)
+	parentOperation := putInboxFolder(t, index, parent, &middle, "Root/Middle/Parent", 103, 203)
+	putInboxBaseline(t, index, note, 1)
+	changes := []Change{
+		inboxNoteChange(t, 1, 2, blocked, Update, nil, "Blocked.md"),
+		inboxNoteChange(t, 2, 2, note, Update, &parent, "Nested.md"),
+		inboxNoteChange(t, 3, 3, note, Delete, &parent, "Nested.md"),
+	}
+	if err := store.IngestPullPage(ctx, 0, 3, changes); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListIndependentInboxCandidates(ctx, 1)
+	if err != nil || len(items) != 1 || items[0].Change.Cursor != 2 {
+		t.Fatalf("paginated candidates=%#v err=%v", items, err)
+	}
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 2, plan); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.ActiveInboxParentBinding(ctx, plan)
+	if err != nil || binding == nil || binding.ParentID != parent || binding.RelativePath != "Root/Middle/Parent" || binding.Device != 103 || binding.Inode != 203 {
+		t.Fatalf("immediate binding=%#v err=%v", binding, err)
+	}
+	type ancestryRow struct {
+		depth         int
+		id            string
+		parent        sql.NullString
+		relative      string
+		device, inode uint64
+		revision      uint64
+		operation     string
+	}
+	var ancestry []ancestryRow
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.Query(`SELECT depth,ancestor_id,ancestor_parent_id,ancestor_relative,device,inode,baseline_revision,baseline_operation_id
+			FROM sync_inbox_parent_bindings WHERE plan_id=? ORDER BY depth`, plan.String())
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var row ancestryRow
+			if err := rows.Scan(&row.depth, &row.id, &row.parent, &row.relative, &row.device, &row.inode, &row.revision, &row.operation); err != nil {
+				return err
+			}
+			ancestry = append(ancestry, row)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ancestry) != 3 ||
+		ancestry[0].depth != 1 || ancestry[0].id != parent.String() || ancestry[0].parent.String != middle.String() || ancestry[0].relative != "Root/Middle/Parent" || ancestry[0].device != 103 || ancestry[0].inode != 203 || ancestry[0].revision != 1 || ancestry[0].operation != parentOperation.String() ||
+		ancestry[1].depth != 2 || ancestry[1].id != middle.String() || ancestry[1].parent.String != root.String() || ancestry[1].relative != "Root/Middle" || ancestry[1].device != 102 || ancestry[1].inode != 202 || ancestry[1].revision != 1 || ancestry[1].operation != middleOperation.String() ||
+		ancestry[2].depth != 3 || ancestry[2].id != root.String() || ancestry[2].parent.Valid || ancestry[2].relative != "Root" || ancestry[2].device != 101 || ancestry[2].inode != 201 || ancestry[2].revision != 1 || ancestry[2].operation != rootOperation.String() {
+		t.Fatalf("ancestry=%#v", ancestry)
+	}
+	applyInboxPlan(t, store, plan)
+	if confirmed, err := store.ConfirmedCursor(ctx); err != nil || confirmed != 0 {
+		t.Fatalf("confirmed prefix changed=%d err=%v", confirmed, err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	index, err = localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ = NewStore(index)
+	items, err = store.ListIndependentInboxCandidates(ctx, 1)
+	if err != nil || len(items) != 1 || items[0].Change.Cursor != 3 || items[0].Change.ObjectID != note || items[0].Change.Mutation != Delete {
+		t.Fatalf("restart candidates=%#v err=%v", items, err)
+	}
+}
+
+func TestRecursiveInboxAncestorGuardsSelection(t *testing.T) {
+	for _, invariant := range []string{"missing", "cycle", "unknown replacement", "missing baseline operation", "unresolved intent", "earlier remote move"} {
+		t.Run(invariant, func(t *testing.T) {
+			ctx := context.Background()
+			index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "recursive-selection.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer index.Close()
+			store, _ := NewStore(index)
+			root, middle, parent, note := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			putInboxFolder(t, index, root, nil, "Root", 101, 201)
+			putInboxFolder(t, index, middle, &root, "Root/Middle", 102, 202)
+			putInboxFolder(t, index, parent, &middle, "Root/Middle/Parent", 103, 203)
+			putInboxBaseline(t, index, note, 1)
+			change := inboxNoteChange(t, 2, 2, note, Update, &parent, "Nested.md")
+			putStoredInboxChange(t, index, change)
+			if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				switch invariant {
+				case "missing":
+					_, err := tx.Exec(`DELETE FROM objects WHERE object_id=?`, root.String())
+					return err
+				case "cycle":
+					_, err := tx.Exec(`UPDATE objects SET parent_id=? WHERE object_id=?`, parent.String(), root.String())
+					return err
+				case "unknown replacement":
+					_, err := tx.Exec(`UPDATE objects SET identity_state='pending' WHERE object_id=?`, middle.String())
+					return err
+				case "missing baseline operation":
+					_, err := tx.Exec(`UPDATE sync_baselines SET operation_id=NULL WHERE object_id=?`, root.String())
+					return err
+				case "unresolved intent":
+					_, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,created_at_ms) VALUES(?,'delete',?,'folder',1,NULL,'',NULL,'pending',1)`, uuid.Must(uuid.NewV7()).String(), root.String())
+					return err
+				case "earlier remote move":
+					_, err := tx.Exec(`INSERT INTO sync_inbox_changes(cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,deleted,state,ingested_at_ms) VALUES(1,?,?,'move','folder',2,NULL,'Root',NULL,0,'pending',1)`, uuid.Must(uuid.NewV7()).String(), middle.String())
+					return err
+				default:
+					return errors.New("unknown recursive selection invariant")
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+			if err != nil || len(items) != 0 {
+				t.Fatalf("ineligible candidates=%#v err=%v", items, err)
+			}
+			if err := store.CreateInboxApplyPlan(ctx, change.Cursor, uuid.Must(uuid.NewV7())); err == nil {
+				t.Fatal("recursive plan accepted invalid ancestry")
+			}
+		})
+	}
+}
+
+func TestRecursiveInboxDepthLimitFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "recursive-depth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	var parent *uuid.UUID
+	var immediate uuid.UUID
+	relative := ""
+	for depth := 1; depth <= 257; depth++ {
+		folder := uuid.New()
+		if relative == "" {
+			relative = fmt.Sprintf("F%03d", depth)
+		} else {
+			relative += fmt.Sprintf("/F%03d", depth)
+		}
+		putInboxFolder(t, index, folder, parent, relative, uint64(1000+depth), uint64(2000+depth))
+		immediate = folder
+		parent = &immediate
+	}
+	note := uuid.New()
+	putInboxBaseline(t, index, note, 1)
+	change := inboxNoteChange(t, 1, 2, note, Update, &immediate, "Nested.md")
+	putStoredInboxChange(t, index, change)
+	items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("over-depth candidates=%#v err=%v", items, err)
+	}
+	if err := store.CreateInboxApplyPlan(ctx, change.Cursor, uuid.Must(uuid.NewV7())); err == nil {
+		t.Fatal("recursive plan accepted ancestry deeper than 256")
+	}
+}
+
+func TestRecursiveInboxAncestorChangesRejectPreparedAndApplyingResume(t *testing.T) {
+	for _, invariant := range []string{"move", "replacement", "baseline revision", "baseline operation", "unresolved intent"} {
+		for _, applying := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/applying=%t", invariant, applying), func(t *testing.T) {
+				ctx := context.Background()
+				index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "recursive-resume.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer index.Close()
+				store, _ := NewStore(index)
+				root, middle, parent, note := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+				putInboxFolder(t, index, root, nil, "Root", 101, 201)
+				putInboxFolder(t, index, middle, &root, "Root/Middle", 102, 202)
+				putInboxFolder(t, index, parent, &middle, "Root/Middle/Parent", 103, 203)
+				putInboxBaseline(t, index, note, 1)
+				change := inboxNoteChange(t, 1, 2, note, Update, &parent, "Nested.md")
+				putStoredInboxChange(t, index, change)
+				plan := uuid.Must(uuid.NewV7())
+				if err := store.CreateInboxApplyPlan(ctx, change.Cursor, plan); err != nil {
+					t.Fatal(err)
+				}
+				if applying {
+					if err := store.BeginApplyPlan(ctx, plan); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+					switch invariant {
+					case "move":
+						_, err := tx.Exec(`UPDATE objects SET relative_path='Moved/Middle' WHERE object_id=?`, middle.String())
+						return err
+					case "replacement":
+						_, err := tx.Exec(`UPDATE objects SET folder_device=902,folder_inode=903 WHERE object_id=?`, root.String())
+						return err
+					case "baseline revision":
+						_, err := tx.Exec(`UPDATE sync_baselines SET revision=revision+1 WHERE object_id=?`, middle.String())
+						return err
+					case "baseline operation":
+						_, err := tx.Exec(`UPDATE sync_baselines SET operation_id=? WHERE object_id=?`, uuid.Must(uuid.NewV7()).String(), root.String())
+						return err
+					case "unresolved intent":
+						_, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,created_at_ms) VALUES(?,'delete',?,'folder',1,NULL,'',NULL,'pending',1)`, uuid.Must(uuid.NewV7()).String(), middle.String())
+						return err
+					default:
+						return errors.New("unknown recursive resume invariant")
+					}
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.ActiveInboxParentBinding(ctx, plan); err == nil {
+					t.Fatal("active binding accepted changed ancestry")
+				}
+				if err := store.BeginApplyPlan(ctx, plan); err == nil {
+					t.Fatal("begin/resume accepted changed ancestry")
+				}
+				if !applying {
+					if err := store.AbandonPreparedInboxPlan(ctx, plan); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.RetryAbandonedInboxPlan(ctx, plan); err == nil {
+						t.Fatal("retry accepted changed ancestry")
+					}
+				}
+				if applying {
+					if err := store.MarkApplyStepApplied(ctx, plan, 0); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.CompleteApplyPlan(ctx, plan); err == nil {
+						t.Fatal("completion accepted changed ancestry")
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestDirectChildInboxParentInvariantsGuardSelectionLinkAndRetry(t *testing.T) {
-	for _, invariant := range []string{"deeper", "missing", "non-folder", "unknown", "unobserved", "missing device", "missing inode", "zero device", "zero inode", "unbaselined", "zero baseline", "locally conflicted", "earlier remote change"} {
+	for _, invariant := range []string{"missing", "non-folder", "unknown", "unobserved", "missing device", "missing inode", "zero device", "zero inode", "unbaselined", "zero baseline", "locally conflicted", "earlier remote change"} {
 		t.Run(invariant, func(t *testing.T) {
 			ctx := context.Background()
 			index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
@@ -1807,7 +2092,7 @@ func TestDirectChildInboxParentInvariantsGuardSelectionLinkAndRetry(t *testing.T
 			}
 			defer index.Close()
 			store, _ := NewStore(index)
-			parent, note, ancestor := uuid.New(), uuid.New(), uuid.New()
+			parent, note := uuid.New(), uuid.New()
 			putInboxRootFolder(t, index, parent)
 			putInboxBaseline(t, index, note, 1)
 			change := inboxNoteChange(t, 3, 2, note, Update, &parent, "Nested.md")
@@ -1816,13 +2101,6 @@ func TestDirectChildInboxParentInvariantsGuardSelectionLinkAndRetry(t *testing.T
 			setEligible := func(eligible bool, phase int) error {
 				return index.WithTransaction(ctx, func(tx *sql.Tx) error {
 					switch invariant {
-					case "deeper":
-						var parentID any
-						if !eligible {
-							parentID = ancestor.String()
-						}
-						_, err := tx.Exec(`UPDATE objects SET parent_id=? WHERE object_id=?`, parentID, parent.String())
-						return err
 					case "missing":
 						if !eligible {
 							_, err := tx.Exec(`DELETE FROM objects WHERE object_id=?`, parent.String())
@@ -2158,10 +2436,10 @@ func TestDirectNotePreserveDeleteResolutionSealsExactMappings(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepared, err := store.PrepareFolderPreserveDelete(ctx, conflict, resolution, 9)
-	if err != nil || prepared.RequestVersion != 3 {
+	if err != nil || prepared.RequestVersion != 4 {
 		t.Fatalf("prepared=%#v %v", prepared, err)
 	}
-	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 13, SourceRevision: 1, Name: "Empty"}}
+	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, SourceParentID: root, TargetParentID: recoveredRoot, CreateCursor: 11, DeleteCursor: 13, SourceRevision: 1, Depth: 1, Name: "Empty"}}
 	notes := []FolderPreserveDeleteNoteMove{{NoteID: note, SourceParentID: root, TargetParentID: recoveredRoot, MoveCursor: 12, SourceRevision: 1, TargetRevision: 2, Name: "N.md", BlobHash: hash}}
 	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 14, clones, notes); err != nil {
 		t.Fatal(err)
@@ -2233,11 +2511,11 @@ func TestDirectFolderPreserveDeleteResolutionBindsSpanAndClones(t *testing.T) {
 		t.Fatal(err)
 	}
 	promotedID := uuid.Must(uuid.NewV7())
-	prepared, err := store.PromotePreparedFolderPreserveDeleteV3(ctx, conflict, promotedID, 9)
-	if err != nil || prepared.KnownCursor != 9 || prepared.RequestVersion != 3 || prepared.ResolutionOperationID != promotedID {
+	prepared, err := store.PromotePreparedFolderPreserveDeleteV4(ctx, conflict, promotedID, 9)
+	if err != nil || prepared.KnownCursor != 9 || prepared.RequestVersion != 4 || prepared.ResolutionOperationID != promotedID {
 		t.Fatalf("promoted=%#v err=%v", prepared, err)
 	}
-	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 12, SourceRevision: 1, Name: "Child"}}
+	clones := []FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, SourceParentID: root, TargetParentID: recoveredRoot, CreateCursor: 11, DeleteCursor: 12, SourceRevision: 1, Depth: 1, Name: "Child"}}
 	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 13, clones, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -2292,5 +2570,49 @@ func TestDirectFolderPreserveDeleteResolutionBindsSpanAndClones(t *testing.T) {
 	}
 	if matchedDelete, err = store.FolderPreserveDeleteMatches(ctx, Change{Cursor: 13, Mutation: Delete, ObjectID: root, ObjectType: Folder, Revision: 3, Deleted: true, Name: "Substituted"}); err != nil || matchedDelete {
 		t.Fatalf("substituted root delete match=%t err=%v", matchedDelete, err)
+	}
+}
+
+func TestRecursivePreserveDeleteManifestValidation(t *testing.T) {
+	root, recoveredRoot := uuid.New(), uuid.New()
+	a, b, c := uuid.New(), uuid.New(), uuid.New()
+	recoveredA, recoveredB, recoveredC := uuid.New(), uuid.New(), uuid.New()
+	note := uuid.New()
+	hash := sha256.Sum256([]byte("exact"))
+	clones := []FolderPreserveDeleteClone{
+		{OriginalFolderID: a, RecoveredFolderID: recoveredA, SourceParentID: root, TargetParentID: recoveredRoot, CreateCursor: 11, DeleteCursor: 17, SourceRevision: 1, Depth: 1, Name: "A"},
+		{OriginalFolderID: b, RecoveredFolderID: recoveredB, SourceParentID: a, TargetParentID: recoveredA, CreateCursor: 12, DeleteCursor: 16, SourceRevision: 2, Depth: 2, Name: "B"},
+		{OriginalFolderID: c, RecoveredFolderID: recoveredC, SourceParentID: b, TargetParentID: recoveredB, CreateCursor: 13, DeleteCursor: 15, SourceRevision: 3, Depth: 3, Name: "C"},
+	}
+	notes := []FolderPreserveDeleteNoteMove{{NoteID: note, SourceParentID: c, TargetParentID: recoveredC, MoveCursor: 14, SourceRevision: 4, TargetRevision: 5, Name: "N.md", BlobHash: hash[:]}}
+	if err := validateFolderPreserveDeleteCompletion(4, root, recoveredRoot, "Recovered", 10, 18, clones, notes); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]func([]FolderPreserveDeleteClone, []FolderPreserveDeleteNoteMove){
+		"parent": func(items []FolderPreserveDeleteClone, _ []FolderPreserveDeleteNoteMove) {
+			items[1].SourceParentID = root
+		},
+		"target": func(items []FolderPreserveDeleteClone, _ []FolderPreserveDeleteNoteMove) {
+			items[2].TargetParentID = recoveredRoot
+		},
+		"depth":  func(items []FolderPreserveDeleteClone, _ []FolderPreserveDeleteNoteMove) { items[2].Depth = 2 },
+		"cursor": func(items []FolderPreserveDeleteClone, _ []FolderPreserveDeleteNoteMove) { items[2].DeleteCursor = 17 },
+		"tree order": func(items []FolderPreserveDeleteClone, _ []FolderPreserveDeleteNoteMove) {
+			items[2].DeleteCursor = 17
+			items[0].DeleteCursor = 15
+		},
+		"note parent": func(_ []FolderPreserveDeleteClone, items []FolderPreserveDeleteNoteMove) {
+			items[0].TargetParentID = recoveredRoot
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			badClones := append([]FolderPreserveDeleteClone(nil), clones...)
+			badNotes := append([]FolderPreserveDeleteNoteMove(nil), notes...)
+			mutate(badClones, badNotes)
+			if err := validateFolderPreserveDeleteCompletion(4, root, recoveredRoot, "Recovered", 10, 18, badClones, badNotes); err == nil {
+				t.Fatal("malformed manifest accepted")
+			}
+		})
 	}
 }

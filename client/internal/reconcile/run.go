@@ -431,7 +431,14 @@ func reconcileFolders(
 	// exist. A plain deletion with no replacement candidate remains a deletion.
 	if len(unresolvedCurrent) > 0 {
 		for _, oldPath := range unresolvedOld {
-			if _, deleted := trustedRemoteFolderDeletes[oldPath]; deleted {
+			trustedDelete := false
+			for source := range trustedRemoteFolderDeletes {
+				if oldPath == source || strings.HasPrefix(oldPath, source+"/") {
+					trustedDelete = true
+					break
+				}
+			}
+			if trustedDelete {
 				continue
 			}
 			old := previous[oldPath]

@@ -2608,58 +2608,68 @@ func TestSyncOnceRestoresChangedDirectNoteRecoveryTarget(t *testing.T) {
 	}
 }
 
-func TestSyncOnceRejectsUnsupportedNonemptyFolderCreateRecovery(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		build func(*testing.T, *LocalCore)
-	}{{"nested", func(t *testing.T, c *LocalCore) {
-		if _, err := c.CreateFolder(context.Background(), "Same/Nested"); err != nil {
-			t.Fatal(err)
+func TestSyncOnceRecoversRecursiveFolderCreatePathCollision(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	a, _, err := Initialize(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	rootB := t.TempDir()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Same"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Same/Nested"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := b.CreateNote(ctx, "Same/Nested/N.md", "nested exact\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := os.ReadFile(filepath.Join(rootB, "Same", "Nested", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4 {
+		if err := b.SyncOnce(ctx, remote); err != nil && !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("recursive create recovery %d: %v", i, err)
 		}
-		if _, _, err := c.CreateNote(context.Background(), "Same/Nested/N.md", "nested\n", nil); err != nil {
-			t.Fatal(err)
+	}
+	snapshot, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonical, recoveredRoot, recoveredNote localindex.Object
+	for _, object := range snapshot.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "Same" {
+			canonical = object
 		}
-	}}} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
-			remote := &memoryRemote{server: server}
-			a, _, err := Initialize(ctx, t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer a.Close()
-			root := t.TempDir()
-			b, _, err := Initialize(ctx, root)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer b.Close()
-			if _, err := a.CreateFolder(ctx, "Same"); err != nil {
-				t.Fatal(err)
-			}
-			if err := a.SyncOnce(ctx, remote); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := b.CreateFolder(ctx, "Same"); err != nil {
-				t.Fatal(err)
-			}
-			tc.build(t, b)
-			before, err := os.ReadDir(filepath.Join(root, "Same"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := b.SyncOnce(ctx, remote); err == nil {
-				t.Fatal("unsupported subtree recovered")
-			}
-			after, err := os.ReadDir(filepath.Join(root, "Same"))
-			if err != nil || len(after) != len(before) {
-				t.Fatalf("unsupported subtree changed before=%d after=%d err=%v", len(before), len(after), err)
-			}
-			if _, err := os.Stat(filepath.Join(root, clientsync.ConflictRootName, clientsync.ConflictRecoveredName)); err != nil {
-				t.Fatalf("conflict namespace unavailable: %v", err)
-			}
-		})
+		if object.Type == localindex.ObjectFolder && strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Same (Konflikt - ") && !strings.Contains(strings.TrimPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/"), "/") {
+			recoveredRoot = object
+		}
+		if object.ID == note.ID {
+			recoveredNote = object
+		}
+	}
+	if canonical.ID == uuid.Nil || recoveredRoot.ID == uuid.Nil || recoveredNote.ID != note.ID || !strings.HasPrefix(recoveredNote.RelativePath, recoveredRoot.RelativePath+"/Nested/") {
+		t.Fatalf("canonical=%#v recovered root=%#v note=%#v", canonical, recoveredRoot, recoveredNote)
+	}
+	actual, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil || !bytes.Equal(actual, expected) {
+		t.Fatalf("recursive create bytes=%q err=%v", actual, err)
 	}
 }
 
@@ -3130,7 +3140,7 @@ func TestSyncOnceRecoversDirectNotesInFolderMoveAgainstRemoteDelete(t *testing.T
 	}
 }
 
-func TestSyncOnceRejectsNonemptyFolderMoveAgainstRemoteDelete(t *testing.T) {
+func TestSyncOnceRecoversRecursiveFolderMoveAgainstRemoteDelete(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
 	remote := &memoryRemote{server: server}
@@ -3172,15 +3182,38 @@ func TestSyncOnceRejectsNonemptyFolderMoveAgainstRemoteDelete(t *testing.T) {
 	if _, err := b.CreateFolder(ctx, "Local/Nested"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := b.CreateNote(ctx, "Local/Nested/N.md", "must remain\n", nil); err != nil {
+	note, _, err := b.CreateNote(ctx, "Local/Nested/N.md", "must remain exact\n", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SyncOnce(ctx, remote); err == nil {
-		t.Fatal("nested moved folder recovered")
+	expected, err := os.ReadFile(filepath.Join(rootB, "Local", "Nested", "N.md"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	content, err := os.ReadFile(filepath.Join(rootB, "Local", "Nested", "N.md"))
-	if err != nil || !bytes.Contains(content, []byte("must remain")) {
-		t.Fatalf("nonempty move bytes=%q err=%v", content, err)
+	for i := range 5 {
+		if err := b.SyncOnce(ctx, remote); err != nil && !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("recursive move/delete recovery %d: %v", i, err)
+		}
+	}
+	snapshot, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveredRoot, recoveredNote localindex.Object
+	for _, object := range snapshot.Objects {
+		if object.Type == localindex.ObjectFolder && strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Local (Konflikt - ") && !strings.Contains(strings.TrimPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/"), "/") {
+			recoveredRoot = object
+		}
+		if object.ID == note.ID {
+			recoveredNote = object
+		}
+	}
+	if recoveredRoot.ID == uuid.Nil || recoveredNote.ID != note.ID || !strings.HasPrefix(recoveredNote.RelativePath, recoveredRoot.RelativePath+"/Nested/") {
+		t.Fatalf("recovered root=%#v note=%#v", recoveredRoot, recoveredNote)
+	}
+	actual, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil || !bytes.Equal(actual, expected) {
+		t.Fatalf("recursive move/delete bytes=%q err=%v", actual, err)
 	}
 }
 
@@ -4106,7 +4139,7 @@ func TestSyncOnceRecoversEditedDirectNoteInDivergentRootFolderMove(t *testing.T)
 }
 
 func TestSyncOnceRejectsUnsafeDivergentDirectNoteRecoveries(t *testing.T) {
-	cases := []string{"branch", "attempted", "nested", "unindexed"}
+	cases := []string{"branch", "attempted", "unindexed"}
 	for _, kind := range cases {
 		t.Run(kind, func(t *testing.T) {
 			ctx := context.Background()
@@ -4239,6 +4272,103 @@ func TestSyncOnceRejectsUnsafeDivergentDirectNoteRecoveries(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSyncOnceRecoversRecursiveDivergentFolderMove(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var folderID uuid.UUID
+	for _, object := range initial.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "F" {
+			folderID = object.ID
+		}
+	}
+	if folderID == uuid.Nil {
+		t.Fatal("initial folder identity missing")
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootB, b.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CreateFolder(ctx, "Local/Sub"); err != nil {
+		t.Fatal(err)
+	}
+	local, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var subID uuid.UUID
+	for _, object := range local.Objects {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "Local/Sub" {
+			subID = object.ID
+		}
+	}
+	if subID == uuid.Nil {
+		t.Fatal("nested folder identity missing")
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcile.Run(ctx, rootA, a.index, reconcile.Options{MoveCandidates: []string{"F"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		if err := b.SyncOnce(ctx, remote); err != nil && !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("recursive divergent recovery %d: %v", i, err)
+		}
+	}
+	final, err := b.index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonical, recoveredRoot, recoveredSub localindex.Object
+	for _, object := range final.Objects {
+		if object.ID == folderID && object.RelativePath == "Server" {
+			canonical = object
+		}
+		if object.Type == localindex.ObjectFolder && strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/Local (Konflikt - ") && !strings.Contains(strings.TrimPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/"), "/") {
+			recoveredRoot = object
+		}
+		if object.ID == subID {
+			recoveredSub = object
+		}
+	}
+	if canonical.ID != folderID || recoveredRoot.ID == uuid.Nil || recoveredSub.ID != subID || recoveredSub.ParentID != recoveredRoot.ID || recoveredSub.RelativePath != recoveredRoot.RelativePath+"/Sub" {
+		t.Fatalf("canonical=%#v recovered root=%#v sub=%#v", canonical, recoveredRoot, recoveredSub)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recoveredSub.RelativePath))); err != nil {
+		t.Fatalf("recovered nested folder missing: %v", err)
 	}
 }
 
@@ -5049,7 +5179,7 @@ func TestSyncOnceAppliesIndependentRootNotesBehindUnresolvedIntent(t *testing.T)
 	}
 }
 
-func TestSyncOnceAppliesNestedNotesBehindUnrelatedUnresolvedIntent(t *testing.T) {
+func TestSyncOnceAppliesRecursiveNotesBehindUnrelatedUnresolvedIntent(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "Blocked.md"), []byte("blocked base\n"), 0o600); err != nil {
@@ -5062,11 +5192,17 @@ func TestSyncOnceAppliesNestedNotesBehindUnrelatedUnresolvedIntent(t *testing.T)
 	if _, err := core.CreateFolder(ctx, "Folder"); err != nil {
 		t.Fatal(err)
 	}
-	updated, _, err := core.CreateNote(ctx, "Folder/Updated.md", "updated base\n", nil)
+	if _, err := core.CreateFolder(ctx, "Folder/Middle"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.CreateFolder(ctx, "Folder/Middle/Parent"); err != nil {
+		t.Fatal(err)
+	}
+	updated, _, err := core.CreateNote(ctx, "Folder/Middle/Parent/Updated.md", "updated base\n", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleted, _, err := core.CreateNote(ctx, "Folder/Deleted.md", "deleted base\n", nil)
+	deleted, _, err := core.CreateNote(ctx, "Folder/Middle/Parent/Deleted.md", "deleted base\n", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5076,7 +5212,7 @@ func TestSyncOnceAppliesNestedNotesBehindUnrelatedUnresolvedIntent(t *testing.T)
 	}
 	var folderID uuid.UUID
 	for _, object := range snapshot.Objects {
-		if object.Type == localindex.ObjectFolder && object.RelativePath == "Folder" {
+		if object.Type == localindex.ObjectFolder && object.RelativePath == "Folder/Middle/Parent" {
 			folderID = object.ID
 			break
 		}
@@ -5153,22 +5289,22 @@ func TestSyncOnceAppliesNestedNotesBehindUnrelatedUnresolvedIntent(t *testing.T)
 	if len(server.pullAfters)-pullStart < 4 {
 		t.Fatalf("nested pull was not paginated: %v", server.pullAfters[pullStart:])
 	}
-	gotUpdated, err := os.ReadFile(filepath.Join(root, "Folder", "Updated.md"))
+	gotUpdated, err := os.ReadFile(filepath.Join(root, "Folder", "Middle", "Parent", "Updated.md"))
 	if err != nil || !bytes.Equal(gotUpdated, updatedV3Bytes) {
 		t.Fatalf("updated bytes=%q err=%v", gotUpdated, err)
 	}
-	updatedDocument, err := core.ReadNote(ctx, "Folder/Updated.md")
+	updatedDocument, err := core.ReadNote(ctx, "Folder/Middle/Parent/Updated.md")
 	if err != nil || updatedDocument.ID != updated.ID {
 		t.Fatalf("updated document=%#v err=%v", updatedDocument, err)
 	}
-	updatedBeforeRestart, err := os.Stat(filepath.Join(root, "Folder", "Updated.md"))
+	updatedBeforeRestart, err := os.Stat(filepath.Join(root, "Folder", "Middle", "Parent", "Updated.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "Folder", "Deleted.md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "Folder", "Middle", "Parent", "Deleted.md")); !os.IsNotExist(err) {
 		t.Fatalf("nested delete=%v", err)
 	}
-	if _, err := core.ReadNote(ctx, "Folder/Deleted.md"); err == nil {
+	if _, err := core.ReadNote(ctx, "Folder/Middle/Parent/Deleted.md"); err == nil {
 		t.Fatal("deleted nested note remains readable")
 	}
 	downloaded, err := store.DownloadedCursor(ctx)
@@ -5217,15 +5353,15 @@ func TestSyncOnceAppliesNestedNotesBehindUnrelatedUnresolvedIntent(t *testing.T)
 	if len(server.pullAfters) <= beforeRestartPulls || server.pullAfters[beforeRestartPulls] != downloaded {
 		t.Fatalf("restart pulls=%v downloaded=%d", server.pullAfters[beforeRestartPulls:], downloaded)
 	}
-	gotUpdated, err = os.ReadFile(filepath.Join(root, "Folder", "Updated.md"))
+	gotUpdated, err = os.ReadFile(filepath.Join(root, "Folder", "Middle", "Parent", "Updated.md"))
 	if err != nil || !bytes.Equal(gotUpdated, updatedV3Bytes) {
 		t.Fatalf("updated bytes after restart=%q err=%v", gotUpdated, err)
 	}
-	updatedAfterRestart, err := os.Stat(filepath.Join(root, "Folder", "Updated.md"))
+	updatedAfterRestart, err := os.Stat(filepath.Join(root, "Folder", "Middle", "Parent", "Updated.md"))
 	if err != nil || !os.SameFile(updatedBeforeRestart, updatedAfterRestart) || !updatedBeforeRestart.ModTime().Equal(updatedAfterRestart.ModTime()) {
 		t.Fatalf("nested update was published again after restart: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "Folder", "Deleted.md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "Folder", "Middle", "Parent", "Deleted.md")); !os.IsNotExist(err) {
 		t.Fatalf("nested delete after restart=%v", err)
 	}
 	if got, err := store.ConfirmedCursor(ctx); err != nil || got != base {
@@ -5234,6 +5370,223 @@ func TestSyncOnceAppliesNestedNotesBehindUnrelatedUnresolvedIntent(t *testing.T)
 	conflicts, err = store.ListConflicts(ctx, 10)
 	if err != nil || len(conflicts) != 1 || conflicts[0].Outbox.Mutation.ObjectID != blocked.ID || conflicts[0].Code != "type_mismatch" {
 		t.Fatalf("restart unrelated conflict=%#v err=%v", conflicts, err)
+	}
+	coldRoot := t.TempDir()
+	cold, _, err := Initialize(ctx, coldRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cold.Close()
+	if err := cold.SyncOnce(ctx, remote); err != nil {
+		t.Fatalf("cold client sync=%v", err)
+	}
+	coldBytes, err := os.ReadFile(filepath.Join(coldRoot, "Folder", "Middle", "Parent", "Updated.md"))
+	if err != nil || !bytes.Equal(coldBytes, updatedV3Bytes) {
+		t.Fatalf("cold updated bytes=%q err=%v", coldBytes, err)
+	}
+	coldDocument, err := cold.ReadNote(ctx, "Folder/Middle/Parent/Updated.md")
+	if err != nil || coldDocument.ID != updated.ID {
+		t.Fatalf("cold updated document=%#v err=%v", coldDocument, err)
+	}
+	if _, err := os.Stat(filepath.Join(coldRoot, "Folder", "Middle", "Parent", "Deleted.md")); !os.IsNotExist(err) {
+		t.Fatalf("cold nested delete=%v", err)
+	}
+	coldStore, err := clientsync.NewStore(cold.index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := coldStore.ConfirmedCursor(ctx); err != nil || got != uint64(len(server.changes)) {
+		t.Fatalf("cold confirmed=%d want=%d err=%v", got, len(server.changes), err)
+	}
+}
+
+func TestRecursiveInboxConvergesAuthenticatedABRestartAndColdClient(t *testing.T) {
+	ctx := context.Background()
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, _, err := a.CreateNote(ctx, "Blocked.md", "blocked base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"Folder", "Folder/Middle", "Folder/Middle/Parent"} {
+		if _, err := a.CreateFolder(ctx, relative); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated, _, err := a.CreateNote(ctx, "Folder/Middle/Parent/Updated.md", "updated base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, _, err := a.CreateNote(ctx, "Folder/Middle/Parent/Deleted.md", "deleted base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	storeB, err := clientsync.NewStore(b.index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := storeB.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedB, err := b.ReadNote(ctx, "Blocked.md")
+	if err != nil || blockedB.ID != blocked.ID {
+		t.Fatalf("B blocked=%#v err=%v", blockedB, err)
+	}
+	if _, _, err := b.SaveNote(ctx, "Blocked.md", blockedB.Revision, "unresolved B edit\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := storeB.ListReady(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockedOperation uuid.UUID
+	for _, item := range ready {
+		if item.Mutation.ObjectID == blocked.ID {
+			blockedOperation = item.Mutation.OperationID
+			break
+		}
+	}
+	if blockedOperation == uuid.Nil {
+		t.Fatal("missing B blocked operation")
+	}
+	server.results[blockedOperation] = clientsync.Result{
+		Conflict:  "type_mismatch",
+		Canonical: &clientsync.CanonicalState{ObjectType: clientsync.Folder, Revision: 2, Name: "Blocked-folder"},
+	}
+
+	blockedA, err := a.ReadNote(ctx, "Blocked.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "Blocked.md", blockedA.Revision, "remote blocked\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	updatedA, err := a.ReadNote(ctx, "Folder/Middle/Parent/Updated.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "Folder/Middle/Parent/Updated.md", updatedA.Revision, "remote updated v2\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	updatedA, err = a.ReadNote(ctx, "Folder/Middle/Parent/Updated.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "Folder/Middle/Parent/Updated.md", updatedA.Revision, "remote updated v3\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := os.ReadFile(filepath.Join(rootA, "Folder", "Middle", "Parent", "Updated.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedA, err := a.ReadNote(ctx, "Folder/Middle/Parent/Deleted.md")
+	if err != nil || deletedA.ID != deleted.ID {
+		t.Fatalf("A deleted note=%#v err=%v", deletedA, err)
+	}
+	if _, err := a.DeleteNote(ctx, "Folder/Middle/Parent/Deleted.md", deletedA.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+
+	server.maxPull = 1
+	pullStart := len(server.pullAfters)
+	if err := b.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("B sync=%v", err)
+	}
+	if len(server.pullAfters)-pullStart < 4 {
+		t.Fatalf("B pull was not paginated: %v", server.pullAfters[pullStart:])
+	}
+	got, err := os.ReadFile(filepath.Join(rootB, "Folder", "Middle", "Parent", "Updated.md"))
+	if err != nil || !bytes.Equal(got, expected) {
+		t.Fatalf("B updated bytes=%q err=%v", got, err)
+	}
+	gotDocument, err := b.ReadNote(ctx, "Folder/Middle/Parent/Updated.md")
+	if err != nil || gotDocument.ID != updated.ID {
+		t.Fatalf("B updated document=%#v err=%v", gotDocument, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Folder", "Middle", "Parent", "Deleted.md")); !os.IsNotExist(err) {
+		t.Fatalf("B nested delete=%v", err)
+	}
+	if downloaded, err := storeB.DownloadedCursor(ctx); err != nil || downloaded != uint64(len(server.changes)) {
+		t.Fatalf("B downloaded=%d want=%d err=%v", downloaded, len(server.changes), err)
+	}
+	if confirmed, err := storeB.ConfirmedCursor(ctx); err != nil || confirmed != base {
+		t.Fatalf("B confirmed=%d want=%d err=%v", confirmed, base, err)
+	}
+	beforeRestart, err := os.Stat(filepath.Join(rootB, "Folder", "Middle", "Parent", "Updated.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
+		t.Fatalf("B restart sync=%v", err)
+	}
+	afterRestart, err := os.Stat(filepath.Join(rootB, "Folder", "Middle", "Parent", "Updated.md"))
+	if err != nil || !os.SameFile(beforeRestart, afterRestart) || !beforeRestart.ModTime().Equal(afterRestart.ModTime()) {
+		t.Fatalf("B restart republished update: %v", err)
+	}
+
+	rootC := t.TempDir()
+	c, _, err := Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SyncOnce(ctx, remote); err != nil {
+		t.Fatalf("cold C sync=%v", err)
+	}
+	got, err = os.ReadFile(filepath.Join(rootC, "Folder", "Middle", "Parent", "Updated.md"))
+	if err != nil || !bytes.Equal(got, expected) {
+		t.Fatalf("cold C updated bytes=%q err=%v", got, err)
+	}
+	gotDocument, err = c.ReadNote(ctx, "Folder/Middle/Parent/Updated.md")
+	if err != nil || gotDocument.ID != updated.ID {
+		t.Fatalf("cold C updated document=%#v err=%v", gotDocument, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootC, "Folder", "Middle", "Parent", "Deleted.md")); !os.IsNotExist(err) {
+		t.Fatalf("cold C nested delete=%v", err)
+	}
+	storeC, err := clientsync.NewStore(c.index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed, err := storeC.ConfirmedCursor(ctx); err != nil || confirmed != uint64(len(server.changes)) {
+		t.Fatalf("cold C confirmed=%d want=%d err=%v", confirmed, len(server.changes), err)
 	}
 }
 
@@ -5561,6 +5914,101 @@ func TestSyncOnceRejectsNestedParentReplacementBeforeStepCompletion(t *testing.T
 	item, found, err := store.InboxChange(ctx, change.Cursor)
 	if err != nil || !found || item.State != "applying" {
 		t.Fatalf("inbox after final guard=%#v found=%t err=%v", item, found, err)
+	}
+}
+
+func TestRecursiveInboxRevalidatesEveryAncestorBeforeFilesystemMutation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	core, _, err := Initialize(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	for _, relative := range []string{"Folder", "Folder/Middle", "Folder/Middle/Parent"} {
+		if _, err := core.CreateFolder(ctx, relative); err != nil {
+			t.Fatal(err)
+		}
+	}
+	note, _, err := core.CreateNote(ctx, "Folder/Middle/Parent/N.md", "local base\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
+	remote := &memoryRemote{server: server}
+	if err := core.SyncOnce(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := core.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rootID, parentID uuid.UUID
+	for _, object := range snapshot.Objects {
+		switch object.RelativePath {
+		case "Folder":
+			rootID = object.ID
+		case "Folder/Middle/Parent":
+			parentID = object.ID
+		}
+	}
+	if rootID == uuid.Nil || parentID == uuid.Nil {
+		t.Fatalf("missing ancestry identities root=%s parent=%s", rootID, parentID)
+	}
+	store, err := clientsync.NewStore(core.index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := store.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteDocument, err := frontmatter.EnsureIdentity([]byte("remote update\n"), note.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteHash := sha256.Sum256(remoteDocument.Markdown)
+	server.blobs[remoteHash] = append([]byte(nil), remoteDocument.Markdown...)
+	change := clientsync.Change{
+		Cursor:      base + 1,
+		OperationID: uuid.Must(uuid.NewV7()),
+		ObjectID:    note.ID,
+		ObjectType:  clientsync.Note,
+		Mutation:    clientsync.Update,
+		Revision:    2,
+		ParentID:    ptrUUID(parentID),
+		Name:        "N.md",
+		BlobHash:    remoteHash[:],
+	}
+	server.changes = append(server.changes, change)
+	if err := store.IngestPullPage(ctx, base, change.Cursor, []clientsync.Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, change.Cursor, plan); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(filepath.Join(root, "Folder", "Middle", "Parent", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookBeforeNoteApplyPublication = func() error {
+		return core.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE sync_baselines SET operation_id=? WHERE object_id=?`, uuid.Must(uuid.NewV7()).String(), rootID.String())
+			return err
+		})
+	}
+	defer func() { testHookBeforeNoteApplyPublication = nil }()
+	if err := core.ExecuteActiveApplyPlan(ctx, remote); err == nil || !strings.Contains(err.Error(), "before filesystem mutation") {
+		t.Fatalf("ancestor mutation before publication=%v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "Folder", "Middle", "Parent", "N.md"))
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("note changed before ancestry rejection=%q err=%v", got, err)
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || active.ID != plan || active.Status != "applying" || active.Steps[0].State != "pending" {
+		t.Fatalf("active after ancestry rejection=%#v err=%v", active, err)
 	}
 }
 
@@ -5912,7 +6360,7 @@ func TestPreserveDeleteAbsentChildResolvesBeforeMissingParentPath(t *testing.T) 
 	if _, err = store.PrepareFolderPreserveDelete(ctx, conflict, resolution, 9); err != nil {
 		t.Fatal(err)
 	}
-	clones := []clientsync.FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, CreateCursor: 11, DeleteCursor: 12, SourceRevision: 1, Name: "Child"}}
+	clones := []clientsync.FolderPreserveDeleteClone{{OriginalFolderID: child, RecoveredFolderID: recoveredChild, SourceParentID: originalRoot, TargetParentID: recoveredRoot, CreateCursor: 11, DeleteCursor: 12, SourceRevision: 1, Depth: 1, Name: "Child"}}
 	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 13, clones, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -5933,7 +6381,7 @@ func TestPreserveDeleteAbsentNotePreflightResumesExactPublishedTarget(t *testing
 	defer index.Close()
 	core := &LocalCore{root: rootPath, index: index}
 	store, _ := clientsync.NewStore(index)
-	originalRoot, note, recoveredRoot := uuid.New(), uuid.New(), uuid.New()
+	originalRoot, originalChild, note, recoveredRoot, recoveredChild := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	create, conflict, resolution := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
 	if err = store.Enqueue(ctx, []clientsync.Mutation{{OperationID: create, Kind: clientsync.Create, ObjectID: originalRoot, ObjectType: clientsync.Folder, Name: "Root"}}); err != nil {
 		t.Fatal(err)
@@ -5955,23 +6403,28 @@ func TestPreserveDeleteAbsentNotePreflightResumesExactPublishedTarget(t *testing
 	}
 	content := []byte("---\nremember:\n  schema: 1\n  note_id: \"" + note.String() + "\"\n---\nexact\n")
 	hash := sha256.Sum256(content)
-	moves := []clientsync.FolderPreserveDeleteNoteMove{{NoteID: note, SourceParentID: originalRoot, TargetParentID: recoveredRoot, MoveCursor: 11, SourceRevision: 1, TargetRevision: 2, Name: "Note.md", BlobHash: hash[:]}}
-	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 12, nil, moves); err != nil {
+	clones := []clientsync.FolderPreserveDeleteClone{{OriginalFolderID: originalChild, RecoveredFolderID: recoveredChild, SourceParentID: originalRoot, TargetParentID: recoveredRoot, CreateCursor: 11, DeleteCursor: 13, SourceRevision: 1, Depth: 1, Name: "Child"}}
+	moves := []clientsync.FolderPreserveDeleteNoteMove{{NoteID: note, SourceParentID: originalChild, TargetParentID: recoveredChild, MoveCursor: 12, SourceRevision: 1, TargetRevision: 2, Name: "Note.md", BlobHash: hash[:]}}
+	if err = store.CompleteFolderPreserveDelete(ctx, conflict, recoveredRoot, "Recovered", 10, 14, clones, moves); err != nil {
 		t.Fatal(err)
 	}
-	recoveredPath := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/Recovered"
-	if err = index.ReplaceSnapshot(ctx, localindex.Snapshot{Objects: []localindex.Object{{ID: recoveredRoot, Type: localindex.ObjectFolder, RelativePath: recoveredPath, CollisionPath: strings.ToLower(recoveredPath), IdentityState: localindex.IdentityNew}}}); err != nil {
-		t.Fatal(err)
-	}
+	recoveredPath := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/Recovered/Child"
 	target := filepath.Join(rootPath, filepath.FromSlash(recoveredPath), "Note.md")
 	if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := repository.RootedFolderIdentity(rootPath, recoveredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = index.ReplaceSnapshot(ctx, localindex.Snapshot{Objects: []localindex.Object{{ID: recoveredChild, ParentID: recoveredRoot, Type: localindex.ObjectFolder, RelativePath: recoveredPath, CollisionPath: strings.ToLower(recoveredPath), IdentityState: localindex.IdentityKnown, FolderDevice: device, FolderInode: inode}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err = os.WriteFile(target, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	change := clientsync.Change{Cursor: 11, OperationID: uuid.Must(uuid.NewV7()), ObjectID: note, Mutation: clientsync.Move, ObjectType: clientsync.Note, Revision: 2, ParentID: &recoveredRoot, Name: "Note.md", BlobHash: hash[:]}
-	plan := &clientsync.ApplyPlan{ID: uuid.Must(uuid.NewV7()), FromCursor: 10, ThroughCursor: 11, Steps: []clientsync.Change{change}}
+	change := clientsync.Change{Cursor: 12, OperationID: uuid.Must(uuid.NewV7()), ObjectID: note, Mutation: clientsync.Move, ObjectType: clientsync.Note, Revision: 2, ParentID: &recoveredChild, Name: "Note.md", BlobHash: hash[:]}
+	plan := &clientsync.ApplyPlan{ID: uuid.Must(uuid.NewV7()), FromCursor: 11, ThroughCursor: 12, Steps: []clientsync.Change{change}}
 	steps, err := core.preflightNotePlan(ctx, plan, clientsync.BlobResolverFunc(func(context.Context, [sha256.Size]byte) ([]byte, error) {
 		return append([]byte(nil), content...), nil
 	}))
@@ -5985,6 +6438,19 @@ func TestPreserveDeleteAbsentNotePreflightResumesExactPublishedTarget(t *testing
 		return append([]byte(nil), content...), nil
 	})); err == nil || !strings.Contains(err.Error(), "target occupied") {
 		t.Fatalf("occupied target err=%v", err)
+	}
+	if err = os.WriteFile(target, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parentPath := filepath.Dir(target)
+	if err = os.Rename(parentPath, parentPath+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err = core.publishNoteApplyStep(steps[0]); err == nil {
+		t.Fatal("replacement recovered parent accepted")
 	}
 }
 
@@ -6033,7 +6499,7 @@ func TestPreparedV2PreserveDeletePromotesOnlyAfterExplicitUnavailable(t *testing
 	if err = core.stageSupportedConflicts(ctx, store, remote); err != nil {
 		t.Fatal(err)
 	}
-	if len(remote.versions) != 2 || remote.versions[0] != 2 || remote.versions[1] != 3 {
+	if len(remote.versions) != 2 || remote.versions[0] != 2 || remote.versions[1] != 4 {
 		t.Fatalf("versions=%v", remote.versions)
 	}
 	if err = index.WithTransaction(ctx, func(tx *sql.Tx) error {
@@ -6042,13 +6508,84 @@ func TestPreparedV2PreserveDeletePromotesOnlyAfterExplicitUnavailable(t *testing
 		if e := tx.QueryRow(`SELECT resolution_operation_id,request_version,state FROM sync_folder_preserve_delete_resolutions WHERE conflict_operation_id=?`, conflict.String()).Scan(&operation, &version, &state); e != nil {
 			return e
 		}
-		if operation == legacyResolution.String() || version != 3 || state != "resolved" {
+		if operation == legacyResolution.String() || version != 4 || state != "resolved" {
 			t.Fatalf("promoted row=%s/%d/%s", operation, version, state)
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPreparedV3PreserveDeleteAmbiguityRetriesPersistedRequest(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	core := &LocalCore{root: t.TempDir(), index: index}
+	store, _ := clientsync.NewStore(index)
+	root := uuid.New()
+	create, conflict, resolution := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if err = store.Enqueue(ctx, []clientsync.Mutation{{OperationID: create, Kind: clientsync.Create, ObjectID: root, ObjectType: clientsync.Folder, Name: "Root"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, create, clientsync.Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Enqueue(ctx, []clientsync.Mutation{{OperationID: conflict, Kind: clientsync.Delete, ObjectID: root, ObjectType: clientsync.Folder, BaseRevision: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.MarkAttempted(ctx, conflict); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordResult(ctx, conflict, clientsync.Result{Conflict: "base_revision_mismatch", Canonical: &clientsync.CanonicalState{ObjectType: clientsync.Folder, Revision: 2, Name: "Moved"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, e := tx.Exec(`INSERT INTO sync_inbox_changes(cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,deleted,state,ingested_at_ms) VALUES(9,?,?,'move','folder',2,NULL,'Moved',NULL,0,'pending',1)`, uuid.Must(uuid.NewV7()).String(), root.String()); e != nil {
+			return e
+		}
+		if _, e := tx.Exec(`UPDATE sync_state SET value='9' WHERE key='downloaded_cursor'`); e != nil {
+			return e
+		}
+		_, e := tx.Exec(`INSERT INTO sync_folder_preserve_delete_resolutions(conflict_operation_id,resolution_operation_id,folder_id,expected_revision,state,request_version,known_cursor) VALUES(?,?,?,2,'prepared',3,9)`, conflict.String(), resolution.String(), root.String())
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remote := &ambiguousPreserveDeleteRemote{recovered: uuid.New(), fail: true}
+	if err = core.stageSupportedConflicts(ctx, store, remote); !errors.Is(err, remotehttp.ErrRetryable) {
+		t.Fatalf("first err=%v", err)
+	}
+	if err = core.stageSupportedConflicts(ctx, store, remote); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.versions) != 2 || remote.versions[0] != 3 || remote.versions[1] != 3 || remote.operations[0] != resolution || remote.operations[1] != resolution {
+		t.Fatalf("requests=%v/%v", remote.versions, remote.operations)
+	}
+}
+
+type ambiguousPreserveDeleteRemote struct {
+	recovered  uuid.UUID
+	fail       bool
+	versions   []uint64
+	operations []uuid.UUID
+}
+
+func (r *ambiguousPreserveDeleteRemote) ResolveBlob(context.Context, [sha256.Size]byte) ([]byte, error) {
+	return nil, errors.New("unexpected blob request")
+}
+
+func (r *ambiguousPreserveDeleteRemote) PreserveAndDeleteEmptyFolder(_ context.Context, operation, _, _ uuid.UUID, _, _, version uint64) (remotehttp.PreserveDeleteFolderResult, error) {
+	r.versions = append(r.versions, version)
+	r.operations = append(r.operations, operation)
+	if r.fail {
+		r.fail = false
+		return remotehttp.PreserveDeleteFolderResult{}, remotehttp.ErrRetryable
+	}
+	return remotehttp.PreserveDeleteFolderResult{RecoveredFolderID: r.recovered, RecoveredFolderName: "Recovered", RecoveredCursor: 10, DeletedCursor: 11, FirstCursor: 10, LastCursor: 11}, nil
 }
 
 type promotionRemote struct {

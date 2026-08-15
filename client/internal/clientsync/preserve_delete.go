@@ -11,10 +11,9 @@ import (
 )
 
 type FolderPreserveDeleteClone struct {
-	OriginalFolderID, RecoveredFolderID uuid.UUID
-	CreateCursor, DeleteCursor          uint64
-	SourceRevision                      uint64
-	Name                                string
+	OriginalFolderID, RecoveredFolderID, SourceParentID, TargetParentID uuid.UUID
+	CreateCursor, DeleteCursor, SourceRevision, Depth                   uint64
+	Name                                                                string
 }
 type FolderPreserveDeleteNoteMove struct {
 	NoteID, SourceParentID, TargetParentID     uuid.UUID
@@ -48,7 +47,7 @@ func (s *Store) PrepareFolderPreserveDelete(ctx context.Context, conflict, resol
 		}
 		version := uint64(1)
 		if known > 0 {
-			version = 3
+			version = 4
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_resolutions(conflict_operation_id,resolution_operation_id,folder_id,expected_revision,state,request_version,known_cursor) VALUES(?,?,?,?,'prepared',?,?)`, conflict.String(), resolution.String(), folder, revision, version, nullablePositiveInt(known))
 		if err != nil {
@@ -78,13 +77,13 @@ func (s *Store) PrepareFolderPreserveDelete(ctx context.Context, conflict, resol
 	return &out, err
 }
 
-func (s *Store) PromotePreparedFolderPreserveDeleteV3(ctx context.Context, conflict, resolution uuid.UUID, known uint64) (*FolderPreserveDeleteResolution, error) {
+func (s *Store) PromotePreparedFolderPreserveDeleteV4(ctx context.Context, conflict, resolution uuid.UUID, known uint64) (*FolderPreserveDeleteResolution, error) {
 	if !validOperationID(conflict) || !validOperationID(resolution) || known == 0 || known > math.MaxInt64 {
 		return nil, errors.New("invalid preserve delete promotion")
 	}
 	var out FolderPreserveDeleteResolution
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE sync_folder_preserve_delete_resolutions SET resolution_operation_id=?,request_version=3 WHERE conflict_operation_id=? AND state='prepared' AND request_version=2 AND known_cursor=?`, resolution.String(), conflict.String(), known)
+		result, err := tx.ExecContext(ctx, `UPDATE sync_folder_preserve_delete_resolutions SET resolution_operation_id=?,request_version=4 WHERE conflict_operation_id=? AND state='prepared' AND request_version IN(2,3) AND known_cursor=?`, resolution.String(), conflict.String(), known)
 		if err != nil {
 			return err
 		}
@@ -102,7 +101,7 @@ func (s *Store) PromotePreparedFolderPreserveDeleteV3(ctx context.Context, confl
 		out.ConflictOperationID = conflict
 		out.ResolutionOperationID = resolution
 		out.KnownCursor = known
-		out.RequestVersion = 3
+		out.RequestVersion = 4
 		out.State = "prepared"
 		return nil
 	})
@@ -139,7 +138,7 @@ func (s *Store) FolderPreserveDeleteRecoveryCreateParent(ctx context.Context, ch
 	}
 	var parent string
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT expected_parent FROM (SELECT p.recovered_folder_id object_id,p.first_cursor cursor,? expected_parent,p.request_version,p.recovered_folder_name expected_name FROM sync_folder_preserve_delete_resolutions p WHERE p.state='resolved' UNION ALL SELECT c.recovered_folder_id,c.create_cursor,p.recovered_folder_id,p.request_version,c.name FROM sync_folder_preserve_delete_clones c JOIN sync_folder_preserve_delete_resolutions p ON p.conflict_operation_id=c.conflict_operation_id WHERE p.state='resolved') WHERE object_id=? AND cursor=? AND (request_version<3 OR expected_name=?)`, ConflictRecoveredID.String(), change.ObjectID.String(), change.Cursor, change.Name).Scan(&parent)
+		return tx.QueryRowContext(ctx, `SELECT expected_parent FROM (SELECT p.recovered_folder_id object_id,p.first_cursor cursor,? expected_parent,p.request_version,p.recovered_folder_name expected_name FROM sync_folder_preserve_delete_resolutions p WHERE p.state='resolved' UNION ALL SELECT c.recovered_folder_id,c.create_cursor,CASE WHEN p.request_version=4 THEN c.target_parent_id ELSE p.recovered_folder_id END,p.request_version,c.name FROM sync_folder_preserve_delete_clones c JOIN sync_folder_preserve_delete_resolutions p ON p.conflict_operation_id=c.conflict_operation_id WHERE p.state='resolved') WHERE object_id=? AND cursor=? AND (request_version<3 OR expected_name=?)`, ConflictRecoveredID.String(), change.ObjectID.String(), change.Cursor, change.Name).Scan(&parent)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil, nil
@@ -169,7 +168,7 @@ func (s *Store) FolderPreserveDeleteMatches(ctx context.Context, change Change) 
 	}
 	var exists int
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_folder_preserve_delete_resolutions p JOIN sync_conflict_states s ON s.operation_id=p.conflict_operation_id WHERE p.folder_id=? AND p.state='resolved' AND p.last_cursor=? AND ?=p.expected_revision+1 AND (p.request_version<3 OR (s.revision=p.expected_revision AND s.name=? AND s.parent_id IS ?)) UNION ALL SELECT 1 FROM sync_folder_preserve_delete_clones c JOIN sync_folder_preserve_delete_resolutions p ON p.conflict_operation_id=c.conflict_operation_id WHERE c.original_folder_id=? AND c.delete_cursor=? AND p.state='resolved' AND (p.request_version<3 OR (?=c.source_revision+1 AND c.name=? AND ? IS p.folder_id)))`, change.ObjectID.String(), change.Cursor, change.Revision, change.Name, nullableUUIDString(change.ParentID), change.ObjectID.String(), change.Cursor, change.Revision, change.Name, nullableUUIDString(change.ParentID)).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_folder_preserve_delete_resolutions p JOIN sync_conflict_states s ON s.operation_id=p.conflict_operation_id WHERE p.folder_id=? AND p.state='resolved' AND p.last_cursor=? AND ?=p.expected_revision+1 AND (p.request_version<3 OR (s.revision=p.expected_revision AND s.name=? AND s.parent_id IS ?)) UNION ALL SELECT 1 FROM sync_folder_preserve_delete_clones c JOIN sync_folder_preserve_delete_resolutions p ON p.conflict_operation_id=c.conflict_operation_id WHERE c.original_folder_id=? AND c.delete_cursor=? AND p.state='resolved' AND (p.request_version<3 OR (?=c.source_revision+1 AND c.name=? AND ? IS CASE WHEN p.request_version=4 THEN c.source_parent_id ELSE p.folder_id END)))`, change.ObjectID.String(), change.Cursor, change.Revision, change.Name, nullableUUIDString(change.ParentID), change.ObjectID.String(), change.Cursor, change.Revision, change.Name, nullableUUIDString(change.ParentID)).Scan(&exists)
 	})
 	return exists == 1, err
 }
@@ -188,50 +187,18 @@ func (s *Store) CompleteFolderPreserveDelete(ctx context.Context, conflict, reco
 	if !validOperationID(conflict) || !validObjectID(recovered) || first == 0 || last < first || last > math.MaxInt64 {
 		return errors.New("invalid preserve delete completion")
 	}
-	f, n := uint64(len(clones)), uint64(len(notes))
-	if f+n > 10000 || last != first+2*f+n+1 {
-		return errors.New("invalid preserve delete span")
-	}
-	seen := map[uuid.UUID]bool{recovered: true}
-	for i, c := range clones {
-		if !validObjectID(c.OriginalFolderID) || !validObjectID(c.RecoveredFolderID) || seen[c.OriginalFolderID] || seen[c.RecoveredFolderID] || c.CreateCursor != first+1+uint64(i) || c.DeleteCursor != first+1+f+n+uint64(i) {
-			return errors.New("invalid preserve delete clone")
-		}
-		seen[c.OriginalFolderID] = true
-		seen[c.RecoveredFolderID] = true
-	}
-	for i, item := range notes {
-		if !validObjectID(item.NoteID) || seen[item.NoteID] || item.SourceParentID == uuid.Nil || item.TargetParentID != recovered || item.MoveCursor != first+1+f+uint64(i) || item.SourceRevision == 0 || item.TargetRevision != item.SourceRevision+1 || item.Name == "" || len(item.BlobHash) != 32 {
-			return errors.New("invalid preserve delete note")
-		}
-		seen[item.NoteID] = true
-	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var version uint64
-		if err := tx.QueryRowContext(ctx, `SELECT request_version FROM sync_folder_preserve_delete_resolutions WHERE conflict_operation_id=?`, conflict.String()).Scan(&version); err != nil {
+		var folderRaw string
+		if err := tx.QueryRowContext(ctx, `SELECT request_version,folder_id FROM sync_folder_preserve_delete_resolutions WHERE conflict_operation_id=?`, conflict.String()).Scan(&version, &folderRaw); err != nil {
 			return err
 		}
-		if version != 3 && len(notes) > 0 {
-			return errors.New("preserve delete version mismatch")
+		folder, err := uuid.Parse(folderRaw)
+		if err != nil {
+			return err
 		}
-		if version == 3 {
-			if naming.ValidateComponent(recoveredName) != nil {
-				return errors.New("invalid preserve delete recovery name")
-			}
-			for _, clone := range clones {
-				if clone.SourceRevision == 0 || naming.ValidateComponent(clone.Name) != nil {
-					return errors.New("invalid preserve delete clone descriptor")
-				}
-			}
-		} else {
-			if recoveredName != "" {
-				return errors.New("preserve delete legacy descriptor mismatch")
-			}
-			for _, clone := range clones {
-				if clone.SourceRevision != 0 || clone.Name != "" {
-					return errors.New("preserve delete legacy clone mismatch")
-				}
-			}
+		if err = validateFolderPreserveDeleteCompletion(version, folder, recovered, recoveredName, first, last, clones, notes); err != nil {
+			return err
 		}
 		result, err := tx.ExecContext(ctx, `UPDATE sync_folder_preserve_delete_resolutions SET state='sealing',recovered_folder_id=?,recovered_folder_name=?,recovered_cursor=?,deleted_cursor=?,first_cursor=?,last_cursor=?,clone_count=?,note_count=? WHERE conflict_operation_id=? AND state='prepared'`, recovered.String(), nullableNonEmptyString(recoveredName), first, last, first, last, len(clones), len(notes), conflict.String())
 		if err != nil {
@@ -248,11 +215,11 @@ func (s *Store) CompleteFolderPreserveDelete(ctx context.Context, conflict, reco
 			defer rows.Close()
 			var values []string
 			for rows.Next() {
-				var v string
-				if e = rows.Scan(&v); e != nil {
+				var value string
+				if e = rows.Scan(&value); e != nil {
 					return nil, e
 				}
-				values = append(values, v)
+				values = append(values, value)
 			}
 			if e = rows.Err(); e != nil {
 				return nil, e
@@ -265,12 +232,12 @@ func (s *Store) CompleteFolderPreserveDelete(ctx context.Context, conflict, reco
 			}
 			return nil, nil
 		}
-		for i, c := range clones {
-			op, e := localDelete(c.OriginalFolderID, "folder", c.SourceRevision)
+		for i, clone := range clones {
+			op, e := localDelete(clone.OriginalFolderID, "folder", clone.SourceRevision)
 			if e != nil {
 				return e
 			}
-			if _, e = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_clones(conflict_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name,local_delete_operation_id) VALUES(?,?,?,?,?,?,?,?,?)`, conflict.String(), i, c.OriginalFolderID.String(), c.RecoveredFolderID.String(), c.CreateCursor, c.DeleteCursor, nullablePositiveInt(c.SourceRevision), nullableNonEmptyString(c.Name), op); e != nil {
+			if _, e = tx.ExecContext(ctx, `INSERT INTO sync_folder_preserve_delete_clones(conflict_operation_id,ordinal,original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name,local_delete_operation_id,source_parent_id,target_parent_id,depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, conflict.String(), i, clone.OriginalFolderID.String(), clone.RecoveredFolderID.String(), clone.CreateCursor, clone.DeleteCursor, nullablePositiveInt(clone.SourceRevision), nullableNonEmptyString(clone.Name), op, nullableRecursiveUUID(version, clone.SourceParentID), nullableRecursiveUUID(version, clone.TargetParentID), nullableRecursiveDepth(version, clone.Depth)); e != nil {
 				return e
 			}
 		}
@@ -297,12 +264,110 @@ func (s *Store) CompleteFolderPreserveDelete(ctx context.Context, conflict, reco
 	})
 }
 
+func validateFolderPreserveDeleteCompletion(version uint64, folder, recovered uuid.UUID, recoveredName string, first, last uint64, clones []FolderPreserveDeleteClone, notes []FolderPreserveDeleteNoteMove) error {
+	f, n := uint64(len(clones)), uint64(len(notes))
+	if version == 4 {
+		if f+n+1 > 10000 || f > (math.MaxInt64-1-n)/2 || first > math.MaxInt64-(2*f+n+1) || last != first+2*f+n+1 {
+			return errors.New("invalid preserve delete span")
+		}
+	} else if f+n > 10000 || last != first+2*f+n+1 {
+		return errors.New("invalid preserve delete span")
+	}
+	if version >= 3 {
+		if naming.ValidateComponent(recoveredName) != nil {
+			return errors.New("invalid preserve delete recovery name")
+		}
+	} else if recoveredName != "" {
+		return errors.New("preserve delete legacy descriptor mismatch")
+	}
+	if version != 3 && version != 4 && len(notes) > 0 {
+		return errors.New("preserve delete version mismatch")
+	}
+	seen := map[uuid.UUID]bool{folder: true, recovered: true}
+	sourceTargets := map[uuid.UUID]uuid.UUID{folder: recovered}
+	sourceDepths := map[uuid.UUID]uint64{folder: 0}
+	sourceRanks := map[uuid.UUID]int{folder: 0}
+	deleteCursors := make(map[uint64]bool, len(clones))
+	deleteStart := first + 1 + f + n
+	var previousDepth uint64
+	var previousOriginal uuid.UUID
+	for i, clone := range clones {
+		if !validObjectID(clone.OriginalFolderID) || !validObjectID(clone.RecoveredFolderID) || seen[clone.OriginalFolderID] || seen[clone.RecoveredFolderID] || clone.CreateCursor != first+1+uint64(i) {
+			return errors.New("invalid preserve delete clone")
+		}
+		if version == 4 {
+			targetParent, parentExists := sourceTargets[clone.SourceParentID]
+			parentDepth, depthExists := sourceDepths[clone.SourceParentID]
+			parentDelete := last
+			for _, prior := range clones[:i] {
+				if prior.OriginalFolderID == clone.SourceParentID {
+					parentDelete = prior.DeleteCursor
+					break
+				}
+			}
+			if !parentExists || !depthExists || clone.TargetParentID != targetParent || clone.Depth == 0 || clone.Depth > 256 || clone.Depth != parentDepth+1 || clone.DeleteCursor < deleteStart || clone.DeleteCursor >= last || deleteCursors[clone.DeleteCursor] || clone.DeleteCursor >= parentDelete || clone.SourceRevision == 0 || clone.SourceRevision > math.MaxInt64 || naming.ValidateComponent(clone.Name) != nil || i > 0 && (clone.Depth < previousDepth || clone.Depth == previousDepth && bytes.Compare(clone.OriginalFolderID[:], previousOriginal[:]) <= 0) {
+				return errors.New("invalid preserve delete clone")
+			}
+			sourceTargets[clone.OriginalFolderID] = clone.RecoveredFolderID
+			sourceDepths[clone.OriginalFolderID] = clone.Depth
+			sourceRanks[clone.OriginalFolderID] = i + 1
+			deleteCursors[clone.DeleteCursor] = true
+			previousDepth, previousOriginal = clone.Depth, clone.OriginalFolderID
+		} else {
+			if clone.SourceParentID != uuid.Nil || clone.TargetParentID != uuid.Nil || clone.Depth != 0 || clone.DeleteCursor != first+1+f+n+uint64(i) {
+				return errors.New("invalid preserve delete legacy clone")
+			}
+			if version == 3 {
+				if clone.SourceRevision == 0 || naming.ValidateComponent(clone.Name) != nil {
+					return errors.New("invalid preserve delete clone descriptor")
+				}
+			} else if clone.SourceRevision != 0 || clone.Name != "" {
+				return errors.New("preserve delete legacy clone mismatch")
+			}
+		}
+		seen[clone.OriginalFolderID], seen[clone.RecoveredFolderID] = true, true
+	}
+	previousParentRank := -1
+	var previousNote uuid.UUID
+	for i, item := range notes {
+		if !validObjectID(item.NoteID) || seen[item.NoteID] || item.MoveCursor != first+1+f+uint64(i) || item.SourceRevision == 0 || item.TargetRevision != item.SourceRevision+1 || item.Name == "" || len(item.BlobHash) != 32 {
+			return errors.New("invalid preserve delete note")
+		}
+		if version == 4 {
+			targetParent, mapped := sourceTargets[item.SourceParentID]
+			rank, ranked := sourceRanks[item.SourceParentID]
+			if !mapped || !ranked || item.TargetParentID != targetParent || item.SourceRevision > math.MaxInt64 || item.TargetRevision > math.MaxInt64 || naming.ValidateComponent(item.Name) != nil || rank < previousParentRank || rank == previousParentRank && bytes.Compare(item.NoteID[:], previousNote[:]) <= 0 {
+				return errors.New("invalid preserve delete note")
+			}
+			previousParentRank, previousNote = rank, item.NoteID
+		} else if item.SourceParentID != folder || item.TargetParentID != recovered {
+			return errors.New("invalid preserve delete note")
+		}
+		seen[item.NoteID] = true
+	}
+	return nil
+}
+
+func nullableRecursiveUUID(version uint64, id uuid.UUID) any {
+	if version != 4 {
+		return nil
+	}
+	return id.String()
+}
+
+func nullableRecursiveDepth(version, depth uint64) any {
+	if version != 4 {
+		return nil
+	}
+	return depth
+}
+
 func verifyFolderPreserveDeleteReplay(ctx context.Context, tx *sql.Tx, conflict, recovered uuid.UUID, recoveredName string, first, last uint64, clones []FolderPreserveDeleteClone, notes []FolderPreserveDeleteNoteMove) error {
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_folder_preserve_delete_resolutions WHERE conflict_operation_id=? AND state='resolved' AND recovered_folder_id=? AND recovered_folder_name IS ? AND first_cursor=? AND last_cursor=? AND clone_count=? AND note_count=?`, conflict.String(), recovered.String(), nullableNonEmptyString(recoveredName), first, last, len(clones), len(notes)).Scan(&count); err != nil || count != 1 {
 		return errors.New("preserve delete completion unavailable")
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name FROM sync_folder_preserve_delete_clones WHERE conflict_operation_id=? ORDER BY ordinal`, conflict.String())
+	rows, err := tx.QueryContext(ctx, `SELECT original_folder_id,recovered_folder_id,create_cursor,delete_cursor,source_revision,name,source_parent_id,target_parent_id,depth FROM sync_folder_preserve_delete_clones WHERE conflict_operation_id=? ORDER BY ordinal`, conflict.String())
 	if err != nil {
 		return err
 	}
@@ -314,14 +379,15 @@ func verifyFolderPreserveDeleteReplay(ctx context.Context, tx *sql.Tx, conflict,
 		}
 		var a, b string
 		var c, d uint64
-		var sourceRevision sql.NullInt64
-		var name sql.NullString
-		if err = rows.Scan(&a, &b, &c, &d, &sourceRevision, &name); err != nil {
+		var sourceRevision, depth sql.NullInt64
+		var name, sourceParent, targetParent sql.NullString
+		if err = rows.Scan(&a, &b, &c, &d, &sourceRevision, &name, &sourceParent, &targetParent, &depth); err != nil {
 			rows.Close()
 			return err
 		}
 		x := clones[i]
-		if a != x.OriginalFolderID.String() || b != x.RecoveredFolderID.String() || c != x.CreateCursor || d != x.DeleteCursor || uint64(sourceRevision.Int64) != x.SourceRevision || name.String != x.Name {
+		recursive := x.SourceParentID != uuid.Nil
+		if a != x.OriginalFolderID.String() || b != x.RecoveredFolderID.String() || c != x.CreateCursor || d != x.DeleteCursor || uint64(sourceRevision.Int64) != x.SourceRevision || name.String != x.Name || sourceParent.Valid != recursive || targetParent.Valid != recursive || depth.Valid != recursive || recursive && (sourceParent.String != x.SourceParentID.String() || targetParent.String != x.TargetParentID.String() || uint64(depth.Int64) != x.Depth) {
 			rows.Close()
 			return errors.New("preserve delete clone replay mismatch")
 		}
