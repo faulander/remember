@@ -1060,6 +1060,36 @@ func putInboxBaseline(t *testing.T, index *localindex.Index, object uuid.UUID, r
 	}
 }
 
+func putInboxRootFolder(t *testing.T, index *localindex.Index, folder uuid.UUID) {
+	t.Helper()
+	if err := index.WithTransaction(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO objects(object_id,object_type,relative_path,collision_path,parent_id,folder_device,folder_inode,identity_state) VALUES(?,'folder','Folder','folder',NULL,11,22,'known')`, folder.String()); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,1,?)`, folder.String(), uuid.Must(uuid.NewV7()).String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func putStoredInboxChange(t *testing.T, index *localindex.Index, change Change) {
+	t.Helper()
+	var parent, blob any
+	if change.ParentID != nil {
+		parent = change.ParentID.String()
+	}
+	if len(change.BlobHash) != 0 {
+		blob = change.BlobHash
+	}
+	if err := index.WithTransaction(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO sync_inbox_changes(cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,deleted,state,ingested_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,'pending',1)`, change.Cursor, change.OperationID.String(), change.ObjectID.String(), change.Mutation, change.ObjectType, change.Revision, parent, change.Name, blob, change.Deleted)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func applyInboxPlan(t *testing.T, store *Store, planID uuid.UUID) {
 	t.Helper()
 	ctx := context.Background()
@@ -1122,6 +1152,55 @@ func TestInboxApplyPlanCompletesOutOfOrderWithoutSkippingFrontier(t *testing.T) 
 		if err != nil || !found || item.State != "applied" {
 			t.Fatalf("cursor %d item=%#v found=%t err=%v", cursor, item, found, err)
 		}
+	}
+}
+
+func TestDirectChildInboxUpdateAndDeleteAreIndependent(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "inbox-plan.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	parent, updated, deleted := uuid.New(), uuid.New(), uuid.New()
+	putInboxRootFolder(t, index, parent)
+	putInboxBaseline(t, index, updated, 1)
+	putInboxBaseline(t, index, deleted, 1)
+	changes := []Change{
+		inboxNoteChange(t, 1, 2, updated, Update, &parent, "Updated.md"),
+		inboxNoteChange(t, 2, 2, deleted, Delete, &parent, "Deleted.md"),
+	}
+	if err := store.IngestPullPage(ctx, 0, 2, changes); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedConflict, unrelatedObject := uuid.Must(uuid.NewV7()), uuid.New()
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,conflict_code,created_at_ms) VALUES(?,'delete',?,'folder',1,NULL,'',NULL,'conflict','object_missing',1)`, unrelatedConflict.String(), unrelatedObject.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("candidates=%#v err=%v", items, err)
+	}
+	deletePlan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 2, deletePlan); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || len(active.Steps) != 1 || active.Steps[0].ParentID == nil || *active.Steps[0].ParentID != parent {
+		t.Fatalf("nested plan=%#v err=%v", active, err)
+	}
+	applyInboxPlan(t, store, deletePlan)
+	updatePlan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, updatePlan); err != nil {
+		t.Fatal(err)
+	}
+	applyInboxPlan(t, store, updatePlan)
+	if confirmed, err := store.ConfirmedCursor(ctx); err != nil || confirmed != 2 {
+		t.Fatalf("confirmed=%d err=%v", confirmed, err)
 	}
 }
 
@@ -1665,6 +1744,308 @@ func TestIndependentInboxChainReselectsAfterReopen(t *testing.T) {
 	confirmed, err := store.ConfirmedCursor(ctx)
 	if err != nil || confirmed != 0 {
 		t.Fatalf("confirmed=%d err=%v", confirmed, err)
+	}
+}
+
+func TestDirectChildInboxChainReselectsAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "nested-chain.db")
+	index, err := localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewStore(index)
+	parent, blocked, note := uuid.New(), uuid.New(), uuid.New()
+	putInboxRootFolder(t, index, parent)
+	putInboxBaseline(t, index, note, 1)
+	changes := []Change{
+		inboxNoteChange(t, 1, 2, blocked, Update, nil, "Blocked.md"),
+		inboxNoteChange(t, 2, 2, note, Update, &parent, "Nested.md"),
+		inboxNoteChange(t, 3, 3, note, Delete, &parent, "Nested.md"),
+	}
+	if err := store.IngestPullPage(ctx, 0, 3, changes); err != nil {
+		t.Fatal(err)
+	}
+	first := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 2, first); err != nil {
+		t.Fatal(err)
+	}
+	applyInboxPlan(t, store, first)
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	index, err = localindex.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ = NewStore(index)
+	items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Change.Cursor != 3 || items[0].Change.ObjectID != note || items[0].Change.Mutation != Delete || items[0].Change.ParentID == nil || *items[0].Change.ParentID != parent {
+		t.Fatalf("resumed nested candidates=%#v", items)
+	}
+	next := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 3, next); err != nil {
+		t.Fatal(err)
+	}
+	if confirmed, err := store.ConfirmedCursor(ctx); err != nil || confirmed != 0 {
+		t.Fatalf("confirmed=%d err=%v", confirmed, err)
+	}
+}
+
+func TestDirectChildInboxParentInvariantsGuardSelectionLinkAndRetry(t *testing.T) {
+	for _, invariant := range []string{"deeper", "missing", "non-folder", "unknown", "unobserved", "missing device", "missing inode", "zero device", "zero inode", "unbaselined", "zero baseline", "locally conflicted", "earlier remote change"} {
+		t.Run(invariant, func(t *testing.T) {
+			ctx := context.Background()
+			index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer index.Close()
+			store, _ := NewStore(index)
+			parent, note, ancestor := uuid.New(), uuid.New(), uuid.New()
+			putInboxRootFolder(t, index, parent)
+			putInboxBaseline(t, index, note, 1)
+			change := inboxNoteChange(t, 3, 2, note, Update, &parent, "Nested.md")
+			putStoredInboxChange(t, index, change)
+
+			setEligible := func(eligible bool, phase int) error {
+				return index.WithTransaction(ctx, func(tx *sql.Tx) error {
+					switch invariant {
+					case "deeper":
+						var parentID any
+						if !eligible {
+							parentID = ancestor.String()
+						}
+						_, err := tx.Exec(`UPDATE objects SET parent_id=? WHERE object_id=?`, parentID, parent.String())
+						return err
+					case "missing":
+						if !eligible {
+							_, err := tx.Exec(`DELETE FROM objects WHERE object_id=?`, parent.String())
+							return err
+						}
+						_, err := tx.Exec(`INSERT INTO objects(object_id,object_type,relative_path,collision_path,parent_id,folder_device,folder_inode,identity_state) VALUES(?,'folder','Folder','folder',NULL,11,22,'known')`, parent.String())
+						return err
+					case "non-folder":
+						objectType := "note"
+						if eligible {
+							objectType = "folder"
+						}
+						_, err := tx.Exec(`UPDATE objects SET object_type=? WHERE object_id=?`, objectType, parent.String())
+						return err
+					case "unknown":
+						state := "pending"
+						if eligible {
+							state = "known"
+						}
+						_, err := tx.Exec(`UPDATE objects SET identity_state=? WHERE object_id=?`, state, parent.String())
+						return err
+					case "unobserved", "missing device", "missing inode", "zero device", "zero inode":
+						var device, inode any = 11, 22
+						if !eligible {
+							switch invariant {
+							case "unobserved":
+								device, inode = nil, nil
+							case "missing device":
+								device = nil
+							case "missing inode":
+								inode = nil
+							case "zero device":
+								device = 0
+							case "zero inode":
+								inode = 0
+							}
+						}
+						_, err := tx.Exec(`UPDATE objects SET folder_device=?,folder_inode=? WHERE object_id=?`, device, inode, parent.String())
+						return err
+					case "unbaselined":
+						if !eligible {
+							_, err := tx.Exec(`DELETE FROM sync_baselines WHERE object_id=?`, parent.String())
+							return err
+						}
+						_, err := tx.Exec(`INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,1,?)`, parent.String(), uuid.Must(uuid.NewV7()).String())
+						return err
+					case "zero baseline":
+						revision := 0
+						if eligible {
+							revision = 1
+						}
+						_, err := tx.Exec(`UPDATE sync_baselines SET revision=? WHERE object_id=?`, revision, parent.String())
+						return err
+					case "locally conflicted":
+						if eligible {
+							_, err := tx.Exec(`UPDATE sync_outbox SET status='superseded' WHERE object_id=? AND status='pending'`, parent.String())
+							return err
+						}
+						_, err := tx.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,created_at_ms) VALUES(?,'delete',?,'folder',1,NULL,'',NULL,'pending',1)`, uuid.Must(uuid.NewV7()).String(), parent.String())
+						return err
+					case "earlier remote change":
+						if eligible {
+							if _, err := tx.Exec(`UPDATE sync_inbox_changes SET state='applying',applying_at_ms=ingested_at_ms WHERE object_id=? AND state='pending'`, parent.String()); err != nil {
+								return err
+							}
+							_, err := tx.Exec(`UPDATE sync_inbox_changes SET state='applied',applied_at_ms=applying_at_ms WHERE object_id=? AND state='applying'`, parent.String())
+							return err
+						}
+						_, err := tx.Exec(`INSERT INTO sync_inbox_changes(cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,deleted,state,ingested_at_ms) VALUES(?,? ,?,'move','folder',2,NULL,'Folder',NULL,0,'pending',1)`, phase, uuid.Must(uuid.NewV7()).String(), parent.String())
+						return err
+					default:
+						return errors.New("unknown test invariant")
+					}
+				})
+			}
+
+			if err := setEligible(false, 1); err != nil {
+				t.Fatal(err)
+			}
+			items, err := store.ListIndependentInboxCandidates(ctx, 1000)
+			if err != nil || len(items) != 0 {
+				t.Fatalf("ineligible candidates=%#v err=%v", items, err)
+			}
+			if err := store.CreateInboxApplyPlan(ctx, change.Cursor, uuid.Must(uuid.NewV7())); err == nil {
+				t.Fatal("Go plan creation accepted ineligible parent")
+			}
+
+			spoof := uuid.Must(uuid.NewV7())
+			if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				if _, err := tx.Exec(`INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,2,3,'prepared',1)`, spoof.String()); err != nil {
+					return err
+				}
+				_, err := tx.Exec(`INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,0,3,?,?,?,'note',2,?,'Nested.md',?,'pending')`, spoof.String(), change.OperationID.String(), note.String(), change.Mutation, parent.String(), change.BlobHash)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`INSERT INTO sync_inbox_apply_plans(plan_id,cursor) VALUES(?,3)`, spoof.String())
+				return err
+			}); err == nil {
+				t.Fatal("SQL link guard accepted ineligible parent")
+			}
+			if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`DELETE FROM apply_plans WHERE plan_id=?`, spoof.String())
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := setEligible(true, 1); err != nil {
+				t.Fatal(err)
+			}
+			items, err = store.ListIndependentInboxCandidates(ctx, 1000)
+			if err != nil || len(items) != 1 || items[0].Change.Cursor != change.Cursor {
+				t.Fatalf("restored candidates=%#v err=%v", items, err)
+			}
+			plan := uuid.Must(uuid.NewV7())
+			if err := store.CreateInboxApplyPlan(ctx, change.Cursor, plan); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AbandonPreparedInboxPlan(ctx, plan); err != nil {
+				t.Fatal(err)
+			}
+			if err := setEligible(false, 2); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RetryAbandonedInboxPlan(ctx, plan); err == nil {
+				t.Fatal("failed-plan retry accepted ineligible parent")
+			}
+		})
+	}
+}
+
+func TestDirectChildInboxParentBindingGuardsBeginAfterLink(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	parent, note := uuid.New(), uuid.New()
+	putInboxRootFolder(t, index, parent)
+	putInboxBaseline(t, index, note, 1)
+	change := inboxNoteChange(t, 1, 2, note, Update, &parent, "Nested.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.ActiveInboxParentBinding(ctx, plan)
+	if err != nil || binding == nil || binding.ParentID != parent || binding.RelativePath != "Folder" || binding.Device != 11 || binding.Inode != 22 {
+		t.Fatalf("binding=%#v err=%v", binding, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE objects SET folder_inode=23 WHERE object_id=?`, parent.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActiveInboxParentBinding(ctx, plan); err == nil {
+		t.Fatal("mutable parent change retained a valid plan binding")
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err == nil {
+		t.Fatal("linked plan began after parent binding changed")
+	}
+	item, found, err := store.InboxChange(ctx, 1)
+	if err != nil || !found || item.State != "pending" {
+		t.Fatalf("inbox after rejected begin=%#v found=%t err=%v", item, found, err)
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || active.ID != plan || active.Status != "prepared" {
+		t.Fatalf("plan after rejected begin=%#v err=%v", active, err)
+	}
+}
+
+func TestDirectChildInboxParentBindingGuardsApplyingReplayAndCompletion(t *testing.T) {
+	ctx := context.Background()
+	index, err := localindex.Open(ctx, filepath.Join(t.TempDir(), "i.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, _ := NewStore(index)
+	parent, note := uuid.New(), uuid.New()
+	putInboxRootFolder(t, index, parent)
+	putInboxBaseline(t, index, note, 1)
+	change := inboxNoteChange(t, 1, 2, note, Update, &parent, "Nested.md")
+	if err := store.IngestPullPage(ctx, 0, 1, []Change{change}); err != nil {
+		t.Fatal(err)
+	}
+	plan := uuid.Must(uuid.NewV7())
+	if err := store.CreateInboxApplyPlan(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_baselines SET operation_id=? WHERE object_id=?`, uuid.Must(uuid.NewV7()).String(), parent.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginApplyPlan(ctx, plan); err == nil {
+		t.Fatal("applying replay accepted changed parent baseline")
+	}
+	if err := store.MarkApplyStepApplied(ctx, plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteApplyPlan(ctx, plan); err == nil {
+		t.Fatal("completion accepted changed parent baseline")
+	}
+	active, err := store.ActiveApplyPlan(ctx)
+	if err != nil || active == nil || active.ID != plan || active.Status != "applying" || active.Steps[0].State != "applied" {
+		t.Fatalf("active after rejected completion=%#v err=%v", active, err)
+	}
+	item, found, err := store.InboxChange(ctx, 1)
+	if err != nil || !found || item.State != "applying" {
+		t.Fatalf("inbox after rejected completion=%#v found=%t err=%v", item, found, err)
 	}
 }
 

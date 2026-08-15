@@ -23,6 +23,15 @@ type InboxItem struct {
 	AppliedAt  *int64
 }
 
+// InboxParentBinding is the immutable root Folder identity authorizing one
+// direct-child Note plan.
+type InboxParentBinding struct {
+	ParentID     uuid.UUID
+	RelativePath string
+	Device       uint64
+	Inode        uint64
+}
+
 func parseCursor(raw, label string) (uint64, error) {
 	value, err := strconv.ParseUint(raw, 10, 63)
 	if err != nil || strconv.FormatUint(value, 10) != raw {
@@ -224,16 +233,16 @@ func (s *Store) PendingInboxChange(ctx context.Context, cursor uint64) (InboxIte
 	return item, found, err
 }
 
-// ListIndependentInboxCandidates returns the currently eligible root-note
-// update/delete rows in cursor order. Eligibility is a point-in-time filter;
-// CreateInboxApplyPlan repeats every invariant atomically.
+// ListIndependentInboxCandidates returns the currently eligible root-note and
+// direct-child note update/delete rows in cursor order. Eligibility is a
+// point-in-time filter; CreateInboxApplyPlan repeats it atomically.
 func (s *Store) ListIndependentInboxCandidates(ctx context.Context, limit int) ([]InboxItem, error) {
 	if limit <= 0 || limit > 1000 {
 		return nil, errors.New("invalid independent inbox candidate limit")
 	}
 	var items []InboxItem
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_inbox_changes i WHERE i.state='pending' AND i.object_type='note' AND i.parent_id IS NULL AND i.mutation IN ('update','delete') AND EXISTS(SELECT 1 FROM sync_baselines b WHERE b.object_id=i.object_id AND b.revision=i.revision-1) AND NOT EXISTS(SELECT 1 FROM sync_inbox_changes earlier WHERE earlier.object_id=i.object_id AND earlier.cursor<i.cursor AND earlier.state<>'applied') AND NOT EXISTS(SELECT 1 FROM sync_unresolved_local_intents unresolved WHERE unresolved.object_id=i.object_id) ORDER BY i.cursor LIMIT ?`, limit)
+		rows, err := tx.QueryContext(ctx, `SELECT `+inboxColumns+` FROM sync_independent_inbox_candidates ORDER BY cursor LIMIT ?`, limit)
 		if err != nil {
 			return err
 		}
@@ -306,18 +315,19 @@ func (s *Store) MarkInboxApplied(ctx context.Context, cursor uint64) error {
 }
 
 // CreateInboxApplyPlan creates one persisted apply plan for an independent
-// out-of-order root-note update or delete. It does not advance either cursor.
+// out-of-order root-note or direct-child note update or delete. It does not
+// advance either cursor.
 func (s *Store) CreateInboxApplyPlan(ctx context.Context, cursor uint64, planID uuid.UUID) error {
 	if cursor == 0 || cursor > math.MaxInt64 || !validOperationID(planID) {
 		return errors.New("invalid inbox apply plan")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		item, found, err := inboxItemTx(ctx, tx, cursor)
+		item, err := scanInboxItem(tx.QueryRowContext(ctx, `SELECT `+inboxColumns+` FROM sync_independent_inbox_candidates WHERE cursor=?`, cursor))
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("inbox change is not eligible for independent apply")
+		}
 		if err != nil {
 			return err
-		}
-		if !found || item.State != "pending" || item.Change.ObjectType != Note || item.Change.ParentID != nil || (item.Change.Mutation != Update && item.Change.Mutation != Delete) {
-			return errors.New("inbox change is not eligible for independent apply")
 		}
 		var active int
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM apply_plans WHERE status IN ('prepared','applying'))`).Scan(&active); err != nil {
@@ -326,44 +336,104 @@ func (s *Store) CreateInboxApplyPlan(ctx context.Context, cursor uint64, planID 
 		if active != 0 {
 			return errors.New("another apply plan is active")
 		}
-		var earlier int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_inbox_changes WHERE object_id=? AND cursor<? AND state<>'applied')`, item.Change.ObjectID.String(), cursor).Scan(&earlier); err != nil {
-			return err
-		}
-		if earlier != 0 {
-			return errors.New("earlier inbox change for object is not applied")
-		}
-		var unresolved int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_unresolved_local_intents WHERE object_id=?)`, item.Change.ObjectID.String()).Scan(&unresolved); err != nil {
-			return err
-		}
-		if unresolved != 0 {
-			return errors.New("inbox object has unresolved local intent")
-		}
-		var baseline uint64
-		if err := tx.QueryRowContext(ctx, `SELECT revision FROM sync_baselines WHERE object_id=?`, item.Change.ObjectID.String()).Scan(&baseline); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return errors.New("inbox object baseline is missing")
-			}
-			return err
-		}
-		if baseline == math.MaxInt64 || item.Change.Revision != baseline+1 {
-			return errors.New("inbox object baseline is not the exact predecessor")
-		}
 		now := s.clock().UTC().UnixMilli()
 		if _, err := tx.ExecContext(ctx, `INSERT INTO apply_plans(plan_id,from_cursor,through_cursor,status,created_at_ms) VALUES(?,?,?,'prepared',?)`, planID.String(), cursor-1, cursor, now); err != nil {
 			return err
 		}
-		var blob any
+		if item.Change.ParentID != nil {
+			result, err := tx.ExecContext(ctx, `INSERT INTO sync_inbox_parent_bindings(plan_id,inbox_cursor,parent_id,parent_relative,device,inode,baseline_revision,baseline_operation_id)
+				SELECT ?,?,parent.object_id,parent.relative_path,parent.folder_device,parent.folder_inode,baseline.revision,baseline.operation_id
+				FROM objects parent JOIN sync_baselines baseline ON baseline.object_id=parent.object_id
+				WHERE parent.object_id=?`, planID.String(), cursor, item.Change.ParentID.String())
+			if err != nil {
+				return err
+			}
+			if count, err := result.RowsAffected(); err != nil || count != 1 {
+				return errors.New("nested inbox parent binding unavailable")
+			}
+		}
+		var parent, blob any
+		if item.Change.ParentID != nil {
+			parent = item.Change.ParentID.String()
+		}
 		if len(item.Change.BlobHash) != 0 {
 			blob = item.Change.BlobHash
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,0,?,?,?,?,?,?,?,?,?,'pending')`, planID.String(), item.Change.Cursor, item.Change.OperationID.String(), item.Change.ObjectID.String(), item.Change.Mutation, item.Change.ObjectType, item.Change.Revision, nil, item.Change.Name, blob); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO apply_steps(plan_id,step_index,cursor,operation_id,object_id,mutation,object_type,revision,parent_id,name,blob_hash,state) VALUES(?,0,?,?,?,?,?,?,?,?,?,'pending')`, planID.String(), item.Change.Cursor, item.Change.OperationID.String(), item.Change.ObjectID.String(), item.Change.Mutation, item.Change.ObjectType, item.Change.Revision, parent, item.Change.Name, blob); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO sync_inbox_apply_plans(plan_id,cursor) VALUES(?,?)`, planID.String(), cursor)
 		return err
 	})
+}
+
+func linkedInboxParentBindingValidTx(ctx context.Context, tx *sql.Tx, planID uuid.UUID) error {
+	var valid int
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1
+		FROM sync_inbox_apply_plans link
+		JOIN sync_inbox_changes i ON i.cursor=link.cursor
+		WHERE link.plan_id=?
+		  AND ((i.parent_id IS NULL AND NOT EXISTS(SELECT 1 FROM sync_inbox_parent_bindings binding WHERE binding.plan_id=link.plan_id))
+		       OR EXISTS(SELECT 1 FROM sync_inbox_valid_parent_bindings binding WHERE binding.plan_id=link.plan_id AND binding.inbox_cursor=i.cursor))
+	)`, planID.String()).Scan(&valid)
+	if err != nil {
+		return err
+	}
+	if valid == 0 {
+		return errors.New("nested inbox parent binding is no longer valid")
+	}
+	return nil
+}
+
+// ActiveInboxParentBinding returns and revalidates the immutable parent
+// identity for a linked direct-child Note plan. Root-Note and legacy plans
+// return nil.
+func (s *Store) ActiveInboxParentBinding(ctx context.Context, planID uuid.UUID) (*InboxParentBinding, error) {
+	if !validOperationID(planID) {
+		return nil, errors.New("invalid apply plan id")
+	}
+	var binding *InboxParentBinding
+	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		var parent sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT i.parent_id
+			FROM sync_inbox_apply_plans link
+			JOIN sync_inbox_changes i ON i.cursor=link.cursor
+			WHERE link.plan_id=?`, planID.String()).Scan(&parent)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !parent.Valid {
+			var count int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sync_inbox_parent_bindings WHERE plan_id=?`, planID.String()).Scan(&count); err != nil {
+				return err
+			}
+			if count != 0 {
+				return errors.New("root inbox plan has a parent binding")
+			}
+			return nil
+		}
+		var rawID, relative string
+		var device, inode uint64
+		err = tx.QueryRowContext(ctx, `SELECT parent_id,parent_relative,device,inode
+			FROM sync_inbox_valid_parent_bindings WHERE plan_id=?`, planID.String()).Scan(&rawID, &relative, &device, &inode)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("nested inbox parent binding is no longer valid")
+		}
+		if err != nil {
+			return err
+		}
+		id, err := uuid.Parse(rawID)
+		if err != nil || id == uuid.Nil || id.String() != parent.String || naming.ValidateRelativePath(relative) != nil || device == 0 || inode == 0 {
+			return errors.New("invalid nested inbox parent binding")
+		}
+		binding = &InboxParentBinding{ParentID: id, RelativePath: relative, Device: device, Inode: inode}
+		return nil
+	})
+	return binding, err
 }
 
 // AbandonPreparedInboxPlan durably fails a pristine prepared linked plan. The
@@ -373,6 +443,7 @@ func (s *Store) AbandonPreparedInboxPlan(ctx context.Context, planID uuid.UUID) 
 		return errors.New("invalid apply plan id")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+
 		var pristine int
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 			SELECT 1 FROM sync_inbox_apply_plans l
@@ -517,6 +588,9 @@ func (s *Store) completeInboxApplyPlanTx(ctx context.Context, tx *sql.Tx, planID
 	}
 	if status != "applying" || stepState != "applied" || inboxState != "applying" || stepCount != 1 || stepCursor != cursor || revision < 2 {
 		return errors.New("linked inbox apply plan is not completable")
+	}
+	if err := linkedInboxParentBindingValidTx(ctx, tx, planID); err != nil {
+		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE sync_baselines SET revision=?,operation_id=? WHERE object_id=? AND revision=?`, revision, operationID, objectID, revision-1)
 	if err != nil {

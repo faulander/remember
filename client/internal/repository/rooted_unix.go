@@ -33,6 +33,20 @@ func ReadRooted(root, relative string, maxBytes int64) ([]byte, error) {
 	return readAt(parent, base, maxBytes)
 }
 
+// ReadRootedInFolderExpected reads through one retained parent descriptor after
+// binding that descriptor to the indexed Folder identity.
+func ReadRootedInFolderExpected(root, relative string, device, inode uint64, maxBytes int64) ([]byte, error) {
+	parent, base, err := openRootedParent(root, relative)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(parent)
+	if err := verifyFolderDescriptor(parent, device, inode); err != nil {
+		return nil, err
+	}
+	return readAt(parent, base, maxBytes)
+}
+
 func ReadRootedPrivate(root, relative string, maxBytes int64) ([]byte, error) {
 	parent, base, err := openRootedParent(root, relative)
 	if err != nil {
@@ -190,6 +204,16 @@ func CreateRooted(root, relative string, content []byte, validate Validator) err
 // the expected bytes. A replacement created after staging is never removed;
 // the displaced version is retained under the hidden staging name.
 func WriteRootedExpected(root, relative string, expected, content []byte, validate Validator) error {
+	return writeRootedExpected(root, relative, 0, 0, expected, content, validate)
+}
+
+// WriteRootedInFolderExpected replaces a note only through the exact indexed
+// parent Folder descriptor.
+func WriteRootedInFolderExpected(root, relative string, device, inode uint64, expected, content []byte, validate Validator) error {
+	return writeRootedExpected(root, relative, device, inode, expected, content, validate)
+}
+
+func writeRootedExpected(root, relative string, device, inode uint64, expected, content []byte, validate Validator) error {
 	if validate != nil {
 		if err := validate(content); err != nil {
 			return fmt.Errorf("validate staged note: %w", err)
@@ -200,6 +224,11 @@ func WriteRootedExpected(root, relative string, expected, content []byte, valida
 		return err
 	}
 	defer unix.Close(parent)
+	if device != 0 || inode != 0 {
+		if err := verifyFolderDescriptor(parent, device, inode); err != nil {
+			return err
+		}
+	}
 	displaced, err := stageAt(parent, base, ".remember-save-recovery-")
 	if err != nil {
 		return fmt.Errorf("stage destination before replace: %w", err)
@@ -258,11 +287,26 @@ func WriteRootedExpected(root, relative string, expected, content []byte, valida
 // MoveRootedExpected atomically renames the exact source pathname to a hidden
 // staging name before validation. It can never unlink a newly recreated source.
 func MoveRootedExpected(root, sourceRelative, destinationRelative string, expected []byte) error {
+	return moveRootedExpected(root, sourceRelative, destinationRelative, 0, 0, expected)
+}
+
+// MoveRootedFromFolderExpected moves a note only through the exact indexed
+// source Folder descriptor.
+func MoveRootedFromFolderExpected(root, sourceRelative, destinationRelative string, device, inode uint64, expected []byte) error {
+	return moveRootedExpected(root, sourceRelative, destinationRelative, device, inode, expected)
+}
+
+func moveRootedExpected(root, sourceRelative, destinationRelative string, device, inode uint64, expected []byte) error {
 	sourceParent, sourceBase, err := openRootedParent(root, sourceRelative)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(sourceParent)
+	if device != 0 || inode != 0 {
+		if err := verifyFolderDescriptor(sourceParent, device, inode); err != nil {
+			return err
+		}
+	}
 	destinationParent, destinationBase, err := openRootedParent(root, destinationRelative)
 	if err != nil {
 		return err
@@ -375,6 +419,20 @@ func recoverStagedMove(sourceParent, destinationParent int, destinationBase stri
 		return err
 	}
 	return unix.Fsync(sourceParent)
+}
+
+func verifyFolderDescriptor(fd int, device, inode uint64) error {
+	if device == 0 || inode == 0 {
+		return errors.New("invalid rooted folder identity")
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || uint64(stat.Dev) != device || uint64(stat.Ino) != inode {
+		return errors.New("rooted folder identity changed")
+	}
+	return nil
 }
 
 func openRootedParent(root, relative string) (int, string, error) {

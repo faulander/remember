@@ -84,6 +84,7 @@ func (r *interruptingRemote) Pull(ctx context.Context, after uint64, limit int) 
 type recordingRemote struct {
 	*remotehttp.Client
 	afters []uint64
+	max    int
 }
 
 func (r *recordingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b, c uuid.UUID, d, e, v uint64) (remotehttp.PreserveDeleteFolderResult, error) {
@@ -91,6 +92,9 @@ func (r *recordingRemote) PreserveAndDeleteEmptyFolder(ctx context.Context, a, b
 }
 func (r *recordingRemote) Pull(ctx context.Context, after uint64, limit int) (remotehttp.PullPage, error) {
 	r.afters = append(r.afters, after)
+	if r.max > 0 && limit > r.max {
+		limit = r.max
+	}
 	return r.Client.Pull(ctx, after, limit)
 }
 
@@ -918,6 +922,208 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	assertRememberNoteBytesAndID(t, ctx, c, "Q.md", expectedQ, q.ID)
 	if z.ID == uuid.Nil {
 		t.Fatal("missing Z id")
+	}
+}
+
+func TestAuthenticatedNestedNoteIsolationBehindDivergentFolderMove(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "nested-isolation@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Nested isolation A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Nested isolation B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "FolderX"); err != nil {
+		t.Fatal(err)
+	}
+	blocked, _, err := a.CreateNote(ctx, "FolderX/Blocked.md", "structural blocker\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "Notes"); err != nil {
+		t.Fatal(err)
+	}
+	y, _, err := a.CreateNote(ctx, "Notes/Y.md", "initial Y\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, _, err := a.CreateNote(ctx, "Notes/Z.md", "initial Z\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	blockedFolderID := localFolderIDAtPath(t, ctx, rootA, "FolderX")
+	notesFolderID := localFolderIDAtPath(t, ctx, rootA, "Notes")
+	if got := localFolderIDAtPath(t, ctx, rootB, "Notes"); got != notesFolderID {
+		t.Fatalf("Notes folder ids A/B=%s/%s", notesFolderID, got)
+	}
+	index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := store.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index.Close()
+
+	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "LocalFolder")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "FolderX")
+	localBefore, err := os.Stat(filepath.Join(rootB, "LocalFolder"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootA, "FolderX"), filepath.Join(rootA, "RemoteFolder")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootA, "FolderX")
+	currentY, err := a.ReadNote(ctx, "Notes/Y.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "Notes/Y.md", currentY.Revision, "remote nested Y2\n", []string{"nested"}); err != nil {
+		t.Fatal(err)
+	}
+	currentY, err = a.ReadNote(ctx, "Notes/Y.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "Notes/Y.md", currentY.Revision, "remote nested Y3\n", []string{"nested", "chain"}); err != nil {
+		t.Fatal(err)
+	}
+	currentZ, err := a.ReadNote(ctx, "Notes/Z.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DeleteNote(ctx, "Notes/Z.md", currentZ.Revision); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	expectedBlocked, err := os.ReadFile(filepath.Join(rootA, "RemoteFolder", "Blocked.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedY, err := os.ReadFile(filepath.Join(rootA, "Notes", "Y.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	paged := &recordingRemote{Client: remoteB, max: 2}
+	if err := b.SyncOnce(ctx, paged); !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+		t.Fatalf("blocked nested sync=%v", err)
+	}
+	assertRememberNoteBytesAndID(t, ctx, b, "Notes/Y.md", expectedY, y.ID)
+	if _, err := b.ReadNote(ctx, "Notes/Z.md"); err == nil {
+		t.Fatal("B retained deleted nested Z")
+	}
+	if info, err := os.Stat(filepath.Join(rootB, "LocalFolder")); err != nil || !os.SameFile(localBefore, info) {
+		t.Fatalf("local blocker inode changed: %v", err)
+	}
+	if len(paged.afters) < 2 {
+		t.Fatalf("nested isolation pull was not paginated: %v", paged.afters)
+	}
+	index, err = localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloaded, err := store.DownloadedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed, err := store.ConfirmedCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed != base || downloaded <= confirmed {
+		t.Fatalf("nested frontiers confirmed/downloaded/base=%d/%d/%d", confirmed, downloaded, base)
+	}
+	states := map[uuid.UUID]string{}
+	for cursor := base + 1; cursor <= downloaded; cursor++ {
+		item, found, err := store.InboxChange(ctx, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			states[item.Change.ObjectID] = item.State
+		}
+	}
+	if states[blockedFolderID] != "pending" || states[y.ID] != "applied" || states[z.ID] != "applied" {
+		t.Fatalf("nested inbox blocker/Y/Z=%q/%q/%q", states[blockedFolderID], states[y.ID], states[z.ID])
+	}
+	unresolved, err := store.HasUnresolvedLocalIntent(ctx, blockedFolderID)
+	if err != nil || !unresolved {
+		t.Fatalf("blocker intent unresolved=%v err=%v", unresolved, err)
+	}
+	index.Close()
+
+	yBeforeRestart, err := os.Stat(filepath.Join(rootB, "Notes", "Y.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = clientapp.Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	restarted := &recordingRemote{Client: remoteB, max: 2}
+	if err := b.SyncOnce(ctx, restarted); !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+		t.Fatalf("nested restart sync=%v", err)
+	}
+	if len(restarted.afters) == 0 || restarted.afters[0] != downloaded {
+		t.Fatalf("nested restart pull afters=%v downloaded=%d", restarted.afters, downloaded)
+	}
+	yAfterRestart, err := os.Stat(filepath.Join(rootB, "Notes", "Y.md"))
+	if err != nil || !os.SameFile(yBeforeRestart, yAfterRestart) || !yBeforeRestart.ModTime().Equal(yAfterRestart.ModTime()) {
+		t.Fatalf("nested Y republished on restart: %v", err)
+	}
+
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Nested isolation C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	if got := localFolderIDAtPath(t, ctx, rootC, "RemoteFolder"); got != blockedFolderID {
+		t.Fatalf("cold blocker folder id=%s want=%s", got, blockedFolderID)
+	}
+	if got := localFolderIDAtPath(t, ctx, rootC, "Notes"); got != notesFolderID {
+		t.Fatalf("cold Notes folder id=%s want=%s", got, notesFolderID)
+	}
+	assertRememberNoteBytesAndID(t, ctx, c, "RemoteFolder/Blocked.md", expectedBlocked, blocked.ID)
+	assertRememberNoteBytesAndID(t, ctx, c, "Notes/Y.md", expectedY, y.ID)
+	if _, err := c.ReadNote(ctx, "Notes/Z.md"); err == nil {
+		t.Fatal("cold client retained nested Z")
 	}
 }
 

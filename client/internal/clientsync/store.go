@@ -897,9 +897,12 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 				return err
 			}
 			if planStatus == "applying" && inboxState == "applying" {
-				return nil
+				return linkedInboxParentBindingValidTx(ctx, tx, planID)
 			}
 			if planStatus == "prepared" && inboxState == "applying" {
+				if err := linkedInboxParentBindingValidTx(ctx, tx, planID); err != nil {
+					return err
+				}
 				result, err := tx.ExecContext(ctx, `UPDATE apply_plans SET status='applying' WHERE plan_id=? AND status='prepared'`, planID.String())
 				if err != nil {
 					return err

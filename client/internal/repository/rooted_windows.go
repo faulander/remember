@@ -35,6 +35,9 @@ func RemoveRootedOutboxBlobExpected(string, string, [32]byte, int64) error {
 func ReadRooted(root, relative string, maxBytes int64) ([]byte, error) {
 	return readBoundedFile(filepath.Join(root, filepath.FromSlash(relative)), maxBytes)
 }
+func ReadRootedInFolderExpected(string, string, uint64, uint64, int64) ([]byte, error) {
+	return nil, errors.New("handle-safe rooted folder reads are not yet supported on Windows")
+}
 
 func CreateRootedDirectory(root, relative string, mode uint32) error {
 	path := filepath.Join(root, filepath.FromSlash(relative))
@@ -70,6 +73,9 @@ func CreateRootedInFolderExpected(string, string, string, uint64, uint64, []byte
 func WriteRootedExpected(root, relative string, expected, content []byte, validate Validator) error {
 	return WriteAtomicExpected(filepath.Join(root, filepath.FromSlash(relative)), expected, content, validate)
 }
+func WriteRootedInFolderExpected(string, string, uint64, uint64, []byte, []byte, Validator) error {
+	return errors.New("handle-safe rooted folder writes are not yet supported on Windows")
+}
 
 func MoveRootedExpected(root, sourceRelative, destinationRelative string, expected []byte) error {
 	source := filepath.Join(root, filepath.FromSlash(sourceRelative))
@@ -78,4 +84,7 @@ func MoveRootedExpected(root, sourceRelative, destinationRelative string, expect
 		return fmt.Errorf("move rooted note: %w", err)
 	}
 	return nil
+}
+func MoveRootedFromFolderExpected(string, string, string, uint64, uint64, []byte) error {
+	return errors.New("handle-safe rooted folder moves are not yet supported on Windows")
 }

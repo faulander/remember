@@ -201,6 +201,47 @@ func TestCreateRootedInFolderExpectedRejectsReplacement(t *testing.T) {
 	}
 }
 
+func TestRootedNoteMutationsRejectReplacementParentBinding(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "F"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "F", "N.md"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	device, inode, err := RootedFolderIdentity(root, "F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "F"), filepath.Join(root, "Old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "F"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "F", "N.md"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadRootedInFolderExpected(root, "F/N.md", device, inode, 4); err == nil {
+		t.Fatal("replacement parent accepted for read")
+	}
+	if err := WriteRootedInFolderExpected(root, "F/N.md", device, inode, []byte("old"), []byte("new"), nil); err == nil {
+		t.Fatal("replacement parent accepted for write")
+	}
+	if err := os.Mkdir(filepath.Join(root, "Trash"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveRootedFromFolderExpected(root, "F/N.md", "Trash/N.md", device, inode, []byte("old")); err == nil {
+		t.Fatal("replacement parent accepted for move")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "F", "N.md")); err != nil || string(got) != "old" {
+		t.Fatalf("replacement note=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Trash", "N.md")); !os.IsNotExist(err) {
+		t.Fatalf("replacement moved to trash: %v", err)
+	}
+}
+
 func TestMoveRootedEmptyFolderExpectedRestoresNonemptySource(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "A", "Folder"), 0o755); err != nil {

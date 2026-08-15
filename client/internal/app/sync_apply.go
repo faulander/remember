@@ -52,6 +52,7 @@ type preparedNoteStep struct {
 	folderMutation         bool
 	folderDevice           uint64
 	folderInode            uint64
+	parentBinding          *clientsync.InboxParentBinding
 	resolutionMaterialized bool
 }
 
@@ -88,6 +89,15 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 	if err != nil || plan == nil {
 		return err
 	}
+	parentBinding, err := store.ActiveInboxParentBinding(ctx, plan.ID)
+	if err != nil {
+		return err
+	}
+	if parentBinding != nil {
+		if err := repository.VerifyRootedFolderIdentity(c.root, parentBinding.RelativePath, parentBinding.Device, parentBinding.Inode); err != nil {
+			return fmt.Errorf("nested inbox parent identity changed: %w", err)
+		}
+	}
 	steps, err := c.preflightNotePlan(ctx, plan, resolver)
 	if err != nil {
 		var incident *applyIntegrityError
@@ -99,6 +109,12 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 			}
 		}
 		return err
+	}
+	if parentBinding != nil {
+		if len(steps) != 1 || steps[0].change.ParentID == nil || *steps[0].change.ParentID != parentBinding.ParentID || path.Dir(steps[0].relative) != parentBinding.RelativePath {
+			return errors.New("nested inbox plan no longer matches its parent binding")
+		}
+		steps[0].parentBinding = parentBinding
 	}
 	if err := store.BeginApplyPlan(ctx, plan.ID); err != nil {
 		return err
@@ -169,8 +185,18 @@ func (c *LocalCore) executeActiveApplyPlanLocked(ctx context.Context, resolver c
 		if testHookAfterNoteApplyReconcile != nil {
 			testHookAfterNoteApplyReconcile()
 		}
+		if parentBinding != nil {
+			if err := repository.VerifyRootedFolderIdentity(c.root, parentBinding.RelativePath, parentBinding.Device, parentBinding.Inode); err != nil {
+				return errors.New("nested inbox parent identity changed before step completion")
+			}
+		}
 		if err := store.MarkApplyStepApplied(ctx, plan.ID, step.index); err != nil {
 			return err
+		}
+	}
+	if parentBinding != nil {
+		if err := repository.VerifyRootedFolderIdentity(c.root, parentBinding.RelativePath, parentBinding.Device, parentBinding.Inode); err != nil {
+			return errors.New("nested inbox parent identity changed before plan completion")
 		}
 	}
 	if err := store.CompleteApplyPlan(ctx, plan.ID); err != nil {
@@ -1069,7 +1095,13 @@ func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {
 		}
 		return repository.CreateRooted(c.root, step.relative, step.content, validateAppliedNote(step.change.ObjectID))
 	case clientsync.Update:
-		current, err := repository.ReadRooted(c.root, step.relative, clientsync.MaxBlobBytes)
+		var current []byte
+		var err error
+		if step.parentBinding == nil {
+			current, err = repository.ReadRooted(c.root, step.relative, clientsync.MaxBlobBytes)
+		} else {
+			current, err = repository.ReadRootedInFolderExpected(c.root, step.relative, step.parentBinding.Device, step.parentBinding.Inode, clientsync.MaxBlobBytes)
+		}
 		if err != nil {
 			return err
 		}
@@ -1078,6 +1110,9 @@ func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {
 		}
 		if !bytes.Equal(current, step.expected) {
 			return errors.New("remote update source changed")
+		}
+		if step.parentBinding != nil {
+			return repository.WriteRootedInFolderExpected(c.root, step.relative, step.parentBinding.Device, step.parentBinding.Inode, step.expected, step.content, validateAppliedNote(step.change.ObjectID))
 		}
 		return repository.WriteRootedExpected(c.root, step.relative, step.expected, step.content, validateAppliedNote(step.change.ObjectID))
 	case clientsync.Move:
@@ -1095,6 +1130,9 @@ func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {
 		if err := repository.EnsureRootedDirectory(c.root, ".remember/trash", 0o700); err != nil {
 			return err
 		}
+		if step.parentBinding != nil {
+			return repository.MoveRootedFromFolderExpected(c.root, step.source, step.trash, step.parentBinding.Device, step.parentBinding.Inode, step.expected)
+		}
 		return repository.MoveRootedExpected(c.root, step.source, step.trash, step.expected)
 	default:
 		return ErrUnsupportedApplyPlan
@@ -1102,6 +1140,11 @@ func (c *LocalCore) publishNoteApplyStep(step preparedNoteStep) error {
 }
 
 func (c *LocalCore) verifyNoteApplyStep(step preparedNoteStep) error {
+	if step.parentBinding != nil {
+		if err := repository.VerifyRootedFolderIdentity(c.root, step.parentBinding.RelativePath, step.parentBinding.Device, step.parentBinding.Inode); err != nil {
+			return errors.New("nested inbox parent identity changed")
+		}
+	}
 	if step.deleted {
 		if _, err := repository.ReadRooted(c.root, step.relative, 1); !os.IsNotExist(err) {
 			return errors.New("deleted note still exists")
