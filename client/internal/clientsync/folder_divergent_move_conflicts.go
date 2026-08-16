@@ -328,6 +328,19 @@ func (s *Store) MarkConflictFolderDivergentMoveEvacuated(ctx context.Context, op
 		if err := validateDivergentNoteTopologyTx(ctx, tx, r); err != nil {
 			return err
 		}
+		var treeExists int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_tree_manifests WHERE operation_id=? AND sealed=1)`, operationID.String()).Scan(&treeExists); err != nil {
+			return err
+		}
+		if treeExists == 1 {
+			manifest, err := conflictFolderDivergentTreeManifestTx(ctx, tx, operationID)
+			if err != nil {
+				return err
+			}
+			if err := validateDivergentFolderTreeTopologyTx(ctx, tx, r.FolderID, *manifest); err != nil {
+				return err
+			}
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE conflict_folder_divergent_move_recoveries SET state='evacuated' WHERE operation_id=? AND state='prepared'`, operationID.String())
 		if err != nil {
 			return err
@@ -376,6 +389,23 @@ func (s *Store) CompleteConflictFolderDivergentMoveRecovery(ctx context.Context,
 		}
 		if ok == 0 {
 			return errors.New("divergent folder move completion identity mismatch")
+		}
+		foundTree, treeMutations, err := divergentFolderTreeReplacementMutationsTx(ctx, tx, r)
+		if err != nil {
+			return err
+		}
+		if foundTree {
+			if err := s.enqueueTx(ctx, tx, treeMutations); err != nil {
+				return err
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE conflict_folder_divergent_move_recoveries SET state='completed' WHERE operation_id=? AND state='canonical_published'`, r.OperationID.String())
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return errors.New("divergent folder tree completion unavailable")
+			}
+			return nil
 		}
 		foundRecursive, recursiveMutations, err := recursiveLocalFolderReplacementMutationsTx(ctx, tx, RecursiveFolderDivergentMoveRecovery, r.OperationID, r.RecoveredFolderID, path.Base(r.RecoveryRelative))
 		if err != nil {

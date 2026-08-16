@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -880,6 +882,323 @@ func TestAuthenticatedDivergentFolderDirectNotesConverge(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "divergent-tree@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Tree A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Tree B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "F/K"); err != nil {
+		t.Fatal(err)
+	}
+	knownNote, _, err := a.CreateNote(ctx, "F/K/N.md", "authenticated known\n", []string{"server"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	rootID := localFolderIDAtPath(t, ctx, rootB, "F")
+	knownFolderID := localFolderIDAtPath(t, ctx, rootB, "F/K")
+	canonicalBytes, err := os.ReadFile(filepath.Join(rootB, "F", "K", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceInfo, err := os.Stat(filepath.Join(rootB, "F"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "F")
+	localOnly, _, err := b.CreateNote(ctx, "Local/Only.md", "authenticated local\n", []string{"local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localBytes, err := os.ReadFile(filepath.Join(rootB, "Local", "Only.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.ListReady(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moveOperation uuid.UUID
+	for _, item := range ready {
+		if item.Mutation.ObjectID == rootID && item.Mutation.Kind == clientsync.Move {
+			moveOperation = item.Mutation.OperationID
+		}
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if moveOperation == uuid.Nil {
+		t.Fatal("missing divergent tree move operation")
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootA, "F")
+	syncTimes(t, ctx, a, remoteA, 1)
+	if err := b.SyncOnce(ctx, remoteB); err != nil && !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+		t.Fatalf("pre-restart recovery: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err = clientapp.Open(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for i := 0; i < 10; i++ {
+		if err := b.SyncOnce(ctx, remoteB); err != nil && !errors.Is(err, clientapp.ErrUnresolvedOutbound) {
+			t.Fatalf("restart B recovery %d: %v", i, err)
+		}
+	}
+	recovered := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName("Local", moveOperation)
+	recoveredRootID := localFolderIDAtPath(t, ctx, rootB, recovered)
+	recoveredFolderID := localFolderIDAtPath(t, ctx, rootB, recovered+"/K")
+	recoveredKnownBytes, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recovered), "K", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredKnown, err := frontmatter.Read(recoveredKnownBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveredRootID == uuid.Nil || recoveredRootID == rootID || recoveredFolderID == uuid.Nil || recoveredFolderID == knownFolderID || recoveredKnown.NoteID == uuid.Nil || recoveredKnown.NoteID == knownNote.ID {
+		t.Fatalf("recovered identities root=%s folder=%s note=%s", recoveredRootID, recoveredFolderID, recoveredKnown.NoteID)
+	}
+	recoveredInfo, err := os.Stat(filepath.Join(rootB, filepath.FromSlash(recovered)))
+	if err != nil || !os.SameFile(sourceInfo, recoveredInfo) {
+		t.Fatalf("restart B recovered root inode: %v", err)
+	}
+	verify := func(label string, core *clientapp.LocalCore) {
+		t.Helper()
+		assertRememberNoteBytesAndID(t, ctx, core, "Server/K/N.md", canonicalBytes, knownNote.ID)
+		knownCopyBytes, err := os.ReadFile(filepath.Join(core.Root(), filepath.FromSlash(recovered), "K", "N.md"))
+		if err != nil {
+			t.Fatalf("%s recovered known note: %v", label, err)
+		}
+		knownCopy, err := frontmatter.Read(knownCopyBytes)
+		if err != nil || knownCopy.NoteID != recoveredKnown.NoteID || string(knownCopy.Body) != "authenticated known\n" || !reflect.DeepEqual(knownCopy.Tags, []string{"server"}) {
+			t.Fatalf("%s recovered known note=%#v err=%v", label, knownCopy, err)
+		}
+		assertRememberNoteBytesAndID(t, ctx, core, recovered+"/Only.md", localBytes, localOnly.ID)
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Server"); got != rootID {
+			t.Fatalf("%s canonical root=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Server/K"); got != knownFolderID {
+			t.Fatalf("%s canonical child=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), recovered); got != recoveredRootID {
+			t.Fatalf("%s recovered root=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), recovered+"/K"); got != recoveredFolderID {
+			t.Fatalf("%s recovered child=%s", label, got)
+		}
+		snapshot, err := core.Snapshot(ctx)
+		if err != nil || len(snapshot.Issues) != 0 {
+			t.Fatalf("%s issues=%#v err=%v", label, snapshot.Issues, err)
+		}
+		for _, stale := range []string{"F", "Local"} {
+			if _, err := os.Stat(filepath.Join(core.Root(), stale)); !os.IsNotExist(err) {
+				t.Fatalf("%s retained %s: %v", label, stale, err)
+			}
+		}
+	}
+	verify("B", b)
+	syncTimes(t, ctx, a, remoteA, 3)
+	verify("A", a)
+	remoteC := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Tree C"))
+	rootC := t.TempDir()
+	c, _, err := clientapp.Initialize(ctx, rootC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	syncTimes(t, ctx, c, remoteC, 1)
+	verify("C", c)
+	index, err = localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
+		t.Fatalf("B unresolved=%t err=%v", unresolved, err)
+	}
+	recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, moveOperation)
+	if err != nil || recovery == nil || recovery.State != "completed" {
+		t.Fatalf("B recovery=%#v err=%v", recovery, err)
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedDivergentFolderTreeRejectsAdvancedKnownBaseline(t *testing.T) {
+	ctx := context.Background()
+	server, err := integrationtest.New(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const email, password = "divergent-tree-baseline@example.test", "correct horse battery staple"
+	if err := server.CreateVerifiedUser(ctx, email, password); err != nil {
+		t.Fatal(err)
+	}
+	remoteA := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Baseline A"))
+	remoteB := remote(t, server.URL, login(t, server.URL, email, password, "Divergent Baseline B"))
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a, _, err := clientapp.Initialize(ctx, rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, _, err := clientapp.Initialize(ctx, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	note, _, err := a.CreateNote(ctx, "F/N.md", "known\n", []string{"server"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	syncTimes(t, ctx, b, remoteB, 1)
+	original, err := os.ReadFile(filepath.Join(rootB, "F", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	folderID := localFolderIDAtPath(t, ctx, rootB, "F")
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootB, "F")
+	index, err := localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := store.ListReady(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moveOperation uuid.UUID
+	for _, item := range ready {
+		if item.Mutation.ObjectID == folderID && item.Mutation.Kind == clientsync.Move {
+			moveOperation = item.Mutation.OperationID
+		}
+	}
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if moveOperation == uuid.Nil {
+		t.Fatal("missing baseline divergence move")
+	}
+	current, err := a.ReadNote(ctx, "F/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "F/N.md", current.Revision, "transient\n", []string{"server"}); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	current, err = a.ReadNote(ctx, "F/N.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.SaveNote(ctx, "F/N.md", current.Revision, "known\n", []string{"server"}); err != nil {
+		t.Fatal(err)
+	}
+	syncTimes(t, ctx, a, remoteA, 1)
+	reverted, err := os.ReadFile(filepath.Join(rootA, "F", "N.md"))
+	if err != nil || !bytes.Equal(reverted, original) {
+		t.Fatalf("same-byte baseline setup exact=%t err=%v", bytes.Equal(reverted, original), err)
+	}
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFolderMove(t, ctx, rootA, "F")
+	syncTimes(t, ctx, a, remoteA, 1)
+	for i := 0; i < 4; i++ {
+		_ = b.SyncOnce(ctx, remoteB)
+	}
+	index, err = localindex.Open(ctx, filepath.Join(rootB, ".remember", "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	store, err = clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, moveOperation)
+	if err != nil || recovery == nil || recovery.State == "completed" {
+		t.Fatalf("advanced baseline recovery=%#v err=%v", recovery, err)
+	}
+	manifest, err := store.ConflictFolderDivergentTreeManifest(ctx, moveOperation)
+	if err != nil || manifest == nil {
+		t.Fatalf("advanced baseline manifest=%#v err=%v", manifest, err)
+	}
+	revision, found, err := store.Baseline(ctx, note.ID)
+	if err != nil || !found || revision <= manifest.Members[0].SourceRevision {
+		t.Fatalf("advanced note baseline=%d sealed=%d found=%t err=%v", revision, manifest.Members[0].SourceRevision, found, err)
+	}
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		for _, operation := range append([]uuid.UUID{manifest.NewRootOperationID}, manifest.Members[0].NewOperationID) {
+			var count int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_outbox WHERE operation_id=?`, operation.String()).Scan(&count); err != nil {
+				return err
+			}
+			if count != 0 {
+				return fmt.Errorf("replacement %s was enqueued", operation)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	ctx := context.Background()
 	server, err := integrationtest.New(ctx, t.TempDir())
@@ -904,6 +1223,9 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := a.CreateFolder(ctx, "FolderX"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateFolder(ctx, "Container"); err != nil {
 		t.Fatal(err)
 	}
 	blocked, _, err := a.CreateNote(ctx, "FolderX/Blocked.md", "structural blocker\n", nil)
@@ -937,11 +1259,11 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 		t.Fatal(err)
 	}
 	index.Close()
-	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "LocalFolder")); err != nil {
+	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "Container", "LocalFolder")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileFolderMove(t, ctx, rootB, "FolderX")
-	localBefore, err := os.Stat(filepath.Join(rootB, "LocalFolder"))
+	localBefore, err := os.Stat(filepath.Join(rootB, "Container", "LocalFolder"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -987,7 +1309,7 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	if _, err := b.ReadNote(ctx, "Z.md"); err == nil {
 		t.Fatal("B retained deleted Z")
 	}
-	if info, err := os.Stat(filepath.Join(rootB, "LocalFolder")); err != nil || !os.SameFile(localBefore, info) {
+	if info, err := os.Stat(filepath.Join(rootB, "Container", "LocalFolder")); err != nil || !os.SameFile(localBefore, info) {
 		t.Fatalf("local folder inode changed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(rootB, "RemoteFolder")); !os.IsNotExist(err) {
@@ -1066,7 +1388,7 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	if got := localFolderIDAtPath(t, ctx, rootC, "RemoteFolder"); got != folderID {
 		t.Fatalf("cold folder id=%s want=%s", got, folderID)
 	}
-	if _, err := os.Stat(filepath.Join(rootC, "LocalFolder")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rootC, "Container", "LocalFolder")); !os.IsNotExist(err) {
 		t.Fatalf("cold retained local losing path: %v", err)
 	}
 	assertRememberNoteBytesAndID(t, ctx, c, "RemoteFolder/Blocked.md", expectedBlocked, blocked.ID)
@@ -1106,6 +1428,9 @@ func TestAuthenticatedNestedNoteIsolationBehindDivergentFolderMove(t *testing.T)
 	if _, err := a.CreateFolder(ctx, "FolderX"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := a.CreateFolder(ctx, "Container"); err != nil {
+		t.Fatal(err)
+	}
 	blocked, _, err := a.CreateNote(ctx, "FolderX/Blocked.md", "structural blocker\n", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1142,11 +1467,11 @@ func TestAuthenticatedNestedNoteIsolationBehindDivergentFolderMove(t *testing.T)
 	}
 	index.Close()
 
-	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "LocalFolder")); err != nil {
+	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "Container", "LocalFolder")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileFolderMove(t, ctx, rootB, "FolderX")
-	localBefore, err := os.Stat(filepath.Join(rootB, "LocalFolder"))
+	localBefore, err := os.Stat(filepath.Join(rootB, "Container", "LocalFolder"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1193,7 +1518,7 @@ func TestAuthenticatedNestedNoteIsolationBehindDivergentFolderMove(t *testing.T)
 	if _, err := b.ReadNote(ctx, "Notes/Z.md"); err == nil {
 		t.Fatal("B retained deleted nested Z")
 	}
-	if info, err := os.Stat(filepath.Join(rootB, "LocalFolder")); err != nil || !os.SameFile(localBefore, info) {
+	if info, err := os.Stat(filepath.Join(rootB, "Container", "LocalFolder")); err != nil || !os.SameFile(localBefore, info) {
 		t.Fatalf("local blocker inode changed: %v", err)
 	}
 	if len(paged.afters) < 2 {

@@ -198,6 +198,33 @@ func TestMaterializeConflictCopyRekeysAndRecordsOrigin(t *testing.T) {
 	}
 }
 
+func TestRekeyIdentityPreservesContentWithoutConflictMetadata(t *testing.T) {
+	original, replacement := uuid.New(), uuid.Must(uuid.NewV7())
+	input := []byte("---\r\n# keep\r\ntitle: Unknown\r\nremember:\r\n  schema: 1\r\n  note_id: \"" + original.String() + "\"\r\n  tags: [Work]\r\n  custom: true\r\n---\r\nBody exact\r\n")
+	output, err := RekeyIdentity(input, original, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := Inspect(output)
+	if err != nil || inspection.NoteID != replacement {
+		t.Fatalf("inspection=%#v err=%v", inspection, err)
+	}
+	for _, expected := range []string{"# keep", "title: Unknown", "tags:", "Work", "custom: true", "Body exact\r\n"} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Fatalf("missing %q in %s", expected, output)
+		}
+	}
+	if bytes.Contains(output, []byte("conflict:")) {
+		t.Fatalf("unexpected conflict metadata in %s", output)
+	}
+	if strings.Contains(strings.ReplaceAll(string(output), "\r\n", ""), "\n") {
+		t.Fatal("rekeyed CRLF document contains bare LF")
+	}
+	if _, err := RekeyIdentity(input, uuid.New(), replacement); err == nil {
+		t.Fatal("mismatched source identity accepted")
+	}
+}
+
 func TestEnsureIdentityRefusesInvalidSource(t *testing.T) {
 	t.Parallel()
 

@@ -597,6 +597,8 @@ ADR 0076 und Client-Schema v38 erweitern lokale Folder-Create-, divergente Root-
 
 ADR 0077 und Protokoll v4 implementieren die vollständige aktive Folder-Delete/Remote-Move-DAG: Folder werden parent-first unter frischen UUIDs geklont, Notes unter unveränderter UUID und mit exaktem Blob in den jeweiligen Clone-Parent verschoben, danach werden Original-Folder deepest-first tombstoned. Client und Server versiegeln Root, Actor/Device, Counts, Parent-/Depth-Deskriptoren, Revisionen, Hashes und Cursor; rekursive Post-Frontier-Historie, mehr als 256 Folder-Ebenen oder 10.000 Objekte sowie fehlende Blobs lehnen die Transaktion ab. V1–V3 bleiben wire- und replay-kompatibel; eine vorbereitete ältere Resolution darf erst nach authentifizierter expliziter Ablehnung mit neuer Operations-ID auf v4 wechseln.
 
+ADR 0079 und Client-Schema v40 erweitern divergente Root-Folder-Moves auf gemischte Subtrees. Der kanonische Server-Subtree behält Root- und Descendant-UUIDs sowie exakte bestätigte Note-Bytes. Die sichtbare lokale Verlustfassung erhält einen neuen Root; serverbekannte Folder und Notes werden unter frischen UUIDs geklont, ausschließlich lokale Descendants behalten UUID und finale Bytes. Ein unveränderliches Manifest bindet Source-/Recovery-IDs, Parent-DAG, Pfade, Tiefen, Operationen, Baselines, Inodes und Hashes. Lokale Intents auf serverbekannten Descendants, attempted oder verzweigte Historie und jede Source-Abweichung bleiben fail-closed.
+
 Ablauf:
 
 1. Batch laden,
@@ -764,6 +766,7 @@ Umsetzung von `SYNC-008`:
 - Eine deterministische Operationsordnung bestimmt den kanonischen Ort.
 - Die alternative Benutzerabsicht wird als Strukturkonflikt angezeigt.
 - Sind unterschiedliche Objekte am gleichen Ziel beteiligt, greift die Pfadkollisionsregel.
+- ADR 0079 konvergiert unterschiedliche Root-Ziele auch für gemischte Subtrees aus exakt baseline-identischen serverbekannten und streng manifestierten lokalen Descendants: Der Serverpfad behält alle ursprünglichen UUIDs und Bytes; die lokale Verlustfassung klont serverbekannte Identitäten und erhält lokale Identitäten. Canonical-Staging, Recovery-Evakuierung und Replacement-Outbox sind crash-fortsetzbar.
 
 Die genaue UX, ob die alternative Absicht zusätzlich als Alias oder nur als Konfliktereignis dargestellt wird, wird in Meilenstein 2 festgelegt.
 

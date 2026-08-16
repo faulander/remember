@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path"
 	"sort"
 
@@ -26,8 +27,11 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 		old := make(map[uuid.UUID]localindex.Object)
 		current := make(map[uuid.UUID]localindex.Object)
 		pending := make(map[uuid.UUID]bool)
+		previousPending := make(map[uuid.UUID]localindex.Object)
 		for _, o := range previous.Objects {
-			if o.IdentityState != localindex.IdentityPending {
+			if o.IdentityState == localindex.IdentityPending {
+				previousPending[o.ID] = o
+			} else {
 				old[o.ID] = o
 			}
 		}
@@ -71,6 +75,9 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 				}
 			}
 			before, was := old[id]
+			if pendingBefore, ok := previousPending[id]; ok && sameObserved(pendingBefore, o) && pendingBefore.FolderDevice == o.FolderDevice && pendingBefore.FolderInode == o.FolderInode {
+				continue
+			}
 			projected, err := loadProjection(id)
 			if err != nil {
 				return nil, nil, err
@@ -148,7 +155,7 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 					if parentProjection.dependency != nil {
 						m.DependencyOperationID = parentProjection.dependency
 					} else if !parentProjection.durable {
-						return nil, nil, errors.New("sync child parent has no durable server projection")
+						return nil, nil, fmt.Errorf("sync child %s parent %s has no durable server projection", o.RelativePath, o.ParentID)
 					}
 				}
 			}
@@ -195,7 +202,7 @@ func captureSync(ctx context.Context, root string, index *localindex.Index, prev
 					if parentProjection.dependency != nil && (m.DependencyOperationID == nil || *m.DependencyOperationID != *parentProjection.dependency) {
 						m.AdditionalDependencies = append(m.AdditionalDependencies, *parentProjection.dependency)
 					} else if !parentProjection.durable && parentProjection.dependency == nil {
-						return nil, nil, errors.New("sync move parent has no durable server projection")
+						return nil, nil, fmt.Errorf("sync move %s parent %s has no durable server projection", o.RelativePath, o.ParentID)
 					}
 				}
 				mutations = append(mutations, m)

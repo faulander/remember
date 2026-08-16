@@ -54,8 +54,12 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 	if err := store.ReconcileInboxAppliedThroughConfirmed(ctx); err != nil {
 		return err
 	}
+	awaitingDivergentTreePull := false
 	if err := c.stageSupportedConflicts(ctx, store, remote); err != nil {
-		return err
+		if !errors.Is(err, errDivergentTreeAwaitingPull) {
+			return err
+		}
+		awaitingDivergentTreePull = true
 	}
 	if err := c.cleanupCompletedConflictStages(ctx, store); err != nil {
 		return err
@@ -90,8 +94,10 @@ func (c *LocalCore) SyncOnce(ctx context.Context, remote SyncRemote) error {
 			return err
 		}
 	}
-	if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode}); err != nil {
-		return err
+	if !awaitingDivergentTreePull {
+		if _, err := reconcile.Run(ctx, c.root, c.index, reconcile.Options{RecoveryMode: c.recoveryMode}); err != nil {
+			return err
+		}
 	}
 	// Pull authenticated history before dependency-ready child deletes. If it
 	// proves that a pending subtree root was remotely moved, probe that root
@@ -173,7 +179,10 @@ normalOutbox:
 		}
 		if !result.Accepted {
 			if err := c.stageSupportedConflicts(ctx, store, remote); err != nil {
-				return err
+				if !errors.Is(err, errDivergentTreeAwaitingPull) {
+					return err
+				}
+				break
 			}
 			// A rejected subtree-root delete must pull its canonical move before
 			// any queued descendant deletes can be submitted.

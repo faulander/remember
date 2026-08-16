@@ -38,6 +38,7 @@ var testHookBeforeDivergentFolderEvacuatedTransition func() error
 var testHookAfterDivergentCanonicalStageCreate func() error
 var testHookAfterDivergentCanonicalPublish func() error
 var testHookAfterDivergentCanonicalCleanup func() error
+var testHookAfterDivergentTreeRewrite func() error
 
 func preserveDeleteNotes(in []remotehttp.PreserveDeleteNoteMove) []clientsync.FolderPreserveDeleteNoteMove {
 	out := make([]clientsync.FolderPreserveDeleteNoteMove, len(in))
@@ -153,7 +154,7 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 				if errors.Is(err, clientsync.ErrDivergentFolderMoveIneligible) {
 					continue
 				}
-				return err
+				return fmt.Errorf("recover divergent root folder move: %w", err)
 			}
 			continue
 		}
@@ -586,6 +587,7 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 	}
 	var members []clientsync.ConflictFolderCreateNoteMember
 	var recursive *clientsync.ConflictRecursiveLocalFolderManifest
+	var tree *clientsync.ConflictFolderDivergentTreeManifest
 	if recovery == nil {
 		eligible, err := store.DivergentFolderMoveRecoveryEligible(ctx, m.OperationID)
 		if err != nil {
@@ -604,52 +606,67 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(canonical.Name))); err == nil || !os.IsNotExist(err) {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
-		recursive, err = store.DiscoverRecursiveLocalFolderManifest(ctx, m.OperationID, m.ObjectID)
-		if err != nil {
-			return clientsync.ErrDivergentFolderMoveIneligible
-		}
-		if recursive != nil {
-			if err := prepareRecursiveLocalFolderManifest(c.root, object.RelativePath, object.ID, objects, recursive); err != nil {
-				return clientsync.ErrDivergentFolderMoveIneligible
-			}
-		} else {
-			members, err = store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
-			if err != nil {
-				return clientsync.ErrDivergentFolderMoveIneligible
-			}
-			byID := map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember{}
-			for _, member := range members {
-				byID[member.NoteID] = member
-			}
-			prefix := object.RelativePath + "/"
-			for _, desc := range snapshot.Objects {
-				if desc.ID == object.ID || !strings.HasPrefix(desc.RelativePath, prefix) {
-					continue
-				}
-				member, ok := byID[desc.ID]
-				if !ok || desc.Type != localindex.ObjectNote || path.Dir(desc.RelativePath) != object.RelativePath || member.Name != path.Base(desc.RelativePath) || !bytes.Equal(desc.ContentHash, member.BlobHash[:]) {
-					return clientsync.ErrDivergentFolderMoveIneligible
-				}
-				delete(byID, desc.ID)
-			}
-			if len(byID) != 0 {
-				return clientsync.ErrDivergentFolderMoveIneligible
-			}
-			if err := verifyDivergentDirectNoteSubtree(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, members); err != nil {
-				return clientsync.ErrDivergentFolderMoveIneligible
-			}
-		}
 		recoveredID, err := uuid.NewV7()
 		if err != nil {
 			return err
 		}
-		var newOperation uuid.UUID
-		if recursive != nil {
-			newOperation = recursive.NewRootOperationID
-		} else {
-			newOperation, err = uuid.NewV7()
+		plannedRootOperation, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		candidates, err := divergentFolderTreeCandidates(object, snapshot)
+		if err != nil {
+			return clientsync.ErrDivergentFolderMoveIneligible
+		}
+		if len(candidates) != 0 {
+			tree, err = store.PlanConflictFolderDivergentTree(ctx, m.OperationID, m.ObjectID, recoveredID, plannedRootOperation, candidates)
 			if err != nil {
-				return err
+				return fmt.Errorf("plan divergent folder tree: %w", err)
+			}
+		}
+		var newOperation uuid.UUID
+		if tree != nil {
+			if err := prepareDivergentFolderTreeManifest(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, tree); err != nil {
+				return fmt.Errorf("prepare divergent folder tree: %w", err)
+			}
+			newOperation = tree.NewRootOperationID
+		} else {
+			recursive, err = store.DiscoverRecursiveLocalFolderManifest(ctx, m.OperationID, m.ObjectID)
+			if err != nil {
+				return clientsync.ErrDivergentFolderMoveIneligible
+			}
+			if recursive != nil {
+				if err := prepareRecursiveLocalFolderManifest(c.root, object.RelativePath, object.ID, objects, recursive); err != nil {
+					return clientsync.ErrDivergentFolderMoveIneligible
+				}
+				newOperation = recursive.NewRootOperationID
+			} else {
+				members, err = store.PendingDirectNoteCreates(ctx, m.OperationID, m.ObjectID)
+				if err != nil {
+					return clientsync.ErrDivergentFolderMoveIneligible
+				}
+				byID := map[uuid.UUID]clientsync.ConflictFolderCreateNoteMember{}
+				for _, member := range members {
+					byID[member.NoteID] = member
+				}
+				prefix := object.RelativePath + "/"
+				for _, desc := range snapshot.Objects {
+					if desc.ID == object.ID || !strings.HasPrefix(desc.RelativePath, prefix) {
+						continue
+					}
+					member, ok := byID[desc.ID]
+					if !ok || desc.Type != localindex.ObjectNote || path.Dir(desc.RelativePath) != object.RelativePath || member.Name != path.Base(desc.RelativePath) || !bytes.Equal(desc.ContentHash, member.BlobHash[:]) {
+						return clientsync.ErrDivergentFolderMoveIneligible
+					}
+					delete(byID, desc.ID)
+				}
+				if len(byID) != 0 {
+					return clientsync.ErrDivergentFolderMoveIneligible
+				}
+				if err := verifyDivergentDirectNoteSubtree(c.root, object.RelativePath, object.FolderDevice, object.FolderInode, members); err != nil {
+					return clientsync.ErrDivergentFolderMoveIneligible
+				}
+				newOperation = plannedRootOperation
 			}
 		}
 		target := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName(path.Base(object.RelativePath), m.OperationID)
@@ -664,7 +681,12 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			return err
 		}
 		recovery = &clientsync.ConflictFolderDivergentMoveRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperation, AttemptedRelative: object.RelativePath, CanonicalRelative: canonical.Name, RecoveryRelative: target, SourceDevice: object.FolderDevice, SourceInode: object.FolderInode, CanonicalRevision: canonical.Revision, CanonicalNonce: nonce, State: "prepared"}
-		if recursive != nil {
+		if tree != nil {
+			err = store.PutConflictFolderDivergentMoveRecoveryWithTree(ctx, *recovery, *tree)
+			if err != nil {
+				return fmt.Errorf("persist divergent folder tree: %w", err)
+			}
+		} else if recursive != nil {
 			err = store.PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx, *recovery, *recursive)
 		} else if len(members) == 0 {
 			err = store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery)
@@ -683,6 +705,13 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		if err != nil {
 			return err
 		}
+		tree, err = store.ConflictFolderDivergentTreeManifest(ctx, m.OperationID)
+		if err != nil {
+			return err
+		}
+	}
+	if tree != nil {
+		return c.recoverDivergentFolderMoveTree(ctx, store, recovery, tree)
 	}
 	verifyRecovery := func() error {
 		if recursive != nil {

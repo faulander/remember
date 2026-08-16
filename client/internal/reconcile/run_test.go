@@ -67,6 +67,80 @@ func TestRunInitializesNotesAndFoldersThenIsIdempotent(t *testing.T) {
 		t.Error("idempotent reconciliation changed note bytes")
 	}
 }
+func TestCaptureDoesNotEchoExactPendingFolderPromotion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "Folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	index := openTestIndex(t, ctx, root)
+	folderID := uuid.MustParse("018f4c3a-2222-7abc-8123-123456789abc")
+	operationID := uuid.MustParse("018f4c3a-3333-7abc-8123-123456789abc")
+	if _, err := Run(ctx, root, index, Options{AllowInitialFolderIDs: true, NewID: sequenceGenerator(t, folderID), NewOperationID: sequenceGenerator(t, operationID)}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAttempted(ctx, operationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResult(ctx, operationID, clientsync.Result{Accepted: true, Revision: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := index.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous.Objects[0].IdentityState = localindex.IdentityPending
+	if err := index.ReplaceSnapshot(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	current := previous
+	current.Objects = append([]localindex.Object(nil), previous.Objects...)
+	current.Objects[0].IdentityState = localindex.IdentityKnown
+	if err := captureSync(ctx, root, index, previous, &current, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.ListReady(ctx, 10); err != nil || len(ready) != 0 {
+		t.Fatalf("pending promotion emitted echo mutations: %#v err=%v", ready, err)
+	}
+}
+
+func TestCaptureDoesNotEchoPendingRecoveryFolderPromotionWithoutProjection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	index := openTestIndex(t, ctx, root)
+	folderID := uuid.MustParse("018f4c3a-4444-7abc-8123-123456789abc")
+	previous := localindex.Snapshot{Objects: []localindex.Object{{
+		ID:            folderID,
+		Type:          localindex.ObjectFolder,
+		RelativePath:  "_Konflikte/Wiederhergestellt/Recovered",
+		FolderDevice:  41,
+		CollisionPath: "_konflikte/wiederhergestellt/recovered",
+		FolderInode:   42,
+		IdentityState: localindex.IdentityPending,
+	}}}
+	if err := index.ReplaceSnapshot(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	current := previous
+	current.Objects = append([]localindex.Object(nil), previous.Objects...)
+	current.Objects[0].IdentityState = localindex.IdentityKnown
+	if err := captureSync(ctx, root, index, previous, &current, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := clientsync.NewStore(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.ListReady(ctx, 10); err != nil || len(ready) != 0 {
+		t.Fatalf("pending recovery promotion emitted echo mutations: %#v err=%v", ready, err)
+	}
+}
 
 func TestRunPreservesNoteIdentityAcrossMove(t *testing.T) {
 	t.Parallel()

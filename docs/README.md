@@ -90,5 +90,6 @@
 | [0076](adr/0076-m2-recursive-local-folder-recovery.md) | Rekursive lokale Folder-Recovery für exakt manifestierte Create/Update-DAGs |
 | [0077](adr/0077-m2-recursive-folder-preserve-delete.md) | Atomare rekursive Folder-Delete/Remote-Move-Recovery mit identitätserhaltenden Notes |
 | [0078](adr/0078-m2-recursive-note-inbox-isolation.md) | Ancestry-gebundene Isolation tief verschachtelter Note-Updates/-Deletes |
+| [0079](adr/0079-m2-divergent-folder-server-known-descendants.md) | Divergente Root-Folder-Moves mit exakt gebundenen serverbekannten und lokalen Descendants |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

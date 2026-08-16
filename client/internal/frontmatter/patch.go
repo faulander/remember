@@ -127,6 +127,41 @@ func MaterializeConflictCopy(markdown []byte, expectedID, conflictID uuid.UUID, 
 	return output, nil
 }
 
+// RekeyIdentity replaces only the stable note UUID. The body and all other
+// frontmatter fields are preserved, although yaml.v3 may normalize formatting.
+func RekeyIdentity(markdown []byte, expectedID, replacementID uuid.UUID) ([]byte, error) {
+	parsed, err := parse(markdown)
+	if err != nil {
+		return nil, err
+	}
+	if !parsed.inspection.HasRemember || expectedID == uuid.Nil || parsed.inspection.NoteID != expectedID || replacementID == uuid.Nil || replacementID.Variant() != uuid.RFC4122 || replacementID == expectedID {
+		return nil, &ValidationError{Problem: ProblemInvalidNoteID, Detail: expectedID.String()}
+	}
+	setMappingPair(parsed.remember, "note_id", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: replacementID.String(), Style: yaml.DoubleQuotedStyle})
+
+	var encoded bytes.Buffer
+	encoder := yaml.NewEncoder(&encoded)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(parsed.document); err != nil {
+		return nil, &ValidationError{Problem: ProblemInvalidYAML, Detail: err.Error()}
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, &ValidationError{Problem: ProblemInvalidYAML, Detail: err.Error()}
+	}
+	yamlOutput := encoded.String()
+	if parsed.newline == "\r\n" {
+		yamlOutput = strings.ReplaceAll(yamlOutput, "\n", "\r\n")
+	}
+	output := make([]byte, 0, len(yamlOutput)+len(parsed.body)+16)
+	output = append(output, "---"...)
+	output = append(output, parsed.newline...)
+	output = append(output, yamlOutput...)
+	output = append(output, "---"...)
+	output = append(output, parsed.newline...)
+	output = append(output, parsed.body...)
+	return output, nil
+}
+
 // UpdateEditable replaces only body and tags while preserving stable identity
 // and unknown YAML nodes. yaml.v3 may normalize frontmatter formatting.
 func UpdateEditable(markdown []byte, expectedID uuid.UUID, body []byte, tags []string) ([]byte, error) {

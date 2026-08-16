@@ -953,7 +953,7 @@ func (s *Store) BeginApplyPlan(ctx context.Context, planID uuid.UUID) error {
 func (s *Store) PutFolderMutation(ctx context.Context, mutation FolderMutation) error {
 	validTarget := mutation.Mutation == Move && naming.ValidateUserRelativePath(mutation.TargetRelative) == nil || mutation.Mutation == Delete && len(mutation.TargetRelative) > 0
 	if !validOperationID(mutation.PlanID) || mutation.StepIndex < 0 || !validObjectID(mutation.FolderID) || (mutation.Mutation != Move && mutation.Mutation != Delete) || naming.ValidateUserRelativePath(mutation.SourceRelative) != nil || !validTarget || mutation.Device == 0 || mutation.Inode == 0 || mutation.Device > math.MaxInt64 || mutation.Inode > math.MaxInt64 {
-		return errors.New("invalid folder mutation binding")
+		return fmt.Errorf("invalid folder mutation binding: plan=%s step=%d folder=%s mutation=%s source=%q target=%q device=%d inode=%d", mutation.PlanID, mutation.StepIndex, mutation.FolderID, mutation.Mutation, mutation.SourceRelative, mutation.TargetRelative, mutation.Device, mutation.Inode)
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO apply_folder_mutations(plan_id,step_index,folder_id,mutation_kind,source_relative,target_relative,device,inode)

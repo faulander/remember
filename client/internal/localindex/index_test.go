@@ -251,6 +251,9 @@ func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
 		if _, err := tx.Exec(`INSERT INTO sync_state(key,value) VALUES('confirmed_cursor','42') ON CONFLICT(key) DO UPDATE SET value='42'`); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`DROP VIEW conflict_folder_divergent_tree_replacements_complete; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_update_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_no_delete; DROP TRIGGER conflict_folder_divergent_tree_member_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_member_no_update; DROP TRIGGER conflict_folder_divergent_tree_member_no_delete; DROP TRIGGER conflict_folder_divergent_tree_chain_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_chain_no_update; DROP TRIGGER conflict_folder_divergent_tree_chain_no_delete; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_update; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_delete; DROP TABLE conflict_folder_divergent_tree_canonical_folders; DROP TABLE conflict_folder_divergent_tree_note_chains; DROP TABLE conflict_folder_divergent_tree_members; DROP TABLE conflict_folder_divergent_tree_manifests; CREATE VIEW sync_unresolved_local_intents AS SELECT object_id FROM sync_outbox WHERE 0; CREATE TRIGGER conflict_folder_divergent_move_state_guard BEFORE UPDATE ON conflict_folder_divergent_move_recoveries BEGIN SELECT 1; END`); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DROP TRIGGER sync_folder_preserve_delete_note_insert_guard; DROP TRIGGER sync_folder_preserve_delete_note_no_update; DROP TRIGGER sync_folder_preserve_delete_note_no_delete; DROP TABLE sync_folder_preserve_delete_note_moves; DROP TRIGGER sync_folder_preserve_delete_clone_insert_guard; DROP TRIGGER sync_folder_preserve_delete_clone_no_update; DROP TRIGGER sync_folder_preserve_delete_clone_no_delete; DROP TABLE sync_folder_preserve_delete_clones; DROP TRIGGER sync_folder_preserve_delete_resolution_insert_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_immutable; DROP TRIGGER sync_folder_preserve_delete_resolution_seal_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_no_delete; DROP TABLE sync_folder_preserve_delete_resolutions; DROP TRIGGER conflict_folder_divergent_move_note_members_no_update; DROP TRIGGER conflict_folder_divergent_move_note_members_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_update; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_members_guard; DROP TRIGGER conflict_folder_divergent_move_note_chains_guard; DROP TABLE conflict_folder_divergent_move_note_chains; DROP TABLE conflict_folder_divergent_move_note_members; DROP TRIGGER conflict_folder_divergent_move_insert_guard; DROP TRIGGER conflict_folder_divergent_move_identity_immutable; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_move_no_delete; DROP TABLE conflict_folder_divergent_move_recoveries; DROP TRIGGER sync_integrity_incident_insert_guard; DROP TRIGGER sync_integrity_incident_binding_immutable; DROP TRIGGER sync_integrity_incident_progress_guard; DROP TRIGGER sync_integrity_incident_no_delete; DROP TRIGGER sync_integrity_incident_step_binding_immutable; DROP TRIGGER sync_integrity_incident_step_no_delete; DROP TABLE sync_integrity_incidents; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; DROP TABLE sync_inbox_changes; DELETE FROM sync_state WHERE key='downloaded_cursor'; PRAGMA user_version=24`); err != nil {
 			return err
 		}
@@ -286,6 +289,9 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`DROP VIEW sync_inbox_valid_nested_bindings; DROP VIEW sync_inbox_valid_parent_bindings; DROP VIEW sync_independent_inbox_candidates; DROP VIEW sync_inbox_note_ancestry; DROP TRIGGER sync_inbox_parent_binding_insert_guard; DROP TRIGGER sync_inbox_parent_binding_no_update; DROP TRIGGER sync_inbox_parent_binding_no_delete; DROP TABLE sync_inbox_parent_bindings`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP VIEW conflict_folder_divergent_tree_replacements_complete; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_update_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_no_delete; DROP TRIGGER conflict_folder_divergent_tree_member_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_member_no_update; DROP TRIGGER conflict_folder_divergent_tree_member_no_delete; DROP TRIGGER conflict_folder_divergent_tree_chain_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_chain_no_update; DROP TRIGGER conflict_folder_divergent_tree_chain_no_delete; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_update; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_delete; DROP TABLE conflict_folder_divergent_tree_canonical_folders; DROP TABLE conflict_folder_divergent_tree_note_chains; DROP TABLE conflict_folder_divergent_tree_members; DROP TABLE conflict_folder_divergent_tree_manifests; CREATE VIEW sync_unresolved_local_intents AS SELECT object_id FROM sync_outbox WHERE 0; CREATE TRIGGER conflict_folder_divergent_move_state_guard BEFORE UPDATE ON conflict_folder_divergent_move_recoveries BEGIN SELECT 1; END`); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DROP TRIGGER sync_folder_preserve_delete_note_insert_guard; DROP TRIGGER sync_folder_preserve_delete_note_no_update; DROP TRIGGER sync_folder_preserve_delete_note_no_delete; DROP TABLE sync_folder_preserve_delete_note_moves; DROP TRIGGER sync_folder_preserve_delete_clone_insert_guard; DROP TRIGGER sync_folder_preserve_delete_clone_no_update; DROP TRIGGER sync_folder_preserve_delete_clone_no_delete; DROP TABLE sync_folder_preserve_delete_clones; DROP TRIGGER sync_folder_preserve_delete_resolution_insert_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_immutable; DROP TRIGGER sync_folder_preserve_delete_resolution_seal_guard; DROP TRIGGER sync_folder_preserve_delete_resolution_no_delete; DROP TABLE sync_folder_preserve_delete_resolutions; DROP TRIGGER conflict_folder_divergent_move_note_members_no_update; DROP TRIGGER conflict_folder_divergent_move_note_members_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_update; DROP TRIGGER conflict_folder_divergent_move_note_chains_no_delete; DROP TRIGGER conflict_folder_divergent_move_note_members_guard; DROP TRIGGER conflict_folder_divergent_move_note_chains_guard; DROP TABLE conflict_folder_divergent_move_note_chains; DROP TABLE conflict_folder_divergent_move_note_members; DROP TRIGGER conflict_folder_divergent_move_insert_guard; DROP TRIGGER conflict_folder_divergent_move_identity_immutable; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_move_no_delete; DROP TABLE conflict_folder_divergent_move_recoveries; DROP TRIGGER sync_integrity_incident_insert_guard; DROP TRIGGER sync_integrity_incident_binding_immutable; DROP TRIGGER sync_integrity_incident_progress_guard; DROP TRIGGER sync_integrity_incident_no_delete; DROP TRIGGER sync_integrity_incident_step_binding_immutable; DROP TRIGGER sync_integrity_incident_step_no_delete; DROP TABLE sync_integrity_incidents; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER sync_inbox_apply_plan_conflict_guard; DROP TRIGGER sync_inbox_apply_plan_insert_guard; DROP TRIGGER sync_inbox_apply_plan_immutable; DROP TRIGGER sync_inbox_apply_plan_no_delete; DROP TRIGGER sync_inbox_linked_inbox_state_guard; DROP TRIGGER sync_inbox_linked_plan_state_guard; DROP TRIGGER sync_inbox_linked_step_state_guard; DROP TRIGGER sync_inbox_linked_plan_payload_immutable; DROP TRIGGER sync_inbox_linked_plan_no_delete; DROP TRIGGER sync_inbox_linked_step_no_insert; DROP TRIGGER sync_inbox_linked_step_payload_immutable; DROP TRIGGER sync_inbox_linked_step_no_delete; DROP TABLE sync_inbox_apply_plans; PRAGMA user_version=25`); err != nil {
@@ -566,6 +572,75 @@ func TestV39MigrationPreservesDirectBindingAndRootEligibility(t *testing.T) {
 	}
 }
 
+func TestV40MigrationPreservesPreparedDivergentRecoveryAndAcceptsSealedTree(t *testing.T) {
+	db := openLocalSchemaVersion(t, filepath.Join(t.TempDir(), "v39.db"), 39)
+	defer db.Close()
+	operation, replacementRootOperation, baselineOperation, replacementNoteOperation := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	rootID, recoveredRootID, noteID, recoveredNoteID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	nonce := bytes.Repeat([]byte{1}, sha256.Size)
+	sourceHash, recoveredHash := bytes.Repeat([]byte{2}, sha256.Size), bytes.Repeat([]byte{3}, sha256.Size)
+	recoveryRelative := "_Konflikte/Wiederhergestellt/Local (Konflikt - " + operation.String() + ")"
+	if _, err := db.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,conflict_code,created_at_ms) VALUES(?,'move',?,'folder',1,NULL,'Local',NULL,'conflict','base_revision_mismatch',1)`, operation.String(), rootID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_conflict_states(operation_id,object_type,revision,parent_id,name,blob_hash,deleted) VALUES(?,'folder',2,NULL,'Server',NULL,0)`, operation.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_outbox_folder_intents(operation_id,folder_id,mutation_kind,source_relative,device,inode) VALUES(?,?,'move','F',11,22)`, operation.String(), rootID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, operation.String(), rootID.String(), recoveredRootID.String(), replacementRootOperation.String(), "Local", "Server", recoveryRelative, 11, 22, 2, nonce); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,1,?)`, noteID.String(), baselineOperation.String()); err != nil {
+		t.Fatal(err)
+	}
+	script, err := migrations.ReadFile("migrations/040_divergent_server_known_tree.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(string(script)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA user_version=40`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO conflict_folder_divergent_tree_manifests(operation_id,new_root_operation_id,member_count,known_count,sealed) VALUES(?,?,?,?,0)`, operation.String(), replacementRootOperation.String(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	blockedNoteID, blockedRecoveredNoteID := uuid.New(), uuid.New()
+	blockedBaselineOperation, blockedUpdateOperation, blockedReplacementOperation := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	if _, err := db.Exec(`INSERT INTO sync_baselines(object_id,revision,operation_id) VALUES(?,1,?)`, blockedNoteID.String(), blockedBaselineOperation.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,name,blob_hash,status,created_at_ms) VALUES(?,'update',?,'note',1,'',?,'pending',2)`, blockedUpdateOperation.String(), blockedNoteID.String(), sourceHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO conflict_folder_divergent_tree_members(operation_id,ordinal,source_object_id,recovered_object_id,source_parent_id,recovered_parent_id,source_operation_id,new_operation_id,object_type,name,relative_path,depth,source_revision,source_blob_hash,recovered_blob_hash) VALUES(?,1,?,?,?,?,?,?,'note','Blocked.md','Blocked.md',1,1,?,?)`, operation.String(), blockedNoteID.String(), blockedRecoveredNoteID.String(), rootID.String(), recoveredRootID.String(), blockedBaselineOperation.String(), blockedReplacementOperation.String(), sourceHash, recoveredHash); err == nil {
+		t.Fatal("known descendant with open intent entered divergent tree manifest")
+	}
+	if _, err := db.Exec(`INSERT INTO conflict_folder_divergent_tree_members(operation_id,ordinal,source_object_id,recovered_object_id,source_parent_id,recovered_parent_id,source_operation_id,new_operation_id,object_type,name,relative_path,depth,source_revision,source_blob_hash,recovered_blob_hash) VALUES(?,1,?,?,?,?,?,?,'note','N.md','N.md',1,1,?,?)`, operation.String(), noteID.String(), recoveredNoteID.String(), rootID.String(), recoveredRootID.String(), baselineOperation.String(), replacementNoteOperation.String(), sourceHash, recoveredHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE conflict_folder_divergent_tree_manifests SET sealed=1 WHERE operation_id=?`, operation.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE conflict_folder_divergent_move_recoveries SET state='evacuated' WHERE operation_id=?`, operation.String()); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var memberCount, sealed int
+	if err := db.QueryRow(`SELECT r.state,m.member_count,m.sealed FROM conflict_folder_divergent_move_recoveries r JOIN conflict_folder_divergent_tree_manifests m ON m.operation_id=r.operation_id WHERE r.operation_id=?`, operation.String()).Scan(&state, &memberCount, &sealed); err != nil {
+		t.Fatal(err)
+	}
+	if state != "evacuated" || memberCount != 1 || sealed != 1 {
+		t.Fatalf("migrated recovery state=%s members=%d sealed=%d", state, memberCount, sealed)
+	}
+	if _, err := db.Exec(`UPDATE conflict_folder_divergent_tree_members SET name='Changed.md' WHERE operation_id=?`, operation.String()); err == nil {
+		t.Fatal("sealed migrated tree member became mutable")
+	}
+}
+
 func openLocalSchemaVersion(t *testing.T, path string, version int) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
@@ -608,7 +683,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=40`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=41`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
