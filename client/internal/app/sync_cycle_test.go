@@ -4704,7 +4704,7 @@ func TestSyncOnceRejectsDivergentFolderTreeWithKnownDescendantIntent(t *testing.
 	}
 }
 
-func TestSyncOnceRejectsDivergentFolderMoveRevisionConflict(t *testing.T) {
+func TestSyncOnceRecoversDivergentFolderMoveWithDifferentParents(t *testing.T) {
 	ctx := context.Background()
 	server := &memorySyncServer{blobs: map[[32]byte][]byte{}, results: map[uuid.UUID]clientsync.Result{}, states: map[uuid.UUID]clientsync.Change{}}
 	remote := &memoryRemote{server: server}
@@ -4719,12 +4719,29 @@ func TestSyncOnceRejectsDivergentFolderMoveRevisionConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	for _, folder := range []string{"F", "Remote", "Local"} {
-		if _, err := a.CreateFolder(ctx, folder); err != nil {
+	if _, err := a.CreateFolder(ctx, "F"); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := a.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var folderID uuid.UUID
+	for _, object := range initial.Objects {
+		if object.RelativePath == "F" {
+			folderID = object.ID
+		}
+	}
+	if folderID == uuid.Nil {
+		t.Fatal("folder identity missing")
+	}
+	for _, relative := range []string{"Remote", "Local"} {
+		if _, err := a.CreateFolder(ctx, relative); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := a.CreateNote(ctx, "F/N.md", "base\n", nil); err != nil {
+	note, _, err := a.CreateNote(ctx, "F/N.md", "base\n", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := a.SyncOnce(ctx, remote); err != nil {
@@ -4732,6 +4749,23 @@ func TestSyncOnceRejectsDivergentFolderMoveRevisionConflict(t *testing.T) {
 	}
 	if err := b.SyncOnce(ctx, remote); err != nil {
 		t.Fatal(err)
+	}
+	expectedBytes, err := os.ReadFile(filepath.Join(rootB, "F", "N.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncedSnapshot, err := b.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remoteParentID uuid.UUID
+	for _, object := range syncedSnapshot.Objects {
+		if object.RelativePath == "Remote" {
+			remoteParentID = object.ID
+		}
+	}
+	if remoteParentID == uuid.Nil {
+		t.Fatal("remote parent identity missing")
 	}
 	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Remote", "F")); err != nil {
 		t.Fatal(err)
@@ -4748,18 +4782,115 @@ func TestSyncOnceRejectsDivergentFolderMoveRevisionConflict(t *testing.T) {
 	if _, err := b.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SyncOnce(ctx, remote); !errors.Is(err, ErrUnresolvedOutbound) {
-		t.Fatalf("divergent folder move err=%v", err)
+	tampered := false
+	testHookBeforeDivergentFolderEvacuatedTransition = func() error {
+		tampered = true
+		return b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE sync_baselines SET revision=revision+1 WHERE object_id=?`, remoteParentID.String())
+			return err
+		})
+	}
+	defer func() { testHookBeforeDivergentFolderEvacuatedTransition = nil }()
+	if err := b.SyncOnce(ctx, remote); err == nil || !tampered {
+		t.Fatalf("parent baseline tamper passed transition: %v", err)
+	}
+	testHookBeforeDivergentFolderEvacuatedTransition = nil
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_baselines SET revision=revision-1 WHERE object_id=?`, remoteParentID.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := b.SyncOnce(ctx, remote); err != nil && !errors.Is(err, ErrUnresolvedOutbound) {
+			t.Fatalf("recover divergent folder move %d: %v", i, err)
+		}
 	}
 	store, _ := clientsync.NewStore(b.index)
-	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || !unresolved {
+	if unresolved, err := store.HasUnresolvedOutbox(ctx); err != nil || unresolved {
 		t.Fatalf("divergent folder move unresolved=%t err=%v", unresolved, err)
 	}
-	if _, err := b.ReadNote(ctx, "Local/F/N.md"); err != nil {
-		t.Fatalf("divergent local tree changed: %v", err)
+	var operationRaw, state string
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT operation_id,state FROM conflict_folder_divergent_move_recoveries`).Scan(&operationRaw, &state)
+	}); err != nil || state != "completed" {
+		t.Fatalf("recovery operation=%q state=%q err=%v", operationRaw, state, err)
 	}
-	if _, err := os.Stat(filepath.Join(rootB, "Remote", "F")); !os.IsNotExist(err) {
-		t.Fatalf("remote target was guessed: %v", err)
+	operationID, err := uuid.Parse(operationRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateConflictFolderDivergentParents(ctx, operationID); err != nil {
+		t.Fatalf("parent bindings invalid: %v", err)
+	}
+	snapshot, err := b.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonicalFolder, canonicalNote, recoveredFolder, recoveredNote localindex.Object
+	for _, object := range snapshot.Objects {
+		switch {
+		case object.ID == folderID:
+			canonicalFolder = object
+		case object.ID == note.ID:
+			canonicalNote = object
+		case object.Type == localindex.ObjectFolder && strings.HasPrefix(object.RelativePath, clientsync.ConflictRootName+"/"+clientsync.ConflictRecoveredName+"/F (Konflikt - "):
+			recoveredFolder = object
+		}
+	}
+	for _, object := range snapshot.Objects {
+		if object.Type == localindex.ObjectNote && object.ParentID == recoveredFolder.ID {
+			recoveredNote = object
+		}
+	}
+	if canonicalFolder.RelativePath != "Remote/F" || canonicalNote.RelativePath != "Remote/F/N.md" || canonicalNote.ParentID != folderID {
+		t.Fatalf("canonical folder=%#v note=%#v", canonicalFolder, canonicalNote)
+	}
+	if recoveredFolder.ID == uuid.Nil || recoveredFolder.ID == folderID {
+		t.Fatalf("recovered folder=%#v", recoveredFolder)
+	}
+	if recoveredNote.ID == uuid.Nil || recoveredNote.ID == note.ID || recoveredNote.ParentID != recoveredFolder.ID {
+		t.Fatalf("recovered note=%#v", recoveredNote)
+	}
+	actual, err := os.ReadFile(filepath.Join(rootB, "Remote", "F", "N.md"))
+	if err != nil || !bytes.Equal(actual, expectedBytes) {
+		t.Fatalf("canonical bytes=%q err=%v", actual, err)
+	}
+	recoveredBytes, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recoveredNote.RelativePath)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := frontmatter.Read(recoveredBytes)
+	if err != nil || recovered.NoteID != recoveredNote.ID || string(recovered.Body) != "base\n" {
+		t.Fatalf("recovered note=%#v err=%v", recovered, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootB, "Local", "F")); !os.IsNotExist(err) {
+		t.Fatalf("losing path remains: %v", err)
+	}
+	recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, operationID)
+	if err != nil || recovery == nil {
+		t.Fatalf("recovery=%#v err=%v", recovery, err)
+	}
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE conflict_folder_divergent_parent_bindings SET relative_path='Changed' WHERE operation_id=?`, operationID.String())
+		return err
+	}); err == nil {
+		t.Fatal("sealed divergent parent binding mutated")
+	}
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE conflict_folder_divergent_move_recoveries SET canonical_parent_id=NULL WHERE operation_id=?`, operationID.String())
+		return err
+	}); err == nil {
+		t.Fatal("sealed divergent recovery parent mutated")
+	}
+	if err := b.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sync_baselines SET revision=revision+1 WHERE object_id=?`, recovery.CanonicalParentID.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateConflictFolderDivergentParents(ctx, operationID); !errors.Is(err, clientsync.ErrDivergentFolderMoveIneligible) {
+		t.Fatalf("advanced parent baseline accepted: %v", err)
 	}
 }
 

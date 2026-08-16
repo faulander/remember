@@ -911,6 +911,11 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 	if _, err := a.CreateFolder(ctx, "F/K"); err != nil {
 		t.Fatal(err)
 	}
+	for _, relative := range []string{"Remote", "Local", "Remote/Deep", "Local/Deep"} {
+		if _, err := a.CreateFolder(ctx, relative); err != nil {
+			t.Fatal(err)
+		}
+	}
 	knownNote, _, err := a.CreateNote(ctx, "F/K/N.md", "authenticated known\n", []string{"server"})
 	if err != nil {
 		t.Fatal(err)
@@ -919,6 +924,10 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 	syncTimes(t, ctx, b, remoteB, 1)
 	rootID := localFolderIDAtPath(t, ctx, rootB, "F")
 	knownFolderID := localFolderIDAtPath(t, ctx, rootB, "F/K")
+	remoteAncestorID := localFolderIDAtPath(t, ctx, rootB, "Remote")
+	localAncestorID := localFolderIDAtPath(t, ctx, rootB, "Local")
+	remoteParentID := localFolderIDAtPath(t, ctx, rootB, "Remote/Deep")
+	localParentID := localFolderIDAtPath(t, ctx, rootB, "Local/Deep")
 	canonicalBytes, err := os.ReadFile(filepath.Join(rootB, "F", "K", "N.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -927,15 +936,15 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local")); err != nil {
+	if err := os.Rename(filepath.Join(rootB, "F"), filepath.Join(rootB, "Local", "Deep", "F")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileFolderMove(t, ctx, rootB, "F")
-	localOnly, _, err := b.CreateNote(ctx, "Local/Only.md", "authenticated local\n", []string{"local"})
+	localOnly, _, err := b.CreateNote(ctx, "Local/Deep/F/Only.md", "authenticated local\n", []string{"local"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	localBytes, err := os.ReadFile(filepath.Join(rootB, "Local", "Only.md"))
+	localBytes, err := os.ReadFile(filepath.Join(rootB, "Local", "Deep", "F", "Only.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +972,7 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 	if moveOperation == uuid.Nil {
 		t.Fatal("missing divergent tree move operation")
 	}
-	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Server")); err != nil {
+	if err := os.Rename(filepath.Join(rootA, "F"), filepath.Join(rootA, "Remote", "Deep", "F")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileFolderMove(t, ctx, rootA, "F")
@@ -984,7 +993,7 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 			t.Fatalf("restart B recovery %d: %v", i, err)
 		}
 	}
-	recovered := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName("Local", moveOperation)
+	recovered := clientsync.ConflictRootName + "/" + clientsync.ConflictRecoveredName + "/" + clientsync.ConflictFolderName("F", moveOperation)
 	recoveredRootID := localFolderIDAtPath(t, ctx, rootB, recovered)
 	recoveredFolderID := localFolderIDAtPath(t, ctx, rootB, recovered+"/K")
 	recoveredKnownBytes, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(recovered), "K", "N.md"))
@@ -1004,7 +1013,7 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 	}
 	verify := func(label string, core *clientapp.LocalCore) {
 		t.Helper()
-		assertRememberNoteBytesAndID(t, ctx, core, "Server/K/N.md", canonicalBytes, knownNote.ID)
+		assertRememberNoteBytesAndID(t, ctx, core, "Remote/Deep/F/K/N.md", canonicalBytes, knownNote.ID)
 		knownCopyBytes, err := os.ReadFile(filepath.Join(core.Root(), filepath.FromSlash(recovered), "K", "N.md"))
 		if err != nil {
 			t.Fatalf("%s recovered known note: %v", label, err)
@@ -1014,11 +1023,23 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 			t.Fatalf("%s recovered known note=%#v err=%v", label, knownCopy, err)
 		}
 		assertRememberNoteBytesAndID(t, ctx, core, recovered+"/Only.md", localBytes, localOnly.ID)
-		if got := localFolderIDAtPath(t, ctx, core.Root(), "Server"); got != rootID {
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Remote/Deep/F"); got != rootID {
 			t.Fatalf("%s canonical root=%s", label, got)
 		}
-		if got := localFolderIDAtPath(t, ctx, core.Root(), "Server/K"); got != knownFolderID {
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Remote/Deep/F/K"); got != knownFolderID {
 			t.Fatalf("%s canonical child=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Remote"); got != remoteAncestorID {
+			t.Fatalf("%s remote ancestor=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Local"); got != localAncestorID {
+			t.Fatalf("%s local ancestor=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Remote/Deep"); got != remoteParentID {
+			t.Fatalf("%s remote parent=%s", label, got)
+		}
+		if got := localFolderIDAtPath(t, ctx, core.Root(), "Local/Deep"); got != localParentID {
+			t.Fatalf("%s local parent=%s", label, got)
 		}
 		if got := localFolderIDAtPath(t, ctx, core.Root(), recovered); got != recoveredRootID {
 			t.Fatalf("%s recovered root=%s", label, got)
@@ -1030,8 +1051,8 @@ func TestAuthenticatedDivergentFolderTreeConvergesAcrossRestartAndColdClient(t *
 		if err != nil || len(snapshot.Issues) != 0 {
 			t.Fatalf("%s issues=%#v err=%v", label, snapshot.Issues, err)
 		}
-		for _, stale := range []string{"F", "Local"} {
-			if _, err := os.Stat(filepath.Join(core.Root(), stale)); !os.IsNotExist(err) {
+		for _, stale := range []string{"F", "Local/Deep/F"} {
+			if _, err := os.Stat(filepath.Join(core.Root(), filepath.FromSlash(stale))); !os.IsNotExist(err) {
 				t.Fatalf("%s retained %s: %v", label, stale, err)
 			}
 		}
@@ -1258,11 +1279,18 @@ func TestAuthenticatedRootNoteIsolationBehindDivergentFolderMove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	index.Close()
+	containerID := localFolderIDAtPath(t, ctx, rootB, "Container")
 	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "Container", "LocalFolder")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileFolderMove(t, ctx, rootB, "FolderX")
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM sync_baselines WHERE object_id=?`, containerID.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	index.Close()
 	localBefore, err := os.Stat(filepath.Join(rootB, "Container", "LocalFolder"))
 	if err != nil {
 		t.Fatal(err)
@@ -1465,12 +1493,19 @@ func TestAuthenticatedNestedNoteIsolationBehindDivergentFolderMove(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	index.Close()
+	containerID := localFolderIDAtPath(t, ctx, rootB, "Container")
 
 	if err := os.Rename(filepath.Join(rootB, "FolderX"), filepath.Join(rootB, "Container", "LocalFolder")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileFolderMove(t, ctx, rootB, "FolderX")
+	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM sync_baselines WHERE object_id=?`, containerID.String())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	index.Close()
 	localBefore, err := os.Stat(filepath.Join(rootB, "Container", "LocalFolder"))
 	if err != nil {
 		t.Fatal(err)

@@ -91,5 +91,6 @@
 | [0077](adr/0077-m2-recursive-folder-preserve-delete.md) | Atomare rekursive Folder-Delete/Remote-Move-Recovery mit identitätserhaltenden Notes |
 | [0078](adr/0078-m2-recursive-note-inbox-isolation.md) | Ancestry-gebundene Isolation tief verschachtelter Note-Updates/-Deletes |
 | [0079](adr/0079-m2-divergent-folder-server-known-descendants.md) | Divergente Root-Folder-Moves mit exakt gebundenen serverbekannten und lokalen Descendants |
+| [0080](adr/0080-m2-divergent-folder-parent-bindings.md) | Divergente Folder-Moves mit vollständig ancestry- und baseline-gebundenen Ziel-Parents |
 
 ADRs dokumentieren einen zum jeweiligen Zeitpunkt akzeptierten Schnitt. Spätere Entscheidungen dürfen frühere ADRs ergänzen, müssen Abweichungen aber ausdrücklich benennen.

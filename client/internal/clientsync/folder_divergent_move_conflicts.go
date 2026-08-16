@@ -17,11 +17,11 @@ import (
 var ErrDivergentFolderMoveIneligible = errors.New("divergent folder move is not eligible for automatic recovery")
 
 type ConflictFolderDivergentMoveRecovery struct {
-	OperationID, FolderID, RecoveredFolderID, NewOperationID                      uuid.UUID
-	AttemptedRelative, CanonicalRelative, RecoveryRelative                        string
-	SourceDevice, SourceInode, CanonicalRevision, CanonicalDevice, CanonicalInode uint64
-	CanonicalNonce                                                                [sha256.Size]byte
-	State                                                                         string
+	OperationID, FolderID, RecoveredFolderID, NewOperationID, AttemptedParentID, CanonicalParentID uuid.UUID
+	AttemptedRelative, CanonicalRelative, RecoveryRelative                                         string
+	SourceDevice, SourceInode, CanonicalRevision, CanonicalDevice, CanonicalInode                  uint64
+	CanonicalNonce                                                                                 [sha256.Size]byte
+	State                                                                                          string
 }
 
 func validConflictFolderDivergentMoveRecovery(r ConflictFolderDivergentMoveRecovery) bool {
@@ -30,7 +30,7 @@ func validConflictFolderDivergentMoveRecovery(r ConflictFolderDivergentMoveRecov
 		nonzero = nonzero || b != 0
 	}
 	prefix := ConflictRootName + "/" + ConflictRecoveredName + "/"
-	return validOperationID(r.OperationID) && validObjectID(r.FolderID) && validObjectID(r.RecoveredFolderID) && validOperationID(r.NewOperationID) && r.FolderID != r.RecoveredFolderID && r.OperationID != r.NewOperationID && naming.ValidateComponent(r.AttemptedRelative) == nil && naming.ValidateComponent(r.CanonicalRelative) == nil && r.AttemptedRelative != r.CanonicalRelative && strings.HasPrefix(r.RecoveryRelative, prefix) && path.Dir(r.RecoveryRelative) == ConflictRootName+"/"+ConflictRecoveredName && naming.ValidateComponent(path.Base(r.RecoveryRelative)) == nil && r.SourceDevice > 0 && r.SourceInode > 0 && r.SourceDevice <= math.MaxInt64 && r.SourceInode <= math.MaxInt64 && r.CanonicalRevision > 0 && nonzero && ((r.State == "prepared" || r.State == "evacuated") && r.CanonicalDevice == 0 && r.CanonicalInode == 0 || (r.State == "canonical_prepared" || r.State == "canonical_published" || r.State == "completed") && r.CanonicalDevice > 0 && r.CanonicalInode > 0)
+	return validOperationID(r.OperationID) && validObjectID(r.FolderID) && validObjectID(r.RecoveredFolderID) && validOperationID(r.NewOperationID) && (r.AttemptedParentID == uuid.Nil || validObjectID(r.AttemptedParentID)) && (r.CanonicalParentID == uuid.Nil || validObjectID(r.CanonicalParentID)) && r.FolderID != r.RecoveredFolderID && r.FolderID != r.AttemptedParentID && r.FolderID != r.CanonicalParentID && r.OperationID != r.NewOperationID && naming.ValidateUserRelativePath(r.AttemptedRelative) == nil && naming.ValidateUserRelativePath(r.CanonicalRelative) == nil && r.AttemptedRelative != r.CanonicalRelative && strings.HasPrefix(r.RecoveryRelative, prefix) && path.Dir(r.RecoveryRelative) == ConflictRootName+"/"+ConflictRecoveredName && naming.ValidateComponent(path.Base(r.RecoveryRelative)) == nil && r.SourceDevice > 0 && r.SourceInode > 0 && r.SourceDevice <= math.MaxInt64 && r.SourceInode <= math.MaxInt64 && r.CanonicalRevision > 0 && nonzero && ((r.State == "prepared" || r.State == "evacuated") && r.CanonicalDevice == 0 && r.CanonicalInode == 0 || (r.State == "canonical_prepared" || r.State == "canonical_published" || r.State == "completed") && r.CanonicalDevice > 0 && r.CanonicalInode > 0)
 }
 func (s *Store) ConflictFolderDivergentMoveRecovery(ctx context.Context, operationID uuid.UUID) (*ConflictFolderDivergentMoveRecovery, error) {
 	if !validOperationID(operationID) {
@@ -40,9 +40,10 @@ func (s *Store) ConflictFolderDivergentMoveRecovery(ctx context.Context, operati
 	err := s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var r ConflictFolderDivergentMoveRecovery
 		var op, folder, recovered, newOp string
+		var attemptedParent, canonicalParent sql.NullString
 		var nonce []byte
 		var device, inode sql.NullInt64
-		err := tx.QueryRowContext(ctx, `SELECT operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,canonical_device,canonical_inode,state FROM conflict_folder_divergent_move_recoveries WHERE operation_id=?`, operationID.String()).Scan(&op, &folder, &recovered, &newOp, &r.AttemptedRelative, &r.CanonicalRelative, &r.RecoveryRelative, &r.SourceDevice, &r.SourceInode, &r.CanonicalRevision, &nonce, &device, &inode, &r.State)
+		err := tx.QueryRowContext(ctx, `SELECT operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,attempted_parent_id,canonical_parent_id,canonical_device,canonical_inode,state FROM conflict_folder_divergent_move_recoveries WHERE operation_id=?`, operationID.String()).Scan(&op, &folder, &recovered, &newOp, &r.AttemptedRelative, &r.CanonicalRelative, &r.RecoveryRelative, &r.SourceDevice, &r.SourceInode, &r.CanonicalRevision, &nonce, &attemptedParent, &canonicalParent, &device, &inode, &r.State)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -58,6 +59,12 @@ func (s *Store) ConflictFolderDivergentMoveRecovery(ctx context.Context, operati
 		}
 		if err == nil {
 			r.NewOperationID, err = uuid.Parse(newOp)
+		}
+		if err == nil && attemptedParent.Valid {
+			r.AttemptedParentID, err = uuid.Parse(attemptedParent.String)
+		}
+		if err == nil && canonicalParent.Valid {
+			r.CanonicalParentID, err = uuid.Parse(canonicalParent.String)
 		}
 		if device.Valid {
 			r.CanonicalDevice = uint64(device.Int64)
@@ -88,7 +95,7 @@ func (s *Store) DivergentFolderMoveRecoveryEligible(ctx context.Context, operati
 	return eligible != 0, err
 }
 
-func (s *Store) PutConflictFolderDivergentMoveRecovery(ctx context.Context, r ConflictFolderDivergentMoveRecovery) error {
+func (s *Store) PutConflictFolderDivergentMoveRecovery(ctx context.Context, r ConflictFolderDivergentMoveRecovery, parentManifest ConflictFolderDivergentParentManifest) error {
 	if !validConflictFolderDivergentMoveRecovery(r) || r.State != "prepared" {
 		return errors.New("invalid divergent folder move recovery")
 	}
@@ -100,17 +107,10 @@ func (s *Store) PutConflictFolderDivergentMoveRecovery(ctx context.Context, r Co
 		if dependents != 0 {
 			return ErrDivergentFolderMoveIneligible
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:])
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return errors.New("divergent folder move recovery unavailable")
-		}
-		return nil
+		return putConflictFolderDivergentRecoveryTx(ctx, tx, r, parentManifest)
 	})
 }
-func (s *Store) PutConflictFolderDivergentMoveRecoveryWithNotes(ctx context.Context, r ConflictFolderDivergentMoveRecovery, members []ConflictFolderCreateNoteMember) error {
+func (s *Store) PutConflictFolderDivergentMoveRecoveryWithNotes(ctx context.Context, r ConflictFolderDivergentMoveRecovery, parentManifest ConflictFolderDivergentParentManifest, members []ConflictFolderCreateNoteMember) error {
 	if !validConflictFolderDivergentMoveRecovery(r) || r.State != "prepared" || len(members) == 0 {
 		return errors.New("invalid divergent folder note recovery")
 	}
@@ -143,12 +143,8 @@ func (s *Store) PutConflictFolderDivergentMoveRecoveryWithNotes(ctx context.Cont
 				previous = chain.OperationID
 			}
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:])
-		if err != nil {
+		if err := putConflictFolderDivergentRecoveryTx(ctx, tx, r, parentManifest); err != nil {
 			return err
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return errors.New("divergent recovery unavailable")
 		}
 		for _, m := range members {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_divergent_move_note_members(operation_id,note_id,old_operation_id,new_operation_id,name,blob_hash,create_blob_hash) VALUES(?,?,?,?,?,?,?)`, r.OperationID.String(), m.NoteID.String(), m.OldOperationID.String(), m.NewOperationID.String(), m.Name, m.BlobHash[:], m.CreateBlobHash[:]); err != nil {
@@ -170,18 +166,14 @@ func (s *Store) PutConflictFolderDivergentMoveRecoveryWithNotes(ctx context.Cont
 		return nil
 	})
 }
-func (s *Store) PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx context.Context, r ConflictFolderDivergentMoveRecovery, manifest ConflictRecursiveLocalFolderManifest) error {
+func (s *Store) PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx context.Context, r ConflictFolderDivergentMoveRecovery, parentManifest ConflictFolderDivergentParentManifest, manifest ConflictRecursiveLocalFolderManifest) error {
 	if !validConflictFolderDivergentMoveRecovery(r) || r.State != "prepared" || manifest.OperationID != r.OperationID || manifest.NewRootOperationID != r.NewOperationID {
 		return errors.New("invalid recursive divergent folder move recovery")
 	}
 	manifest.Kind = RecursiveFolderDivergentMoveRecovery
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:])
-		if err != nil {
+		if err := putConflictFolderDivergentRecoveryTx(ctx, tx, r, parentManifest); err != nil {
 			return err
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return errors.New("recursive divergent folder move recovery unavailable")
 		}
 		return putRecursiveLocalFolderManifestTx(ctx, tx, manifest)
 	})
@@ -383,8 +375,11 @@ func (s *Store) CompleteConflictFolderDivergentMoveRecovery(ctx context.Context,
 		return errors.New("invalid divergent folder move completion")
 	}
 	return s.index.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if err := validateDivergentParentBindingsTx(ctx, tx, r.OperationID); err != nil {
+			return err
+		}
 		var ok int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries recovery JOIN sync_outbox o ON o.operation_id=recovery.operation_id JOIN sync_conflict_states c ON c.operation_id=o.operation_id JOIN sync_baselines b ON b.object_id=recovery.folder_id JOIN sync_inbox_changes applied ON applied.operation_id=b.operation_id AND applied.object_id=b.object_id WHERE recovery.operation_id=? AND recovery.state='canonical_published' AND recovery.folder_id=? AND recovery.recovered_folder_id=? AND recovery.new_operation_id=? AND recovery.attempted_relative=? AND recovery.canonical_relative=? AND recovery.recovery_relative=? AND recovery.source_device=? AND recovery.source_inode=? AND recovery.canonical_revision=? AND recovery.canonical_nonce=? AND recovery.canonical_device=? AND recovery.canonical_inode=? AND o.status='conflict' AND o.conflict_code='base_revision_mismatch' AND c.object_type='folder' AND c.deleted=0 AND c.parent_id IS NULL AND c.name=recovery.canonical_relative AND c.revision=recovery.canonical_revision AND b.revision=recovery.canonical_revision AND applied.state='applied' AND applied.object_type='folder' AND applied.mutation='move' AND applied.revision=recovery.canonical_revision AND applied.parent_id IS NULL AND applied.name=recovery.canonical_relative AND applied.deleted=0 AND NOT EXISTS(SELECT 1 FROM sync_outbox later WHERE later.object_id=o.object_id AND later.sequence>o.sequence AND later.status IN ('pending','attempted','replay_mismatch','conflict')))`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:], r.CanonicalDevice, r.CanonicalInode).Scan(&ok); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM conflict_folder_divergent_move_recoveries recovery JOIN sync_outbox o ON o.operation_id=recovery.operation_id JOIN sync_conflict_states c ON c.operation_id=o.operation_id JOIN sync_baselines b ON b.object_id=recovery.folder_id JOIN sync_inbox_changes applied ON applied.operation_id=b.operation_id AND applied.object_id=b.object_id WHERE recovery.operation_id=? AND recovery.state='canonical_published' AND recovery.folder_id=? AND recovery.recovered_folder_id=? AND recovery.new_operation_id=? AND recovery.attempted_relative=? AND recovery.canonical_relative=? AND recovery.recovery_relative=? AND recovery.source_device=? AND recovery.source_inode=? AND recovery.canonical_revision=? AND recovery.canonical_nonce=? AND recovery.attempted_parent_id IS ? AND recovery.canonical_parent_id IS ? AND recovery.canonical_device=? AND recovery.canonical_inode=? AND o.status='conflict' AND o.conflict_code='base_revision_mismatch' AND c.object_type='folder' AND c.deleted=0 AND c.parent_id IS recovery.canonical_parent_id AND (recovery.canonical_relative=c.name OR substr(recovery.canonical_relative,length(recovery.canonical_relative)-length(c.name),length(c.name)+1)='/'||c.name) AND c.revision=recovery.canonical_revision AND b.revision=recovery.canonical_revision AND applied.state='applied' AND applied.object_type='folder' AND applied.mutation='move' AND applied.revision=recovery.canonical_revision AND applied.parent_id IS recovery.canonical_parent_id AND applied.name=c.name AND applied.deleted=0 AND NOT EXISTS(SELECT 1 FROM sync_outbox later WHERE later.object_id=o.object_id AND later.sequence>o.sequence AND later.status IN ('pending','attempted','replay_mismatch','conflict')))`, r.OperationID.String(), r.FolderID.String(), r.RecoveredFolderID.String(), r.NewOperationID.String(), r.AttemptedRelative, r.CanonicalRelative, r.RecoveryRelative, r.SourceDevice, r.SourceInode, r.CanonicalRevision, r.CanonicalNonce[:], nullableUUID(r.AttemptedParentID), nullableUUID(r.CanonicalParentID), r.CanonicalDevice, r.CanonicalInode).Scan(&ok); err != nil {
 			return err
 		}
 		if ok == 0 {

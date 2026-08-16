@@ -347,10 +347,16 @@ func mergeDivergentTreeReconcileData(left, right recursiveLocalReconcileData) re
 	return left
 }
 
-func (c *LocalCore) recoverDivergentFolderMoveTree(ctx context.Context, store *clientsync.Store, recovery *clientsync.ConflictFolderDivergentMoveRecovery, manifest *clientsync.ConflictFolderDivergentTreeManifest) error {
+func (c *LocalCore) recoverDivergentFolderMoveTree(ctx context.Context, store *clientsync.Store, recovery *clientsync.ConflictFolderDivergentMoveRecovery, parentManifest *clientsync.ConflictFolderDivergentParentManifest, manifest *clientsync.ConflictFolderDivergentTreeManifest) error {
 	stage := ".remember/conflicts/folders/" + recovery.OperationID.String()
 	recoveryData := divergentTreeReconcileData(manifest, recovery.RecoveryRelative, recovery.RecoveredFolderID, "recovery")
 	attemptedData := divergentTreeReconcileData(manifest, recovery.AttemptedRelative, recovery.FolderID, "source")
+	verifyParents := func() error {
+		if err := store.ValidateConflictFolderDivergentParents(ctx, recovery.OperationID); err != nil {
+			return err
+		}
+		return verifyDivergentFolderParents(c.root, parentManifest)
+	}
 	restorePrepared := func(cause error) error {
 		if _, _, _, err := ensureDivergentCanonicalStage(c.root, stage, recovery.RecoveryRelative, recovery.CanonicalNonce, manifest); err != nil {
 			return errors.Join(cause, err)
@@ -370,6 +376,9 @@ func (c *LocalCore) recoverDivergentFolderMoveTree(ctx context.Context, store *c
 		return errors.Join(cause, err)
 	}
 	if recovery.State == "prepared" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if err := store.ValidateConflictFolderDivergentTreeManifest(ctx, recovery.FolderID, *manifest); err != nil {
 			return fmt.Errorf("validate divergent folder tree manifest: %w", err)
 		}
@@ -432,6 +441,9 @@ func (c *LocalCore) recoverDivergentFolderMoveTree(ctx context.Context, store *c
 		recovery.State = "evacuated"
 	}
 	if recovery.State == "evacuated" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if err := verifyDivergentFolderTreeRecovery(c.root, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, manifest); err != nil {
 			return err
 		}
@@ -455,6 +467,9 @@ func (c *LocalCore) recoverDivergentFolderMoveTree(ctx context.Context, store *c
 		manifest = loaded
 	}
 	if recovery.State == "canonical_prepared" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if err := repository.VerifyRootedFolderPublication(c.root, stage, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); err == nil {
 			if err := verifyDivergentCanonicalTree(c.root, stage, recovery.CanonicalDevice, recovery.CanonicalInode, manifest, true, recovery.CanonicalNonce); err != nil {
 				return err
@@ -478,6 +493,9 @@ func (c *LocalCore) recoverDivergentFolderMoveTree(ctx context.Context, store *c
 		recovery.State = "canonical_published"
 	}
 	if recovery.State == "canonical_published" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if err := repository.CleanupRootedFolderPublication(c.root, recovery.CanonicalRelative, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); err != nil {
 			return err
 		}

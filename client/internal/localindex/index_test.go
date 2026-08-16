@@ -251,6 +251,9 @@ func TestV25MigrationSeedsDownloadedCursorFromConfirmed(t *testing.T) {
 		if _, err := tx.Exec(`INSERT INTO sync_state(key,value) VALUES('confirmed_cursor','42') ON CONFLICT(key) DO UPDATE SET value='42'`); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`DROP TRIGGER conflict_folder_divergent_parent_manifest_insert_guard; DROP TRIGGER conflict_folder_divergent_parent_manifest_update_guard; DROP TRIGGER conflict_folder_divergent_parent_manifest_no_delete; DROP TRIGGER conflict_folder_divergent_parent_binding_insert_guard; DROP TRIGGER conflict_folder_divergent_parent_binding_no_update; DROP TRIGGER conflict_folder_divergent_parent_binding_no_delete; DROP VIEW conflict_folder_divergent_parent_manifests_valid; DROP TABLE conflict_folder_divergent_parent_bindings; DROP TABLE conflict_folder_divergent_parent_manifests`); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DROP VIEW conflict_folder_divergent_tree_replacements_complete; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_update_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_no_delete; DROP TRIGGER conflict_folder_divergent_tree_member_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_member_no_update; DROP TRIGGER conflict_folder_divergent_tree_member_no_delete; DROP TRIGGER conflict_folder_divergent_tree_chain_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_chain_no_update; DROP TRIGGER conflict_folder_divergent_tree_chain_no_delete; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_update; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_delete; DROP TABLE conflict_folder_divergent_tree_canonical_folders; DROP TABLE conflict_folder_divergent_tree_note_chains; DROP TABLE conflict_folder_divergent_tree_members; DROP TABLE conflict_folder_divergent_tree_manifests; CREATE VIEW sync_unresolved_local_intents AS SELECT object_id FROM sync_outbox WHERE 0; CREATE TRIGGER conflict_folder_divergent_move_state_guard BEFORE UPDATE ON conflict_folder_divergent_move_recoveries BEGIN SELECT 1; END`); err != nil {
 			return err
 		}
@@ -289,6 +292,9 @@ func TestV26MigrationAddsInboxApplyPlanLinks(t *testing.T) {
 	}
 	if err := index.WithTransaction(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`DROP VIEW sync_inbox_valid_nested_bindings; DROP VIEW sync_inbox_valid_parent_bindings; DROP VIEW sync_independent_inbox_candidates; DROP VIEW sync_inbox_note_ancestry; DROP TRIGGER sync_inbox_parent_binding_insert_guard; DROP TRIGGER sync_inbox_parent_binding_no_update; DROP TRIGGER sync_inbox_parent_binding_no_delete; DROP TABLE sync_inbox_parent_bindings`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TRIGGER conflict_folder_divergent_parent_manifest_insert_guard; DROP TRIGGER conflict_folder_divergent_parent_manifest_update_guard; DROP TRIGGER conflict_folder_divergent_parent_manifest_no_delete; DROP TRIGGER conflict_folder_divergent_parent_binding_insert_guard; DROP TRIGGER conflict_folder_divergent_parent_binding_no_update; DROP TRIGGER conflict_folder_divergent_parent_binding_no_delete; DROP VIEW conflict_folder_divergent_parent_manifests_valid; DROP TABLE conflict_folder_divergent_parent_bindings; DROP TABLE conflict_folder_divergent_parent_manifests`); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DROP VIEW conflict_folder_divergent_tree_replacements_complete; DROP VIEW sync_unresolved_local_intents; DROP TRIGGER conflict_folder_divergent_move_state_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_update_guard; DROP TRIGGER conflict_folder_divergent_tree_manifest_no_delete; DROP TRIGGER conflict_folder_divergent_tree_member_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_member_no_update; DROP TRIGGER conflict_folder_divergent_tree_member_no_delete; DROP TRIGGER conflict_folder_divergent_tree_chain_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_chain_no_update; DROP TRIGGER conflict_folder_divergent_tree_chain_no_delete; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_insert_guard; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_update; DROP TRIGGER conflict_folder_divergent_tree_canonical_folder_no_delete; DROP TABLE conflict_folder_divergent_tree_canonical_folders; DROP TABLE conflict_folder_divergent_tree_note_chains; DROP TABLE conflict_folder_divergent_tree_members; DROP TABLE conflict_folder_divergent_tree_manifests; CREATE VIEW sync_unresolved_local_intents AS SELECT object_id FROM sync_outbox WHERE 0; CREATE TRIGGER conflict_folder_divergent_move_state_guard BEFORE UPDATE ON conflict_folder_divergent_move_recoveries BEGIN SELECT 1; END`); err != nil {
@@ -640,6 +646,50 @@ func TestV40MigrationPreservesPreparedDivergentRecoveryAndAcceptsSealedTree(t *t
 		t.Fatal("sealed migrated tree member became mutable")
 	}
 }
+func TestV41MigrationPreservesPreparedRootRecovery(t *testing.T) {
+	db := openLocalSchemaVersion(t, filepath.Join(t.TempDir(), "v40.db"), 40)
+	defer db.Close()
+	operation, replacementOperation := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	rootID, recoveredID := uuid.New(), uuid.New()
+	nonce := bytes.Repeat([]byte{4}, sha256.Size)
+	recoveryRelative := "_Konflikte/Wiederhergestellt/Local (Konflikt - " + operation.String() + ")"
+	if _, err := db.Exec(`INSERT INTO sync_outbox(operation_id,mutation,object_id,object_type,base_revision,parent_id,name,blob_hash,status,conflict_code,created_at_ms) VALUES(?,'move',?,'folder',1,NULL,'Local',NULL,'conflict','base_revision_mismatch',1)`, operation.String(), rootID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_conflict_states(operation_id,object_type,revision,parent_id,name,blob_hash,deleted) VALUES(?,'folder',2,NULL,'Server',NULL,0)`, operation.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_outbox_folder_intents(operation_id,folder_id,mutation_kind,source_relative,device,inode) VALUES(?,?,'move','Local',11,22)`, operation.String(), rootID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, operation.String(), rootID.String(), recoveredID.String(), replacementOperation.String(), "Local", "Server", recoveryRelative, 11, 22, 2, nonce); err != nil {
+		t.Fatal(err)
+	}
+	script, err := migrations.ReadFile("migrations/041_divergent_folder_parent_bindings.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(script)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version=41`); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var attemptedParent, canonicalParent sql.NullString
+	if err := db.QueryRow(`SELECT state,attempted_parent_id,canonical_parent_id FROM conflict_folder_divergent_move_recoveries WHERE operation_id=?`, operation.String()).Scan(&state, &attemptedParent, &canonicalParent); err != nil {
+		t.Fatal(err)
+	}
+	if state != "prepared" || attemptedParent.Valid || canonicalParent.Valid {
+		t.Fatalf("migrated recovery state=%s attempted=%#v canonical=%#v", state, attemptedParent, canonicalParent)
+	}
+	if _, err := db.Exec(`UPDATE conflict_folder_divergent_move_recoveries SET canonical_parent_id=? WHERE operation_id=?`, uuid.New().String(), operation.String()); err == nil {
+		t.Fatal("migrated recovery parent became mutable")
+	}
+	if _, err := db.Exec(`UPDATE conflict_folder_divergent_move_recoveries SET state='evacuated' WHERE operation_id=?`, operation.String()); err != nil {
+		t.Fatalf("legacy root transition failed: %v", err)
+	}
+}
 
 func openLocalSchemaVersion(t *testing.T, path string, version int) *sql.DB {
 	t.Helper()
@@ -683,7 +733,7 @@ func TestOpenRejectsNewerLocalSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`PRAGMA user_version=41`); err != nil {
+	if _, err = db.Exec(`PRAGMA user_version=42`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

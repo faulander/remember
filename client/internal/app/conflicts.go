@@ -40,6 +40,10 @@ var testHookAfterDivergentCanonicalPublish func() error
 var testHookAfterDivergentCanonicalCleanup func() error
 var testHookAfterDivergentTreeRewrite func() error
 
+func sameOptionalUUID(left, right *uuid.UUID) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
 func preserveDeleteNotes(in []remotehttp.PreserveDeleteNoteMove) []clientsync.FolderPreserveDeleteNoteMove {
 	out := make([]clientsync.FolderPreserveDeleteNoteMove, len(in))
 	for i, n := range in {
@@ -145,16 +149,16 @@ func (c *LocalCore) stageSupportedConflicts(ctx context.Context, store *clientsy
 				continue
 			}
 		}
-		divergentRootFolderMove := m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && m.ParentID == nil && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.ParentID == nil && conflict.Canonical.Revision > m.BaseRevision && len(conflict.Canonical.BlobHash) == 0 && conflict.Canonical.Name != m.Name
-		if divergentRootFolderMove {
+		divergentFolderMove := m.ObjectType == clientsync.Folder && m.Kind == clientsync.Move && conflict.Code == "base_revision_mismatch" && conflict.Canonical != nil && conflict.Canonical.ObjectType == clientsync.Folder && !conflict.Canonical.Deleted && conflict.Canonical.Revision > m.BaseRevision && len(conflict.Canonical.BlobHash) == 0 && (conflict.Canonical.Name != m.Name || !sameOptionalUUID(conflict.Canonical.ParentID, m.ParentID))
+		if divergentFolderMove {
 			if err := c.ensureLocalConflictNamespace(ctx, store); err != nil {
 				return err
 			}
-			if err := c.recoverEmptyDivergentRootFolderMove(ctx, store, conflict); err != nil {
+			if err := c.recoverDivergentFolderMove(ctx, store, conflict); err != nil {
 				if errors.Is(err, clientsync.ErrDivergentFolderMoveIneligible) {
 					continue
 				}
-				return fmt.Errorf("recover divergent root folder move: %w", err)
+				return fmt.Errorf("recover divergent folder move: %w", err)
 			}
 			continue
 		}
@@ -569,7 +573,46 @@ func verifyDivergentDirectNoteSubtree(root, relative string, device, inode uint6
 	return repository.VerifyRootedSubtreeExpected(root, relative, device, inode, entries, clientsync.MaxBlobBytes)
 }
 
-func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
+func divergentFolderParentCandidates(parentID uuid.UUID, objects map[uuid.UUID]localindex.Object) ([]clientsync.DivergentFolderParentCandidate, error) {
+	if parentID == uuid.Nil {
+		return nil, nil
+	}
+	reversed := make([]clientsync.DivergentFolderParentCandidate, 0, 8)
+	seen := map[uuid.UUID]bool{}
+	for currentID := parentID; currentID != uuid.Nil; {
+		if seen[currentID] || len(reversed) == clientsync.MaxDivergentFolderParentDepth {
+			return nil, clientsync.ErrDivergentFolderMoveIneligible
+		}
+		object, ok := objects[currentID]
+		if !ok || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.FolderDevice == 0 || object.FolderInode == 0 {
+			return nil, clientsync.ErrDivergentFolderMoveIneligible
+		}
+		reversed = append(reversed, clientsync.DivergentFolderParentCandidate{ObjectID: object.ID, ParentID: object.ParentID, RelativePath: object.RelativePath, Device: object.FolderDevice, Inode: object.FolderInode})
+		seen[currentID] = true
+		currentID = object.ParentID
+	}
+	candidates := make([]clientsync.DivergentFolderParentCandidate, len(reversed))
+	for i := range reversed {
+		candidates[len(reversed)-1-i] = reversed[i]
+	}
+	return candidates, nil
+}
+
+func verifyDivergentFolderParents(root string, manifest *clientsync.ConflictFolderDivergentParentManifest) error {
+	if manifest == nil {
+		return nil
+	}
+	for _, bindings := range [][]clientsync.ConflictFolderDivergentParentBinding{manifest.Attempted, manifest.Canonical} {
+		for _, binding := range bindings {
+			if err := repository.VerifyRootedFolderIdentity(root, binding.RelativePath, binding.Device, binding.Inode); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *LocalCore) recoverDivergentFolderMove(ctx context.Context, store *clientsync.Store, conflict clientsync.ConflictItem) error {
 	m, canonical := conflict.Outbox.Mutation, conflict.Canonical
 	recovery, err := store.ConflictFolderDivergentMoveRecovery(ctx, m.OperationID)
 	if err != nil {
@@ -597,13 +640,33 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
 		object, ok := objects[m.ObjectID]
-		if !ok || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.ParentID != uuid.Nil || object.RelativePath != m.Name || object.FolderDevice == 0 || object.FolderInode == 0 {
+		attemptedParentID := uuid.Nil
+		if m.ParentID != nil {
+			attemptedParentID = *m.ParentID
+		}
+		if !ok || object.Type != localindex.ObjectFolder || object.IdentityState != localindex.IdentityKnown || object.ParentID != attemptedParentID || path.Base(object.RelativePath) != m.Name || object.FolderDevice == 0 || object.FolderInode == 0 {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
-		if paths[portablePathKey(canonical.Name)] {
+		attemptedParents, err := divergentFolderParentCandidates(attemptedParentID, objects)
+		if err != nil {
+			return err
+		}
+		canonicalParentID := uuid.Nil
+		if canonical.ParentID != nil {
+			canonicalParentID = *canonical.ParentID
+		}
+		canonicalParents, err := divergentFolderParentCandidates(canonicalParentID, objects)
+		if err != nil {
+			return err
+		}
+		canonicalRelative := canonical.Name
+		if len(canonicalParents) != 0 {
+			canonicalRelative = path.Join(canonicalParents[len(canonicalParents)-1].RelativePath, canonical.Name)
+		}
+		if paths[portablePathKey(canonicalRelative)] {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
-		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(canonical.Name))); err == nil || !os.IsNotExist(err) {
+		if _, err := os.Lstat(filepath.Join(c.root, filepath.FromSlash(canonicalRelative))); err == nil || !os.IsNotExist(err) {
 			return clientsync.ErrDivergentFolderMoveIneligible
 		}
 		recoveredID, err := uuid.NewV7()
@@ -680,18 +743,22 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		if _, err := rand.Read(nonce[:]); err != nil {
 			return err
 		}
-		recovery = &clientsync.ConflictFolderDivergentMoveRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperation, AttemptedRelative: object.RelativePath, CanonicalRelative: canonical.Name, RecoveryRelative: target, SourceDevice: object.FolderDevice, SourceInode: object.FolderInode, CanonicalRevision: canonical.Revision, CanonicalNonce: nonce, State: "prepared"}
+		parentManifest, err := store.PlanConflictFolderDivergentParents(ctx, m.OperationID, m.ObjectID, attemptedParentID, canonicalParentID, attemptedParents, canonicalParents)
+		if err != nil {
+			return fmt.Errorf("plan divergent folder parents: %w", err)
+		}
+		recovery = &clientsync.ConflictFolderDivergentMoveRecovery{OperationID: m.OperationID, FolderID: m.ObjectID, RecoveredFolderID: recoveredID, NewOperationID: newOperation, AttemptedParentID: attemptedParentID, CanonicalParentID: canonicalParentID, AttemptedRelative: object.RelativePath, CanonicalRelative: canonicalRelative, RecoveryRelative: target, SourceDevice: object.FolderDevice, SourceInode: object.FolderInode, CanonicalRevision: canonical.Revision, CanonicalNonce: nonce, State: "prepared"}
 		if tree != nil {
-			err = store.PutConflictFolderDivergentMoveRecoveryWithTree(ctx, *recovery, *tree)
+			err = store.PutConflictFolderDivergentMoveRecoveryWithTree(ctx, *recovery, *parentManifest, *tree)
 			if err != nil {
 				return fmt.Errorf("persist divergent folder tree: %w", err)
 			}
 		} else if recursive != nil {
-			err = store.PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx, *recovery, *recursive)
+			err = store.PutConflictFolderDivergentMoveRecoveryWithRecursiveManifest(ctx, *recovery, *parentManifest, *recursive)
 		} else if len(members) == 0 {
-			err = store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery)
+			err = store.PutConflictFolderDivergentMoveRecovery(ctx, *recovery, *parentManifest)
 		} else {
-			err = store.PutConflictFolderDivergentMoveRecoveryWithNotes(ctx, *recovery, members)
+			err = store.PutConflictFolderDivergentMoveRecoveryWithNotes(ctx, *recovery, *parentManifest, members)
 		}
 		if err != nil {
 			return err
@@ -710,8 +777,21 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 			return err
 		}
 	}
+	parentManifest, err := store.ConflictFolderDivergentParentManifest(ctx, m.OperationID)
+	if err != nil {
+		return err
+	}
+	verifyParents := func() error {
+		if err := store.ValidateConflictFolderDivergentParents(ctx, m.OperationID); err != nil {
+			return err
+		}
+		return verifyDivergentFolderParents(c.root, parentManifest)
+	}
+	if err := verifyParents(); err != nil {
+		return err
+	}
 	if tree != nil {
-		return c.recoverDivergentFolderMoveTree(ctx, store, recovery, tree)
+		return c.recoverDivergentFolderMoveTree(ctx, store, recovery, parentManifest, tree)
 	}
 	verifyRecovery := func() error {
 		if recursive != nil {
@@ -757,6 +837,9 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		return errors.Join(cause, restoreErr)
 	}
 	if recovery.State == "prepared" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if recursive != nil {
 			if err := store.ValidateConflictRecursiveLocalFolderManifest(ctx, clientsync.RecursiveFolderDivergentMoveRecovery, m.OperationID); err != nil {
 				return err
@@ -802,6 +885,9 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 	}
 	stage := ".remember/conflicts/folders/" + recovery.OperationID.String()
 	if recovery.State == "evacuated" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if err := verifyRecovery(); err != nil {
 			return err
 		}
@@ -827,6 +913,9 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		recovery.CanonicalInode = inode
 	}
 	if recovery.State == "canonical_prepared" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		stageErr := repository.VerifyRootedFolderPublication(c.root, stage, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode)
 		if stageErr == nil {
 			if err := repository.PublishRootedFolderPublication(c.root, stage, recovery.CanonicalRelative, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); err != nil {
@@ -846,6 +935,9 @@ func (c *LocalCore) recoverEmptyDivergentRootFolderMove(ctx context.Context, sto
 		recovery.State = "canonical_published"
 	}
 	if recovery.State == "canonical_published" {
+		if err := verifyParents(); err != nil {
+			return err
+		}
 		if err := repository.CleanupRootedFolderPublication(c.root, recovery.CanonicalRelative, recovery.CanonicalNonce, recovery.CanonicalDevice, recovery.CanonicalInode); err != nil {
 			return err
 		}

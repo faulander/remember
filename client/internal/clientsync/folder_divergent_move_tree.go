@@ -346,7 +346,7 @@ func validateDivergentFolderTreeManifestShape(manifest ConflictFolderDivergentTr
 	return nil
 }
 
-func (s *Store) PutConflictFolderDivergentMoveRecoveryWithTree(ctx context.Context, recovery ConflictFolderDivergentMoveRecovery, manifest ConflictFolderDivergentTreeManifest) error {
+func (s *Store) PutConflictFolderDivergentMoveRecoveryWithTree(ctx context.Context, recovery ConflictFolderDivergentMoveRecovery, parentManifest ConflictFolderDivergentParentManifest, manifest ConflictFolderDivergentTreeManifest) error {
 	if !validConflictFolderDivergentMoveRecovery(recovery) || recovery.State != "prepared" || manifest.OperationID != recovery.OperationID || manifest.NewRootOperationID != recovery.NewOperationID {
 		return errors.New("invalid divergent folder tree recovery")
 	}
@@ -357,12 +357,8 @@ func (s *Store) PutConflictFolderDivergentMoveRecoveryWithTree(ctx context.Conte
 		if err := validateDivergentFolderTreeTopologyTx(ctx, tx, recovery.FolderID, manifest); err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO conflict_folder_divergent_move_recoveries(operation_id,folder_id,recovered_folder_id,new_operation_id,attempted_relative,canonical_relative,recovery_relative,source_device,source_inode,canonical_revision,canonical_nonce,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared')`, recovery.OperationID.String(), recovery.FolderID.String(), recovery.RecoveredFolderID.String(), recovery.NewOperationID.String(), recovery.AttemptedRelative, recovery.CanonicalRelative, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, recovery.CanonicalRevision, recovery.CanonicalNonce[:])
-		if err != nil {
+		if err := putConflictFolderDivergentRecoveryTx(ctx, tx, recovery, parentManifest); err != nil {
 			return err
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return errors.New("divergent folder tree recovery unavailable")
 		}
 		known := 0
 		for _, member := range manifest.Members {
@@ -392,7 +388,7 @@ func (s *Store) PutConflictFolderDivergentMoveRecoveryWithTree(ctx context.Conte
 				}
 			}
 		}
-		res, err = tx.ExecContext(ctx, `UPDATE conflict_folder_divergent_tree_manifests SET sealed=1 WHERE operation_id=? AND sealed=0`, manifest.OperationID.String())
+		res, err := tx.ExecContext(ctx, `UPDATE conflict_folder_divergent_tree_manifests SET sealed=1 WHERE operation_id=? AND sealed=0`, manifest.OperationID.String())
 		if err != nil {
 			return err
 		}
@@ -755,7 +751,7 @@ func validateDivergentFolderTreeBindingsTx(ctx context.Context, tx *sql.Tx, reco
 	if err := requireIndexedTreeObjectTx(ctx, tx, recovery.RecoveredFolderID, Folder, ConflictRecoveredID, recovery.RecoveryRelative, recovery.SourceDevice, recovery.SourceInode, nil); err != nil {
 		return err
 	}
-	if err := requireIndexedTreeObjectTx(ctx, tx, recovery.FolderID, Folder, uuid.Nil, recovery.CanonicalRelative, recovery.CanonicalDevice, recovery.CanonicalInode, nil); err != nil {
+	if err := requireIndexedTreeObjectTx(ctx, tx, recovery.FolderID, Folder, recovery.CanonicalParentID, recovery.CanonicalRelative, recovery.CanonicalDevice, recovery.CanonicalInode, nil); err != nil {
 		return err
 	}
 	canonicalFolders := map[uuid.UUID][2]uint64{}
